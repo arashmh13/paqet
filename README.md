@@ -63,7 +63,7 @@ You must correctly set the interfaces, IP addresses, MAC addresses, and ports.
 > **⚠️ Important:**
 >
 > - **Role Configuration**: Role must be explicitly set as `role: "client"` or `role: "server"`
-> - **Transport Security**: KCP requires identical keys on client/server.
+> - **Transport Security**: KCP requires identical keys on client/server. The `transport.obfs` key (which defaults to the KCP key) must match too.
 > - **Configuration**: See "Critical Configuration Points" section below for detailed security requirements
 
 #### Finding Your Network Details
@@ -131,6 +131,10 @@ server:
 # Transport protocol configuration
 transport:
   protocol: "kcp" # Transport protocol (currently only "kcp" supported)
+  obfs: # Datagram obfuscation (keep enabled)
+    enabled: true # true = encrypt + pad every transport packet (default)
+    key: "" # Optional: defaults to transport.kcp.key
+    maxpad: 64 # Random padding window in bytes (0-512)
   kcp:
     block: "aes" # Encryption algorithm
     key: "your-secret-key-here" # CHANGE ME: Secret key (must match server)
@@ -160,10 +164,35 @@ network:
 # Transport protocol configuration
 transport:
   protocol: "kcp" # Transport protocol (currently only "kcp" supported)
+  obfs: # Datagram obfuscation (keep enabled)
+    enabled: true # true = encrypt + pad every transport packet (default)
+    key: "" # Optional: defaults to transport.kcp.key
+    maxpad: 64 # Random padding window in bytes (0-512)
   kcp:
     block: "aes" # Encryption algorithm
     key: "your-secret-key-here" # CHANGE ME: Secret key (must match client)
 ```
+
+#### Transport Obfuscation (`transport.obfs`)
+
+KCP already encrypts the tunnel, but the encrypted packets still have a recognisable *shape*: every pure ACK is exactly the same length, and packet sizes track the size of the tunnelled traffic one to one. Deep packet inspection (DPI) middleboxes fingerprint exactly those properties to flag, throttle or block raw-packet/KCP tunnels.
+
+The `transport.obfs` layer removes that signal. Every packet that leaves the raw socket is wrapped in an AES-256-GCM envelope with a fresh random nonce and then padded with random bytes, so on the wire the traffic is high-entropy and its length no longer correlates with the payload. Packets that fail authentication (active probes, injected or corrupted traffic) are dropped silently, so a prober sees the same behaviour as a closed port.
+
+```yaml
+transport:
+  obfs:
+    enabled: true # default: true
+    key: "" # defaults to transport.kcp.key when empty
+    maxpad: 64 # random padding window in bytes (0-512)
+```
+
+Notes:
+
+- **Both peers must have obfuscation enabled and share the same key.** The key is derived from `obfs.key`, falling back to `transport.kcp.key`; if both are empty while obfuscation is enabled, startup fails with a validation error.
+- `maxpad` is the width of the random padding window. Larger values waste more bandwidth for marginal gains; `64` is a good default and `0` disables padding (encryption and authentication stay on).
+- The obfuscation envelope adds `30` bytes (`12` nonce + `16` tag + `2` length) per packet. `kcp.mtu + 30 + maxpad` must stay within `1460` bytes so the resulting frames still fit a 1500 byte path MTU; otherwise startup fails with a validation error telling you to lower `kcp.mtu` or `obfs.maxpad`.
+- The `ping` and `dump` commands are raw diagnostic tools and do not use this layer.
 
 #### Critical Firewall Configuration
 
@@ -332,6 +361,7 @@ Security depends entirely on proper key management. Use the `secret` command to 
 2.  **Connection Times Out:**
     - **Transport Configuration Mismatch:**
       - **KCP**: Ensure `transport.kcp.key` is exactly identical on client and server
+      - **Obfuscation**: Ensure `transport.obfs` is enabled on both sides with identical keys (or leave `obfs.key` empty on both so it falls back to `transport.kcp.key`)
     - **`iptables` Rules:** Did you apply the firewall rules on the server?
     - **Incorrect Network Details:** Double-check all IPs, MAC addresses, and interface names.
     - **Cloud Provider Firewalls:** Ensure your cloud provider's security group allows TCP traffic on your `listen.addr` port.

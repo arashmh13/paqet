@@ -46,7 +46,12 @@ func (s *Server) Start() error {
 	}
 	s.pConn = pConn
 
-	listener, err := kcp.Listen(s.cfg.Transport.KCP, pConn)
+	trConn, err := s.cfg.Transport.Obfs.Wrap(pConn)
+	if err != nil {
+		return fmt.Errorf("could not enable transport obfuscation: %w", err)
+	}
+
+	listener, err := kcp.Listen(s.cfg.Transport.KCP, trConn)
 	if err != nil {
 		return fmt.Errorf("could not start KCP listener: %w", err)
 	}

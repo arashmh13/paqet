@@ -36,7 +36,13 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 		return nil, fmt.Errorf("could not create raw packet conn: %w", err)
 	}
 
-	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, pConn)
+	trConn, err := tc.cfg.Transport.Obfs.Wrap(pConn)
+	if err != nil {
+		pConn.Close()
+		return nil, fmt.Errorf("could not enable transport obfuscation: %w", err)
+	}
+
+	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, trConn)
 	if err != nil {
 		return nil, err
 	}
