@@ -40,6 +40,14 @@ transport:
   protocol: "kcp"  # Transport protocol (currently only "kcp" supported)
   conn: 1          # Number of connections (1-256, default: 1)
 
+  # Datagram obfuscation (recommended: keep enabled)
+  # Encrypts and randomises the length of every packet on the wire so the
+  # tunnel cannot be fingerprinted as KCP/raw-packet traffic by DPI.
+  # Both peers must have the same key and enable it.
+  obfs:
+    enabled: true             # true = obfuscate all transport packets (default)
+    key: ""                   # Optional: defaults to transport.kcp.key
+    maxpad: 64                # Random padding window in bytes (0-512)
 
   # KCP protocol settings
   kcp:

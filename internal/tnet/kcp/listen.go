@@ -13,25 +13,32 @@ import (
 )
 
 type Listener struct {
-	PacketConn *socket.PacketConn
+	rawConn    *socket.PacketConn
+	packetConn net.PacketConn
 	cfg        *conf.KCP
 	listener   *kcp.Listener
 }
 
-func Listen(cfg *conf.KCP, netCfg conf.Network) (tnet.Listener, error) {
+func Listen(cfg *conf.KCP, obfsCfg *conf.Obfs, netCfg conf.Network) (tnet.Listener, error) {
 	nCfg := netCfg
 	packetConn, err := socket.New(&nCfg)
 	if err != nil {
 		return nil, fmt.Errorf("kcp: failed to create packetconn: %w", err)
 	}
 
-	l, err := kcp.ServeConn(cfg.Block, cfg.Dshard, cfg.Pshard, packetConn)
+	trConn, err := obfsCfg.Wrap(packetConn)
 	if err != nil {
 		packetConn.Close()
+		return nil, fmt.Errorf("kcp: failed to wrap obfuscation: %w", err)
+	}
+
+	l, err := kcp.ServeConn(cfg.Block, cfg.Dshard, cfg.Pshard, trConn)
+	if err != nil {
+		trConn.Close()
 		return nil, fmt.Errorf("kcp: failed to serve connection: %w", err)
 	}
 
-	return &Listener{PacketConn: packetConn, cfg: cfg, listener: l}, nil
+	return &Listener{rawConn: packetConn, packetConn: trConn, cfg: cfg, listener: l}, nil
 }
 
 func (l *Listener) Accept() (tnet.Conn, error) {
@@ -55,8 +62,8 @@ func (l *Listener) Close() error {
 			err = e
 		}
 	}
-	if l.PacketConn != nil {
-		if e := l.PacketConn.Close(); e != nil && err == nil {
+	if l.packetConn != nil {
+		if e := l.packetConn.Close(); e != nil && err == nil {
 			err = e
 		}
 	}
@@ -68,9 +75,9 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) SetClientTCPF(addr net.Addr, f []conf.TCPF) {
-	l.PacketConn.SetClientTCPF(addr, f)
+	l.rawConn.SetClientTCPF(addr, f)
 }
 
 func (l *Listener) DeleteClientTCPF(addr net.Addr) {
-	l.PacketConn.DeleteClientTCPF(addr)
+	l.rawConn.DeleteClientTCPF(addr)
 }

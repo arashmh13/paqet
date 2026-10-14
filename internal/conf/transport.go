@@ -9,6 +9,7 @@ type Transport struct {
 	Protocol string `yaml:"protocol"`
 	Conn     int    `yaml:"conn"`
 	KCP      *KCP   `yaml:"kcp"`
+	Obfs     *Obfs  `yaml:"obfs"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -16,12 +17,19 @@ func (t *Transport) setDefaults(role string) {
 		t.Conn = 1
 	}
 
+	var kcpKey string
 	switch t.Protocol {
 	case "kcp":
 		if t.KCP != nil {
 			t.KCP.setDefaults(role)
+			kcpKey = t.KCP.Key
 		}
 	}
+
+	if t.Obfs == nil {
+		t.Obfs = &Obfs{}
+	}
+	t.Obfs.setDefaults(kcpKey)
 }
 
 func (t *Transport) validate() []error {
@@ -43,6 +51,14 @@ func (t *Transport) validate() []error {
 		} else {
 			errors = append(errors, t.KCP.validate()...)
 		}
+	}
+
+	if t.Obfs != nil {
+		mtu := 0
+		if t.KCP != nil {
+			mtu = t.KCP.MTU
+		}
+		errors = append(errors, t.Obfs.validate(mtu)...)
 	}
 
 	return errors

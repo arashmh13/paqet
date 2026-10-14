@@ -5,6 +5,9 @@ import (
 	"net"
 	"time"
 
+	"paqet/internal/protocol"
+	"paqet/internal/tnet"
+
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 
@@ -14,7 +17,7 @@ import (
 )
 
 type Conn struct {
-	PacketConn *socket.PacketConn
+	PacketConn net.PacketConn
 	UDPSession *kcp.UDPSession
 	Session    *smux.Session
 }

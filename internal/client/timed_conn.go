@@ -27,7 +27,7 @@ func newTimedConn(cfg *conf.Conf) (*timedConn, error) {
 }
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
-	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Network)
+	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
 	if err != nil {
 		return nil, err
 	}

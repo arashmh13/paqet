@@ -12,16 +12,22 @@ import (
 	"paqet/internal/tnet"
 )
 
-func Dial(addr *net.UDPAddr, cfg *conf.KCP, netCfg conf.Network) (tnet.Conn, error) {
+func Dial(addr *net.UDPAddr, cfg *conf.KCP, obfsCfg *conf.Obfs, netCfg conf.Network) (tnet.Conn, error) {
 	nCfg := netCfg
 	packetConn, err := socket.New(&nCfg)
 	if err != nil {
 		return nil, fmt.Errorf("kcp: failed to create packetconn: %w", err)
 	}
 
-	conn, err := kcp.NewConn(addr.String(), cfg.Block, cfg.Dshard, cfg.Pshard, packetConn)
+	trConn, err := obfsCfg.Wrap(packetConn)
 	if err != nil {
 		packetConn.Close()
+		return nil, fmt.Errorf("kcp: failed to wrap obfuscation: %w", err)
+	}
+
+	conn, err := kcp.NewConn(addr.String(), cfg.Block, cfg.Dshard, cfg.Pshard, trConn)
+	if err != nil {
+		trConn.Close()
 		return nil, fmt.Errorf("kcp: failed to dial connection: %w", err)
 	}
 	aplConf(conn, cfg)
@@ -29,9 +35,9 @@ func Dial(addr *net.UDPAddr, cfg *conf.KCP, netCfg conf.Network) (tnet.Conn, err
 	sess, err := smux.Client(conn, smuxConf(cfg))
 	if err != nil {
 		conn.Close()
-		packetConn.Close()
+		trConn.Close()
 		return nil, fmt.Errorf("kcp: failed to create smux session: %w", err)
 	}
 
-	return &Conn{packetConn, conn, sess}, nil
+	return &Conn{trConn, conn, sess}, nil
 }
