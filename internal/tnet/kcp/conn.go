@@ -10,10 +10,6 @@ import (
 
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
-
-	"paqet/internal/protocol"
-	"paqet/internal/socket"
-	"paqet/internal/tnet"
 )
 
 type Conn struct {
