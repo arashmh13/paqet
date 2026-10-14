@@ -19,6 +19,8 @@ func Dial(addr *net.UDPAddr, cfg *conf.KCP, obfsCfg *conf.Obfs, netCfg conf.Netw
 		return nil, fmt.Errorf("kcp: failed to create packetconn: %w", err)
 	}
 
+	_ = packetConn.Handshake(addr)
+
 	trConn, err := obfsCfg.Wrap(packetConn)
 	if err != nil {
 		packetConn.Close()

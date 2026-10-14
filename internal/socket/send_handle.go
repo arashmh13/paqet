@@ -100,7 +100,7 @@ func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
 	e.ip4 = layers.IPv4{
 		Version:  4,
 		IHL:      5,
-		TOS:      184,
+		TOS:      0,
 		TTL:      64,
 		Flags:    layers.IPv4DontFragment,
 		Protocol: layers.IPProtocolTCP,
@@ -112,7 +112,7 @@ func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
 func (h *SendHandle) buildIPv6Header(e *encoder, dstIP net.IP) {
 	e.ip6 = layers.IPv6{
 		Version:      6,
-		TrafficClass: 184,
+		TrafficClass: 0,
 		HopLimit:     64,
 		NextHeader:   layers.IPProtocolTCP,
 		SrcIP:        h.srcIPv6,
@@ -228,6 +228,76 @@ func (h *SendHandle) deleteClientTCPF(addr net.Addr) {
 	h.tcpF.mu.Lock()
 	delete(h.tcpF.clientTCPF, hash.IPAddr(a.IP, uint16(a.Port)))
 	h.tcpF.mu.Unlock()
+}
+
+func (h *SendHandle) WriteControl(addr *net.UDPAddr, f conf.TCPF, seq, ack uint32, synOpts bool) error {
+	e := h.ePool.Get().(*encoder)
+	defer func() {
+		e.buf.Clear()
+		h.ePool.Put(e)
+	}()
+
+	dstIP := addr.IP
+	dstPort := uint16(addr.Port)
+
+	e.tcp = layers.TCP{
+		SrcPort: layers.TCPPort(h.srcPort),
+		DstPort: layers.TCPPort(dstPort),
+		FIN:     f.FIN, SYN: f.SYN, RST: f.RST, PSH: f.PSH, ACK: f.ACK, URG: f.URG, ECE: f.ECE, CWR: f.CWR, NS: f.NS,
+		Window:  65535,
+		Seq:     seq,
+		Ack:     ack,
+	}
+
+	counter := h.tsCounter.Add(1)
+	tsVal := h.time + (counter >> 3)
+	opts := e.opts[:0]
+	if synOpts {
+		binary.BigEndian.PutUint32(e.ts[0:4], tsVal)
+		binary.BigEndian.PutUint32(e.ts[4:8], 0)
+		opts = append(opts,
+			layers.TCPOption{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: e.mss[:]},
+			layers.TCPOption{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
+			layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: e.ts[:]},
+			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
+			layers.TCPOption{OptionType: layers.TCPOptionKindWindowScale, OptionLength: 3, OptionData: e.ws[:]},
+		)
+	} else {
+		tsEcr := tsVal - 50
+		binary.BigEndian.PutUint32(e.ts[0:4], tsVal)
+		binary.BigEndian.PutUint32(e.ts[4:8], tsEcr)
+		opts = append(opts,
+			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
+			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
+			layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: e.ts[:]},
+		)
+	}
+	e.tcp.Options = opts
+
+	var ipLayer gopacket.SerializableLayer
+	if dstIP.To4() != nil {
+		h.buildIPv4Header(e, dstIP)
+		ipLayer = &e.ip4
+		e.tcp.SetNetworkLayerForChecksum(&e.ip4)
+		e.eth.DstMAC = h.srcIPv4RHWA
+		e.eth.EthernetType = layers.EthernetTypeIPv4
+	} else {
+		h.buildIPv6Header(e, dstIP)
+		ipLayer = &e.ip6
+		e.tcp.SetNetworkLayerForChecksum(&e.ip6)
+		e.eth.DstMAC = h.srcIPv6RHWA
+		e.eth.EthernetType = layers.EthernetTypeIPv6
+	}
+
+	serOpts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(e.buf, serOpts, &e.eth, ipLayer, &e.tcp); err != nil {
+		return err
+	}
+
+	h.writeMu.Lock()
+	err := h.handle.WritePacketData(e.buf.Bytes())
+	h.writeMu.Unlock()
+	return err
 }
 
 func (h *SendHandle) Close() {

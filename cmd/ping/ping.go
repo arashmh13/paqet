@@ -44,6 +44,8 @@ func sendPacket() {
 	}
 	defer packetConn.Close()
 
+	_ = packetConn.Handshake(cfg.Server.Addr)
+
 	log.Printf("sending packet from IPv4:%s IPv6:%s to %s via %s", cfg.Network.IPv4.Addr, cfg.Network.IPv6.Addr, cfg.Server.Addr.String(), cfg.Network.Interface.Name)
 	log.Printf("payload: \"%s\" (%d bytes)", payload, len(payload))
 

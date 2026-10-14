@@ -24,10 +24,19 @@ type decoder struct {
 	decoded []gopacket.LayerType
 }
 
+type HandshakePacket struct {
+	Addr *net.UDPAddr
+	SYN  bool
+	ACK  bool
+	Seq  uint32
+	Ack  uint32
+}
+
 type RecvHandle struct {
-	handle *pcap.Handle
-	dPool  sync.Pool
-	mu     sync.Mutex
+	handle      *pcap.Handle
+	dPool       sync.Pool
+	mu          sync.Mutex
+	onHandshake func(*HandshakePacket)
 }
 
 func NewRecvHandle(cfg *conf.Network) (*RecvHandle, error) {
@@ -77,6 +86,9 @@ func (h *RecvHandle) Read(data []byte) (int, net.Addr, error) {
 
 	addr := &net.UDPAddr{}
 	var payload []byte
+	isSYN := false
+	isACK := false
+	var tcpSeq, tcpAck uint32
 	for _, t := range d.decoded {
 		switch t {
 		case layers.LayerTypeIPv4:
@@ -86,7 +98,21 @@ func (h *RecvHandle) Read(data []byte) (int, net.Addr, error) {
 		case layers.LayerTypeTCP:
 			addr.Port = int(d.tcp.SrcPort)
 			payload = d.tcp.Payload
+			isSYN = d.tcp.SYN
+			isACK = d.tcp.ACK
+			tcpSeq = d.tcp.Seq
+			tcpAck = d.tcp.Ack
 		}
+	}
+
+	if h.onHandshake != nil && (isSYN || isACK) && len(payload) == 0 && addr.IP != nil {
+		h.onHandshake(&HandshakePacket{
+			Addr: addr,
+			SYN:  isSYN,
+			ACK:  isACK,
+			Seq:  tcpSeq,
+			Ack:  tcpAck,
+		})
 	}
 
 	if addr.IP == nil || len(payload) == 0 {

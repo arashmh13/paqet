@@ -20,6 +20,8 @@ type PacketConn struct {
 	recvHandle    *RecvHandle
 	readDeadline  atomic.Value
 	writeDeadline atomic.Value
+
+	handshakeCh chan *HandshakePacket
 }
 
 func New(cfg *conf.Network) (*PacketConn, error) {
@@ -39,12 +41,60 @@ func New(cfg *conf.Network) (*PacketConn, error) {
 	}
 
 	conn := &PacketConn{
-		cfg:        cfg,
-		sendHandle: sendHandle,
-		recvHandle: recvHandle,
+		cfg:         cfg,
+		sendHandle:  sendHandle,
+		recvHandle:  recvHandle,
+		handshakeCh: make(chan *HandshakePacket, 16),
+	}
+
+	recvHandle.onHandshake = func(p *HandshakePacket) {
+		if p.SYN && !p.ACK {
+			// Server received SYN: auto reply with SYN-ACK
+			serverISN := rand.Uint32()
+			_ = sendHandle.WriteControl(p.Addr, conf.TCPF{SYN: true, ACK: true}, serverISN, p.Seq+1, true)
+		} else if p.SYN && p.ACK {
+			// Client received SYN-ACK: notify handshake waiter
+			select {
+			case conn.handshakeCh <- p:
+			default:
+			}
+		}
 	}
 
 	return conn, nil
+}
+
+func (c *PacketConn) Handshake(dst *net.UDPAddr) error {
+	clientISN := rand.Uint32()
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_, _, _ = c.recvHandle.Read(buf)
+			}
+		}
+	}()
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := c.sendHandle.WriteControl(dst, conf.TCPF{SYN: true}, clientISN, 0, true); err != nil {
+			return err
+		}
+		select {
+		case hs := <-c.handshakeCh:
+			if hs.Addr.IP.Equal(dst.IP) && hs.Addr.Port == dst.Port {
+				_ = c.sendHandle.WriteControl(dst, conf.TCPF{ACK: true}, hs.Ack, hs.Seq+1, false)
+				return nil
+			}
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 func (c *PacketConn) ReadFrom(data []byte) (n int, addr net.Addr, err error) {
