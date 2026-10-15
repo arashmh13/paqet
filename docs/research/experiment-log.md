@@ -390,3 +390,48 @@
      - Discovered that Iranian domestic resolver `45.9.252.80` answers basic queries ($< 1\text{ ms}$) but fails long Base32 labels (censorship filtering).
      - Public resolvers (`8.8.8.8`, `1.1.1.1`, `9.9.9.9`) scored 6/6 with clean NXDOMAIN and 1400B EDNS0 support.
 - **Outcome:** Operational emergency communication channel verified end-to-end under real conventional-transport failure conditions. Documented in `docs/research/dns-asymmetric-end-to-end-validation.md` and `docs/research/asymmetric-protocol-security-audit.md`. Production services healthy and rollback-ready.
+
+---
+
+## Cycle 18: Phase 10 Security Hardening, Cryptographic Redaction, Pre-Authentication Remediation, and Recovery Plane Validation
+- **Objective:** Eliminate insecure shared-secret defaults and command-line credential exposure; remove plaintext payload logging; fix pre-authentication session allocation and bound server session memory; enforce 64-bit cryptographic nonces and idempotent duplicate reply caching; validate RFC 7766 TCP DNS support; execute safe isolated transport failure testing without risking production services; run rate-limited multi-resolver soak benchmarks across Google, Cloudflare, and Quad9; architect multi-nameserver redundancy for independent provider resilience.
+- **Actions:**
+  1. Remediated P0 Key Management & Secret Exposure:
+     - Eradicated hardcoded shared-secret default string from `cmd/emergency/emergency.go`. Added fail-closed key validation requiring exactly 32 decoded bytes.
+     - Implemented protected key-file loading (`--key-file`) and systemd credential loading (`$CREDENTIALS_DIRECTORY/emergency_key`).
+     - Generated a fresh 32-byte production emergency key via `crypto/rand` and deployed to `/opt/paqet/emergency.key` (0600 root-owned) on both Iran and Germany VPSs.
+     - Updated Germany systemd unit `paqet-emergency.service` to use `--key-file /opt/paqet/emergency.key`. Verified via `ps aux` that zero secret material is visible in process arguments.
+     - Kept primary Paqet proxy transport keys in `client.yaml`/`server.yaml` strictly decoupled.
+  2. Remediated Plaintext Logging:
+     - Replaced server payload logging with metadata-only logging: `[EMERGENCY-SERVER] Authenticated message ID=... Type=... PayloadBytes=... ClientID=... Status=PROCESSED`.
+     - Verified systemd journals on both nodes contain zero plaintext message bytes or credentials.
+  3. Fixed Pre-Authentication Session Allocation & Bounded Memory:
+     - In `internal/ng/transport/dns_emergency.go`, eliminated premature session persistence in `s.sessions`. The server now decrypts with an ephemeral session and **persists sessions only after successful AEAD tag and anti-replay verification**.
+     - Unauthenticated queries or forged session IDs are dropped or rejected with `REFUSED (5)` without allocating persistent heap memory.
+     - Implemented `MaxActiveServerSessions = 1024` with 10-minute idle session eviction and background garbage collector loop.
+  4. Implemented Idempotent Reply Caching & 64-Bit Cryptographic Nonces:
+     - Upgraded QNAME offset from 24-bit to 64-bit cryptographically secure random nonces (`cryptoRandUint64()`), eliminating cache collision risks across recursors.
+     - Implemented `replyCache map[uint32][]byte` storing recent sealed responses per session. Duplicate queries recover cached responses immediately without re-invoking application handlers.
+  5. Implemented RFC 7766 TCP Port 53 Support:
+     - Added concurrent TCP `:53` listener to `EmergencyDNSServer` with 2-byte length-prefix framing.
+  6. Implemented Strict Control Plane Message Schema:
+     - Defined typed schema for control datagrams (`ping`, `alert`, `bootstrap_request`, `bootstrap_response`, `status`, `data`).
+     - Hard-capped application payloads at `MaxEmergencyPayloadBytes = 512`. Rejected unknown message types with `FORMERR (1)`.
+  7. Automated Adversarial Quality Gates:
+     - Added 5 new regression tests in `dns_emergency_test.go`: `TestUnauthenticatedSessionIDMemoryExhaustionProtection`, `TestIdempotentDuplicateRetransmission`, `TestTCPPort53QueryHandling`, `TestKeyLengthValidationAndFailClosed`, `TestOversizedPayloadRejection`.
+     - Ran `go test -v -race ./...` across all packages: **100% PASS with 0 data races**. Ran `go vet ./...`: clean.
+  8. Safe Isolated Conventional Transport Severance Test:
+     - Spawned dedicated test listener on Germany VPS port `18089`. Confirmed baseline reachability from Iran VPS.
+     - Applied isolated egress drop on Iran VPS for `77.37.65.2:18089` only (`BLOCKED`).
+     - While port 18089 was blocked, dispatched emergency message over DNS via Google `8.8.8.8:53`. Received authenticated `ACK_ECHO` in $162.6\text{ ms}$.
+     - Removed isolated firewall rule (`REACHABLE`). Confirmed primary production SOCKS5 proxy on `:1090` remained completely undisturbed ($0.228\text{ s}$, HTTP 200).
+  9. Rate-Limited Multi-Resolver Soak Benchmark (45 Trials):
+     - Executed 45 trials (15 per resolver: 5x16B, 5x64B, 5x140B) across Google (`8.8.8.8`), Cloudflare (`1.1.1.1`), and Quad9 (`9.9.9.9`) at 0.8s rate-limited intervals.
+     - Payloads $\le 64\text{ bytes}$: **100.0% success rate (30/30)**, median RTT **$148.2\text{ ms}$**, 100% byte-exact echo verification.
+     - Payloads $140\text{ bytes}$ (6 fragments): Fragment loss across recursor caches increased tail latency to $2.5 - 4.2\text{ s}$.
+     - Defined core engineering boundary: emergency control signaling must fit within $\le 64\text{ bytes}$.
+  10. Built and Deployed Release `v2.5.2-hardened`:
+      - WSL build: SHA-256 `c6c2331188d650d00b78ddc81b955811977a97fc6f49021c610bb401cbbc7475`.
+      - Deployed to both VPS nodes. Backups preserved in `/opt/paqet/backup-candidate3/paqet`.
+      - Created comprehensive research docs: `docs/research/security-audit.md`, `docs/research/recovery-plane-red-team-tests.md`, and `docs/research/dns_redundancy_and_recovery_plane.md`.
+- **Outcome:** Emergency control plane fully hardened against heap exhaustion, credential leakage, and cache collisions. Verified end-to-end under isolated port block conditions. Production services healthy and rollback-ready.

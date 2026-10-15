@@ -3,10 +3,13 @@ package emergency
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +25,7 @@ var (
 	resolverAddr  string
 	domainSuffix  string
 	keyStr        string
+	keyFile       string
 	clientID      string
 	messageStr    string
 	timeoutSec    int
@@ -34,13 +38,15 @@ func init() {
 	Cmd.AddCommand(sendCmd)
 	Cmd.AddCommand(scanCmd)
 
-	serverCmd.Flags().StringVar(&listenAddr, "addr", ":53", "Authoritative DNS listening UDP address")
+	serverCmd.Flags().StringVar(&listenAddr, "addr", ":53", "Authoritative DNS listening UDP and TCP address")
 	serverCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
-	serverCmd.Flags().StringVar(&keyStr, "key", "yP9v/8x+n3Lp+ZqW4s1RjT5oK2a9XbE8vM7JdH4=", "Base64 or raw 32-byte shared key")
+	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
+	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
 
 	sendCmd.Flags().StringVar(&resolverAddr, "resolver", "8.8.8.8:53", "Recursive DNS resolver address (e.g. 8.8.8.8:53)")
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
-	sendCmd.Flags().StringVar(&keyStr, "key", "yP9v/8x+n3Lp+ZqW4s1RjT5oK2a9XbE8vM7JdH4=", "Base64 or raw 32-byte shared key")
+	sendCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
+	sendCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
 	sendCmd.Flags().StringVar(&clientID, "client-id", "c01", "Client ID string (max 4 chars)")
 	sendCmd.Flags().StringVarP(&messageStr, "message", "m", "EMERGENCY_PING", "Application payload to transmit")
 	sendCmd.Flags().IntVar(&timeoutSec, "timeout", 5, "Timeout in seconds for response")
@@ -61,15 +67,19 @@ var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Runs the authoritative emergency DNS daemon",
 	Run: func(cmd *cobra.Command, args []string) {
-		psk := parseKey(keyStr)
+		psk, err := parseKey(keyStr, keyFile)
+		if err != nil {
+			log.Fatalf("failed to load emergency key: %v", err)
+		}
 
 		srv, err := transport.NewEmergencyDNSServer(transport.EmergencyDNSServerConfig{
 			ListenAddr:   listenAddr,
 			DomainSuffix: domainSuffix,
 			PSK:          psk,
 			Handler: func(msg *transport.EmergencyMessage) (*transport.EmergencyResponse, error) {
-				log.Printf("[EMERGENCY-SERVER] Received authenticated msg ID=%s Type=%s Payload=%q",
-					msg.ID, msg.Type, string(msg.Payload))
+				// Privacy and Security: Log only metadata, never plaintext payload or key material
+				log.Printf("[EMERGENCY-SERVER] Authenticated message ID=%s Type=%s PayloadBytes=%d ClientID=%s Status=PROCESSED",
+					msg.ID, msg.Type, len(msg.Payload), clientID)
 				return &transport.EmergencyResponse{
 					ID:        msg.ID,
 					Status:    "OK",
@@ -83,7 +93,7 @@ var serverCmd = &cobra.Command{
 		}
 		defer srv.Stop()
 
-		log.Printf("[EMERGENCY-SERVER] Listening on %s for domain *.%s", srv.Addr(), domainSuffix)
+		log.Printf("[EMERGENCY-SERVER] Listening on %s (UDP+TCP) for domain *.%s", srv.Addr(), domainSuffix)
 
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -96,7 +106,10 @@ var sendCmd = &cobra.Command{
 	Use:   "send",
 	Short: "Transmits an authenticated emergency message over recursive DNS and waits for reply",
 	Run: func(cmd *cobra.Command, args []string) {
-		psk := parseKey(keyStr)
+		psk, err := parseKey(keyStr, keyFile)
+		if err != nil {
+			log.Fatalf("failed to load emergency key: %v", err)
+		}
 
 		client, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
 			ResolverAddr: resolverAddr,
@@ -110,7 +123,7 @@ var sendCmd = &cobra.Command{
 			log.Fatalf("failed to initialize emergency client: %v", err)
 		}
 
-		msgID := fmt.Sprintf("msg-%d", time.Now().UnixNano()%1000000)
+		msgID := transport.GenerateRandomMessageID()
 		msg := &transport.EmergencyMessage{
 			ID:        msgID,
 			Type:      "alert",
@@ -118,7 +131,8 @@ var sendCmd = &cobra.Command{
 			Timestamp: time.Now().Unix(),
 		}
 
-		fmt.Printf("[CLIENT] Sending emergency message ID=%s to %s via *.%s...\n", msgID, resolverAddr, domainSuffix)
+		fmt.Printf("[CLIENT] Sending emergency message ID=%s (%d bytes) to %s via *.%s...\n",
+			msgID, len(msg.Payload), resolverAddr, domainSuffix)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+2)*time.Second)
 		defer cancel()
 
@@ -130,21 +144,61 @@ var sendCmd = &cobra.Command{
 		fmt.Printf("[CLIENT] SUCCESS! RTT: %v\n", rtt)
 		fmt.Printf(" - Response ID: %s\n", resp.ID)
 		fmt.Printf(" - Status:      %s\n", resp.Status)
-		fmt.Printf(" - Reply:       %s\n", string(resp.Reply))
+		fmt.Printf(" - Reply Bytes: %d\n", len(resp.Reply))
+		if len(resp.Reply) <= 256 {
+			fmt.Printf(" - Reply Echo:  %s\n", string(resp.Reply))
+		} else {
+			fmt.Printf(" - Reply Echo:  %s... (truncated preview)\n", string(resp.Reply[:64]))
+		}
 	},
 }
 
-func parseKey(k string) []byte {
-	if b, err := base64.StdEncoding.DecodeString(k); err == nil && len(b) == 32 {
-		return b
+func parseKey(kStr, kFile string) ([]byte, error) {
+	var rawStr string
+
+	if kFile != "" {
+		data, err := os.ReadFile(kFile)
+		if err != nil {
+			return nil, fmt.Errorf("read key file %s: %w", kFile, err)
+		}
+		rawStr = strings.TrimSpace(string(data))
+	} else if credDir := os.Getenv("CREDENTIALS_DIRECTORY"); credDir != "" {
+		credPath := filepath.Join(credDir, "emergency_key")
+		if data, err := os.ReadFile(credPath); err == nil {
+			rawStr = strings.TrimSpace(string(data))
+		}
 	}
-	raw := []byte(k)
-	if len(raw) >= 32 {
-		return raw[:32]
+
+	if rawStr == "" {
+		if envKey := os.Getenv("PAQET_EMERGENCY_KEY"); envKey != "" {
+			rawStr = strings.TrimSpace(envKey)
+		}
 	}
-	padded := make([]byte, 32)
-	copy(padded, raw)
-	return padded
+
+	if rawStr == "" && kStr != "" {
+		rawStr = strings.TrimSpace(kStr)
+	}
+
+	if rawStr == "" {
+		return nil, errors.New("no emergency key provided. An explicit 32-byte key must be supplied via --key-file, $PAQET_EMERGENCY_KEY, or --key")
+	}
+
+	// 1. Try base64
+	if b, err := base64.StdEncoding.DecodeString(rawStr); err == nil && len(b) == 32 {
+		return b, nil
+	}
+
+	// 2. Try hex
+	if b, err := hex.DecodeString(rawStr); err == nil && len(b) == 32 {
+		return b, nil
+	}
+
+	// 3. Try raw bytes
+	if len(rawStr) == 32 {
+		return []byte(rawStr), nil
+	}
+
+	return nil, fmt.Errorf("invalid key length (got %d chars). Key must decode to exactly 32 bytes (base64, hex, or raw). Zero-padding and truncation are rejected for security", len(rawStr))
 }
 
 var scanCmd = &cobra.Command{
@@ -181,9 +235,9 @@ var scanCmd = &cobra.Command{
 
 		results := dns.ScanResolverPool(ctx, unique, 53, domainSuffix, time.Duration(timeoutSec)*time.Second, 4)
 
-		fmt.Printf("%-18s %-8s %-18s %-6s %-10s %-8s %-8s %-8s\n",
-			"RESOLVER", "STATUS", "PROFILE", "SCORE", "LATENCY", "EDNS0", "NXDOMAIN", "TUNNEL")
-		fmt.Println(strings.Repeat("-", 95))
+		fmt.Printf("%-18s %-8s %-18s %-6s %-10s %-8s %-8s %-10s\n",
+			"RESOLVER", "STATUS", "PROFILE", "SCORE", "LATENCY", "EDNS0", "NXDOMAIN", "CAPABILITY")
+		fmt.Println(strings.Repeat("-", 97))
 
 		for _, r := range results {
 			nxStatus := "HIJACKED"
@@ -194,19 +248,22 @@ var scanCmd = &cobra.Command{
 			if !r.EDNS0Support {
 				ednsStr = "NONE"
 			}
-			tunnelStr := "FAIL"
+			capabilityStr := "FAIL"
 			if r.SupportsLongLabels && r.SupportsTXT {
-				tunnelStr = "PASS"
+				capabilityStr = "PASS"
 			}
 
-			fmt.Printf("%-18s %-8s %-18s %d/6    %-10s %-8s %-8s %-8s\n",
+			fmt.Printf("%-18s %-8s %-18s %d/6    %-10s %-8s %-8s %-10s\n",
 				r.Host, r.Status, r.Profile, r.Score,
 				fmt.Sprintf("%.1fms", float64(r.Latency.Microseconds())/1000.0),
-				ednsStr, nxStatus, tunnelStr)
+				ednsStr, nxStatus, capabilityStr)
 		}
 
+		fmt.Println("\nNote: 'CAPABILITY PASS' verifies DNS protocol, long label, and TXT capability.")
+		fmt.Println("      It does NOT guarantee end-to-end transport without an authenticated payload exchange.")
+
 		if len(results) > 0 && results[0].Score >= 4 && results[0].NXDOMAINPreserved {
-			fmt.Printf("\n[RECOMMENDATION] Optimal unpoisoned resolver: %s:53 (Score %d/6, Latency %v)\n",
+			fmt.Printf("\n[RECOMMENDATION] Optimal candidate resolver: %s:53 (Score %d/6, Latency %v)\n",
 				results[0].Host, results[0].Score, results[0].Latency)
 		} else {
 			fmt.Println("\n[WARNING] No candidate passed all censorship checks with clean NXDOMAIN preservation.")

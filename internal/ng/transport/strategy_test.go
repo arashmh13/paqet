@@ -130,7 +130,7 @@ func TestSNIAssistedEndToEnd(t *testing.T) {
 func TestDNSQNameFramingAndReassembly(t *testing.T) {
 	domainSuffix := "tunnel.example.com"
 	clientID := "c99"
-	offset := uint32(1005)
+	offset := uint64(1005)
 
 	payload := []byte("Censorship resistance via asymmetric DNS query transport")
 

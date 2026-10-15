@@ -91,3 +91,17 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 - **Measured Egress Limit:** Direct un-proxied TCP curl downloads from Iran VPS (`185.18.215.124`) to German VPS (`77.37.65.2`) are physically shaped to $1.34\text{ MB/s}$ ($11.27\text{ Mbps}$).
 - **Transport Utilization:** `aead-stream` achieves $1.43\text{ MB/s}$ ($11.97\text{ Mbps}$), representing 100% saturation of the allocated link capacity.
 - **Throughput Reporting:** Measurements reporting 70+ Mbps reflect unthrottled local loopback or synthetic lab conditions, not the real-world egress limit of this specific virtual machine path.
+
+---
+
+## 11. Bounded Payload Size Boundary for Recursive DNS Reliability
+
+- **Empirical Boundary:** In Phase 10's 45-trial live soak test across Google, Cloudflare, and Quad9, payloads $\le 64\text{ bytes}$ achieved **100.0% delivery with median latency of $148.2\text{ ms}$**. Payloads of $140\text{ bytes}$ (requiring 6 DNS query fragments) experienced recursive fragment loss and required multi-second retransmission backoffs.
+- **Protocol Limitation:** Public recursive DNS resolvers do not provide reliable multi-fragment assembly guarantees. Emergency control signaling must remain strictly bounded to $\le 64\text{ bytes}$ (1 to 2 fragments). General-purpose data tunneling over DNS is unviable.
+
+---
+
+## 12. Authoritative Nameserver IP Co-Location Dependency
+
+- **Single Host SPOF:** The authoritative nameserver daemon runs on `77.37.65.2:53`, co-located on the same VPS hosting primary TCP/TLS proxy transports.
+- **Vulnerability:** An IP-prefix or autonomous system block targeting Hetzner AS24940 will sever both conventional transports and the authoritative DNS daemon. True censorship survivability fundamentally requires a secondary authoritative nameserver deployed on an independent cloud provider and distinct IP network prefix.

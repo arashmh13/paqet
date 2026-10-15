@@ -24,14 +24,14 @@ var b32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 // EncodeDNSQName encodes payload chunks into RFC 1035 compliant domain labels.
 // Format: p<part>.t<total>.o<offset>.<base32chunk>.<clientID>.<domainSuffix>
-func EncodeDNSQName(domainSuffix, clientID string, offset uint32, part, total uint8, chunk []byte) string {
+func EncodeDNSQName(domainSuffix, clientID string, offset uint64, part, total uint8, chunk []byte) string {
 	encodedData := strings.ToLower(b32Encoding.EncodeToString(chunk))
 	// Ensure labels are <= 63 characters
 	return fmt.Sprintf("p%d.t%d.o%d.%s.%s.%s", part, total, offset, encodedData, clientID, domainSuffix)
 }
 
 // DecodeDNSQName parses and decodes an incoming DNS QNAME into its constituent metadata and payload.
-func DecodeDNSQName(qname, domainSuffix string) (clientID string, offset uint32, part, total uint8, data []byte, err error) {
+func DecodeDNSQName(qname, domainSuffix string) (clientID string, offset uint64, part, total uint8, data []byte, err error) {
 	qname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
 	domainSuffix = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domainSuffix)), ".")
 
@@ -72,11 +72,11 @@ func DecodeDNSQName(qname, domainSuffix string) (clientID string, offset uint32,
 	if len(labels[2]) < 2 || labels[2][0] != 'o' {
 		return "", 0, 0, 0, nil, ErrDNSInvalidQuery
 	}
-	oInt, err := strconv.ParseUint(labels[2][1:], 10, 32)
+	oInt, err := strconv.ParseUint(labels[2][1:], 10, 64)
 	if err != nil {
 		return "", 0, 0, 0, nil, err
 	}
-	offset = uint32(oInt)
+	offset = oInt
 
 	// label 3: base32 payload
 	b32Data := strings.ToUpper(labels[3])
@@ -136,7 +136,7 @@ func (r *DNSReassembler) cleanerLoop() {
 const MaxPendingFrames = 1024
 
 // PushFragment inserts a fragment. If this completes the frame, it returns the full byte slice.
-func (r *DNSReassembler) PushFragment(clientID string, offset uint32, part, total uint8, chunk []byte) ([]byte, bool) {
+func (r *DNSReassembler) PushFragment(clientID string, offset uint64, part, total uint8, chunk []byte) ([]byte, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -558,7 +558,7 @@ type RealSocketDNSUpstreamSender struct {
 	resolverAddr *net.UDPAddr
 	domainSuffix string
 	clientID     string
-	offset       uint32
+	offset       uint64
 	mu           sync.Mutex
 }
 
@@ -594,7 +594,7 @@ func (s *RealSocketDNSUpstreamSender) SendUpstream(ctx context.Context, frame []
 		chunk := frame[start:end]
 
 		qname := EncodeDNSQName(s.domainSuffix, s.clientID, curOffset, i, totalParts, chunk)
-		queryPkt := BuildDNSQuery(qname, 0x0010 /* TXT */, uint16(curOffset+uint32(i)))
+		queryPkt := BuildDNSQuery(qname, 0x0010 /* TXT */, uint16(curOffset+uint64(i)))
 
 		if _, err := s.conn.WriteToUDP(queryPkt, s.resolverAddr); err != nil {
 			return fmt.Errorf("dns sendto %s: %w", s.resolverAddr, err)

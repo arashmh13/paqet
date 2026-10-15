@@ -14,7 +14,7 @@ import (
 func TestDNSAsymmetricFramingAndReassemblyDetails(t *testing.T) {
 	domainSuffix := "tunnel.paqet.local"
 	clientID := "c99"
-	offset := uint32(1000)
+	offset := uint64(1000)
 
 	// Simulate a 100-byte payload split into 3 chunks
 	payload := []byte("Emergency DNS payload for severe curfew testing. 100% authenticated chunk framing over UDP:53.")

@@ -1,0 +1,396 @@
+{
+  "summary": {
+    "8.8.8.8:53": {
+      "trials": 15,
+      "success_rate": "66.7%",
+      "echo_verified_rate": "66.7%",
+      "min_ms": 99.08,
+      "median_ms": 146.77,
+      "mean_ms": 142.09,
+      "p95_ms": 157.71,
+      "max_ms": 166.73
+    },
+    "1.1.1.1:53": {
+      "trials": 15,
+      "success_rate": "66.7%",
+      "echo_verified_rate": "66.7%",
+      "min_ms": 132.78,
+      "median_ms": 147.77,
+      "mean_ms": 154.79,
+      "p95_ms": 177.46,
+      "max_ms": 180.35
+    },
+    "9.9.9.9:53": {
+      "trials": 15,
+      "success_rate": "80.0%",
+      "echo_verified_rate": "80.0%",
+      "min_ms": 126.84,
+      "median_ms": 150.82,
+      "mean_ms": 351.44,
+      "p95_ms": 196.34,
+      "max_ms": 2558.48
+    }
+  },
+  "trials": [
+    {
+      "trial": 1,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 16,
+      "rtt_ms": 146.069383,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 2,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 16,
+      "rtt_ms": 147.471304,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 3,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 16,
+      "rtt_ms": 166.72745,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 4,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 16,
+      "rtt_ms": 157.71122,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 5,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 16,
+      "rtt_ms": 99.078473,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 6,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 64,
+      "rtt_ms": 133.084215,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 7,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 64,
+      "rtt_ms": 155.195138,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 8,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 64,
+      "rtt_ms": 133.527537,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 9,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 64,
+      "rtt_ms": 130.279466,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 10,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 64,
+      "rtt_ms": 151.798927,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 11,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4244.087934494019,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 12,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4213.186740875244,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 13,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4226.282835006714,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 14,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4257.596254348755,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 15,
+      "resolver": "8.8.8.8:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4259.714603424072,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 16,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 16,
+      "rtt_ms": 171.524561,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 17,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 16,
+      "rtt_ms": 132.777046,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 18,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 16,
+      "rtt_ms": 145.536255,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 19,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 16,
+      "rtt_ms": 180.351532,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 20,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 16,
+      "rtt_ms": 177.461577,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 21,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 64,
+      "rtt_ms": 168.492411,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 22,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 64,
+      "rtt_ms": 138.502379,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 23,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 64,
+      "rtt_ms": 144.750672,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 24,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 64,
+      "rtt_ms": 150.006961,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 25,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 64,
+      "rtt_ms": 138.517352,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 26,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4200.381755828857,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 27,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4250.894069671631,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 28,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4258.152008056641,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 29,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4206.876039505005,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 30,
+      "resolver": "1.1.1.1:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4251.776218414307,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 31,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 16,
+      "rtt_ms": 160.637091,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 32,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 16,
+      "rtt_ms": 133.541205,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 33,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 16,
+      "rtt_ms": 126.837956,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 34,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 16,
+      "rtt_ms": 140.836648,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 35,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 16,
+      "rtt_ms": 143.656207,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 36,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 64,
+      "rtt_ms": 196.342403,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 37,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 64,
+      "rtt_ms": 140.383377,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 38,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 64,
+      "rtt_ms": 160.818672,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 39,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 64,
+      "rtt_ms": 154.139068,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 40,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 64,
+      "rtt_ms": 153.94522,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 41,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 140,
+      "rtt_ms": 147.701787,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 42,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 140,
+      "rtt_ms": 2558.483216,
+      "success": true,
+      "echo_verified": true
+    },
+    {
+      "trial": 43,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4305.650472640991,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 44,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4203.765869140625,
+      "success": false,
+      "echo_verified": false
+    },
+    {
+      "trial": 45,
+      "resolver": "9.9.9.9:53",
+      "payload_bytes": 140,
+      "rtt_ms": 4220.724582672119,
+      "success": false,
+      "echo_verified": false
+    }
+  ]
+}

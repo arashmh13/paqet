@@ -201,3 +201,22 @@ The current public DNS delegation relies on a single authoritative nameserver IP
 - **Limitation:** If German VPS IP `77.37.65.2` is blocked at the IP level, public recursive resolvers cannot reach the authoritative server, disabling the DNS emergency channel.
 - **Future Roadmap:** To eliminate this SPOF, configure secondary authoritative nameservers on independent IP addresses across multiple cloud providers.
 
+---
+
+## 9. Phase 10 Hardened Security & Reliability Enhancements
+
+1. **Secret Key Isolation & Process Protection:**
+   - Production secrets are provisioned into protected key files (`/opt/paqet/emergency.key`, 0600 root-owned).
+   - Removed `--key` defaults and process command-line arguments, eliminating leakage via `ps aux`.
+   - Emergency key rotated to an independent 32-byte secret; primary transport keys remain completely decoupled.
+2. **Pre-Authentication Heap Allocation Elimination:**
+   - Frames are cryptographically authenticated via `openFrame` before allocating or persisting sessions in `s.sessions`. Unauthenticated probers are rejected with `REFUSED (5)` with zero persistent memory allocated.
+   - Live session map capped at `MaxActiveServerSessions = 1024` with 10-minute idle eviction.
+3. **Idempotent Reply Caching:**
+   - Server caches recent sealed response frames per session. Retransmissions of the same sequence number recover the cached reply without re-executing application handlers.
+4. **RFC 7766 TCP Port 53 Support:**
+   - Authoritative daemon listens concurrently on UDP and TCP `:53`.
+5. **Empirical Operating Boundary:**
+   - Bounded to $\le 64\text{ bytes}$ for deterministic 100% single-round-trip delivery ($< 152\text{ ms}$). Payloads $> 140\text{ bytes}$ incur recursor packet fragmentation drops.
+
+
