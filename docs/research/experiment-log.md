@@ -320,3 +320,35 @@
      - `docs/research/asymmetric-protocol-security-audit.md`
      - `docs/research/dns-asymmetric-end-to-end-validation.md`
 - **Outcome:** Zero data races (`go test -race ./internal/...` PASS), 100% test pass. True operational boundaries established. Emergency transport capacity accurately bounded to bootstrap/signaling ($5.6 - 28\text{ kbps}$) and disclaimed as a general SOCKS5 browsing transport.
+
+---
+
+## Cycle 16: SlipNet Reverse Engineering, Clean-Room Resolver Scanner, Public Cloudflare Delegation, and Prior Art Review
+- **Objective:** Deeply analyze SlipNet/slipgate architecture and AGPL-3.0 licensing constraints, establish formal failure models (Conditions A through I), implement a clean-room multi-factor DNS resolver scanner, configure live child zone delegation on Cloudflare for the operator's domain, execute live public recursive DNS traversal, and document novelty and prior art.
+- **Actions:**
+  1. Reverse-engineered SlipNet and slipgate architectures (`docs/research/slipnet-and-transport-architecture-review.md`):
+     - Identified 6 transport families (DNSTT, NoizDNS, VayDNS, Slipstream, NaiveProxy, StunTLS).
+     - Conducted legal licensing audit: SlipNet is licensed under AGPL-3.0. Direct code ingestion would contaminate Paqet-NG's MIT license with copyleft terms. Formulated clean-room engineering policy.
+  2. Implemented clean-room DNS resolver capability and scoring engine (`internal/ng/dns/`):
+     - RFC 1035 + RFC 6891 EDNS0 query builder and response parser.
+     - Multi-factor capability evaluator (`ScanResolver` and `ScanResolverPool`): probes latency, NS query support, TXT query support, dynamic subdomain handling, tunnel realism (long Base32 labels), EDNS0 buffer sizing (up to 1400 bytes), and **NXDOMAIN non-hijack verification** (detecting Iranian ISP censorship landing pages).
+     - Composite scoring (0..6) and resolver profiling (Preconfigured, Discovered, TunnelCompatible, Blocked).
+     - Verified with unit tests (`scanner_test.go`), passing 100%.
+  3. Integrated dynamic resolver scoring into `DNSAsymmetricDialer` (`SelectBestResolver`).
+  4. Configured Live Public Domain Delegation (Cloudflare API):
+     - Domain: `passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir` (Zone ID `8cf5f6880195d1e476f474e048305d8f`).
+     - Added `A` record: `ns-de.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir` -> `77.37.65.2` (TTL: 300).
+     - Added child `NS` delegation: `tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir` -> `ns-de...` (TTL: 300).
+     - Snapshot preserved in `docs/research/cloudflare_dns_snapshot.json`.
+  5. Live Public Recursive Traversal Execution:
+     - Started authoritative DNS daemon on German VPS (`77.37.65.2:53`).
+     - Iran VPS dispatched query to Google Public DNS (`8.8.8.8:53`).
+     - Google resolver node (`172.253.228.151`) traversed public NS delegation and reached Germany VPS on port 53.
+     - Germany authoritative daemon returned authenticated TXT response.
+     - Iran VPS received the response in **$140.98\text{ ms}$** with `ancount = 1` and authenticated payload `AUTHENTICATED_PAQET_DNS_RECURSIVE_TRAVERSAL_OK`.
+     - Elevated DNS-asymmetric from Prototype to **OPERATIONAL & PUBLICLY VERIFIED** for emergency signaling and bootstrap.
+  6. Produced Novelty and Prior Art Review (`docs/research/novelty-and-prior-art-review.md`):
+     - Articulated Paqet-NG's 4 original contributions: (1) `AsymmetricConn` with anti-DoS replay sequencing; (2) out-of-window raw sequence injection (`wrong_seq`); (3) candidate-isolated evidence-based transport controller; (4) clean-room multi-factor resolver capability scanner.
+  7. Formally updated failure models (Conditions A through I) in `docs/research/hard-mode-capability-matrix.md`.
+  8. Compiled release binary `v2.5.0-platform` (SHA-256 `bcf3a2abf25893c1d549c8c0bf4c493d4465d63bbef776d39acecbf0fdd6891c`).
+- **Outcome:** All quality gates passed with zero data races. All required deliverables completed and committed. Production service on `:1090` verified healthy.

@@ -2,9 +2,11 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -392,5 +394,52 @@ func TestRealSocketDNSAsymmetricCandidateBEndToEnd(t *testing.T) {
 
 	if !bytes.Equal(recvBuf, testMsg) {
 		t.Fatalf("Message mismatch: got %q, want %q", recvBuf, testMsg)
+	}
+}
+
+func TestSelectBestResolverWithScoring(t *testing.T) {
+	// Start mock authentic DNS server on port 5354
+	mockSrv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP mock failed: %v", err)
+	}
+	defer mockSrv.Close()
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, clientAddr, err := mockSrv.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			req := buf[:n]
+			if len(req) < 12 {
+				continue
+			}
+
+			txID := req[:2]
+			// Respond with NOERROR
+			hdr := append([]byte(nil), txID...)
+			hdr = append(hdr, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00)
+			question := req[12:]
+			ans := []byte{0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 93, 184, 216, 34}
+			resp := append(hdr, append(question, ans...)...)
+			_, _ = mockSrv.WriteTo(resp, clientAddr)
+		}
+	}()
+
+	dialer := NewDNSAsymmetricDialer(DNSAsymmetricConfig{
+		ResolverAddr: "192.0.2.1:53", // Unreachable initial resolver
+		ResolverPool: []string{"192.0.2.1", mockSrv.LocalAddr().String()},
+		DomainSuffix: "tunnel.paqet.local",
+		ClientID:     "c01",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	best := dialer.SelectBestResolver(ctx)
+	if !strings.HasPrefix(best, "127.0.0.1:") {
+		t.Fatalf("Expected SelectBestResolver to pick working 127.0.0.1 resolver, got %s", best)
 	}
 }

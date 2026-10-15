@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"paqet/internal/ng/dns"
 )
 
 var (
@@ -173,8 +175,9 @@ func (r *DNSReassembler) PushFragment(clientID string, offset uint32, part, tota
 
 // DNSAsymmetricConfig holds configuration for the DNS asymmetric transport.
 type DNSAsymmetricConfig struct {
-	ResolverAddr string // e.g. "8.8.8.8:53"
-	DomainSuffix string // e.g. "tunnel.example.com"
+	ResolverAddr string   // Primary resolver (e.g. "8.8.8.8:53")
+	ResolverPool []string // Optional candidate pool for dynamic resolver discovery & scoring
+	DomainSuffix string   // e.g. "tunnel.example.com"
 	ClientID     string
 	PSK          []byte
 }
@@ -204,6 +207,32 @@ func NewDNSAsymmetricDialer(cfg DNSAsymmetricConfig) *DNSAsymmetricDialer {
 			CircuitState: "closed",
 		},
 	}
+}
+
+// SelectBestResolver probes the candidate resolver pool using clean-room multi-factor scoring
+// and selects the highest-scoring, lowest-latency unpoisoned resolver.
+func (d *DNSAsymmetricDialer) SelectBestResolver(ctx context.Context) string {
+	d.metricsMu.RLock()
+	pool := make([]string, len(d.cfg.ResolverPool))
+	copy(pool, d.cfg.ResolverPool)
+	current := d.cfg.ResolverAddr
+	suffix := d.cfg.DomainSuffix
+	d.metricsMu.RUnlock()
+
+	if len(pool) == 0 {
+		return current
+	}
+
+	results := dns.ScanResolverPool(ctx, pool, 53, suffix, 2*time.Second, 4)
+	if len(results) > 0 && results[0].Score >= 4 {
+		best := net.JoinHostPort(results[0].Host, fmt.Sprintf("%d", results[0].Port))
+		d.metricsMu.Lock()
+		d.cfg.ResolverAddr = best
+		d.metricsMu.Unlock()
+		return best
+	}
+
+	return current
 }
 
 func (d *DNSAsymmetricDialer) Mode() TransportMode {

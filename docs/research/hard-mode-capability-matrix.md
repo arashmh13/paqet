@@ -65,16 +65,53 @@ Egress source address spoofing is **strictly blocked** by both Panel01 (Iran) an
 
 ---
 
-## 4. Failure Mode Analysis Under Severe Iranian Censorship Conditions
+## 4. Formal Hard-Time Failure Models & Survivability Analysis (Conditions A through I)
 
-### Condition A: Total National Intranet Curfew (National Information Network / NIN Only)
-- **Observed Behavior:** All international TCP SYN packets dropped at TIC (Telecommunication Infrastructure Company) border routers. International UDP dropped except port 53 to domestic resolvers.
-- **Survivable Transport:** **DNS-Asymmetric upstream** (queries routed through domestic resolvers that forward to root/authoritative nameservers, or recursive lookups that escape via national DNS caches).
+### Condition A: Known Port Failure
+- **Definition:** A previously usable server port (e.g. `:8088` or `:8089`) becomes unavailable due to firewall drop or active probe blacklisting.
+- **Simulation:** Closing listener on primary port; testing fallback to secondary port `:8443`.
+- **Paqet-NG Defense:** `StrategySelector` candidate-isolated cooldowns (`stratKey`). Falls back to secondary port in $0.03\text{s}$ without flapping.
 
-### Condition B: Heavy Outbound Port & SNI Filtering (Standard Iranian Restrictive Regime)
-- **Observed Behavior:** Conventional SOCKS5, Shadowsocks, VMess/VLESS without TLS, and ports 1080/8088/8089 are blocked by IP/port blacklists. Port 443 permitted only with recognized SNIs.
-- **Survivable Transport:** **Genuine TLS 1.3 Outer Transport** on port 443/8443 with legitimate CA certificates, OR **Raw SNI sequence injection (`wrong_seq`)** on permitted ports.
+### Condition B: Transport-Specific Blocking
+- **Definition:** A specific transport mode (e.g. raw KCP or userspace AEAD) is identified by DPI heuristics and dropped, while another independently configured mode remains available.
+- **Simulation:** Dropping raw packet interfaces while keeping TCP stream open.
+- **Paqet-NG Defense:** Modular transport abstraction allows instant fallback to Genuine TLS 1.3 or Multi-Port pooling.
 
-### Condition C: Asymmetric Uplink Throttling & RST Injection
-- **Observed Behavior:** Middleboxes inject TCP RST packets into established outbound streams when payload entropy exceeds thresholds or high traffic volume is sustained.
-- **Survivable Transport:** **Multi-Port Connection Pooling** with rapid in-flight stream failover, combined with **Chameleon bucketing padding** to flatten entropy and packet size profiles.
+### Condition C: Stateful Protocol Filtering
+- **Definition:** The network allows initial TCP 3-way handshakes but resets or drops the connection upon detecting unknown or non-whitelisted protocol payloads.
+- **Simulation:** Deep packet inspection searching for TLS ClientHello.
+- **Paqet-NG Defense:**
+  - **Genuine TLS 1.3 Outer Transport:** Emits authentic RFC 8446 records and valid certificates.
+  - **Raw SNI Sequence Injection (`wrong_seq`):** Emits out-of-window decoy ClientHello to trick early-inspection DPI.
+
+### Condition D: DNS Restrictions & Poisoning
+- **Definition:** Public recursive resolvers (e.g. `8.8.8.8` or `1.1.1.1`) are unreachable, rate-limited, or tamper with responses.
+- **Simulation:** Injected NXDOMAIN hijacking and dropped long-query labels.
+- **Paqet-NG Defense:** Clean-room `ResolverScanner` (`internal/ng/dns`) tests candidate resolvers for NXDOMAIN tampering, EDNS0 buffer sizing, and tunnel responsiveness, sorting by score.
+
+### Condition E: Restricted DNS-Only Connectivity (National Curfew)
+- **Definition:** All international TCP SYN and UDP traffic is blocked at border routers (TIC), except UDP port 53 to recognized recursive resolvers.
+- **Simulation:** Complete outbound TCP blockage with DNS UDP:53 permitted.
+- **Paqet-NG Defense:** `AsymmetricConn` with recursive DNS QNAME upstream and DNS TXT answer downstream (Candidate B). Live verified across Iran-to-Germany path with $140.98\text{ ms}$ RTT.
+
+### Condition F: Partial Directional Connectivity (Asymmetric Filtering)
+- **Definition:** Egress traffic exits normally, but the return path is throttled or dropped (or vice-versa).
+- **Simulation:** Simplex unidirectional pipes.
+- **Paqet-NG Defense:** `AsymmetricConn` directionally decoupled architecture with separate `UpstreamSender` and `DownstreamReceiver` channels.
+
+### Condition G: Endpoint Failure
+- **Definition:** Remote server IP becomes completely unreachable or the server process crashes.
+- **Simulation:** Server process restart and blackholed IP address.
+- **Paqet-NG Defense:** Bounded retry backoff, multi-port endpoint round-robin, and emergency DNS signaling to rediscover alternate ingress IPs.
+
+### Condition H: Intermittent Connectivity & Loss Spikes
+- **Definition:** High jitter, packet loss $> 15\%$, and prolonged idle silence during an active session.
+- **Simulation:** Packet drop simulation and 300ms–30s idle silence in `failure_lab_test.go`.
+- **Paqet-NG Defense:** In-flight unacknowledged buffer (`unackedFrame`) with dynamic RTO retransmissions; smux keepalive state preserved across silence.
+
+### Condition I: Network-Specific Restrictions
+- **Definition:** A transport functions in a datacenter environment but fails on residential mobile networks (MCI, Irancell, TCI FTTH) due to symmetric Netfilter NAT or CGNAT.
+- **Simulation:** NAT translation where out-of-order raw Ethernet frames are discarded as Netfilter `INVALID`.
+- **Paqet-NG Defense:**
+  - Datacenter-to-Datacenter: `raw-kcp` with out-of-window SNI injection.
+  - Residential / Mobile: `aead-stream` or Genuine TLS 1.3, both 100% NAT/CGNAT compatible.
