@@ -19,19 +19,26 @@ log:
   level: "info"
 
 transport:
-  # Transport engine selector:
-  # "kcp"          - Legacy KCP over raw TCP (default for 100% backward compatibility)
-  # "raw-hardened" - Hardened raw TCP with strict sequence tracking and anti-replay
-  # "aead-stream"  - High-throughput userspace TCP stream with instant probe rejection
-  type: "raw-hardened"
+  # Selectable transport protocols:
+  # "kcp" / "raw-kcp"   - Hardened raw TCP with exact sequence tracking and anti-replay
+  # "stream" / "aead-stream" - High-throughput userspace TCP stream with instant probe reset
+  # "sni-assisted"      - Stream transport with synthetic decoy TLS ClientHello injection
+  # "auto"              - Dynamic evidence-based strategy selector with automatic fallback
+  # "dns-asymmetric"    - Emergency survival transport over recursive DNS queries
+  # "asymmetric-spoof"  - Experimental bidirectional IP spoofing (requires unverified transit)
+  protocol: "auto"
   conn: 1
   obfs:
     enabled: true
     key: "yP9v/8x+n3Lp+ZqW4s1RjT5oK2a9XbE8vM7JdH4="
     maxpad: 64
-  replay:
-    window_seconds: 30
-    ring_size: 16384
+  sni:
+    decoy: "hcaptcha.com" # Decoy SNI domain for DPI flow cache
+    preset: "chrome"      # Browser fingerprint profile
+    method: "fragment"    # "wrong_seq" or "fragment"
+  selector:
+    cooldown_sec: 45
+    hysteresis_ratio: 0.25
 ```
 
 ---

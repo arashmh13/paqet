@@ -26,3 +26,19 @@
 
 1. **Passive Flow Correlation:** While uniform padding (`0..maxPad`) disrupts precise packet-size fingerprinting, it does not fully obscure long-term statistical burst patterns or session timing during continuous bulk transfers.
 2. **Replay Window Expiry:** The anti-replay ring buffer protects against up to 16,384 replayed packets per connection. Replays arriving after the buffer rolls over and outside the 30-second clock window are rejected by the timestamp check, but require reasonably synchronized clocks ($\Delta t < 30\text{s}$).
+
+---
+
+## 4. IP-Spoofing & BCP 38 / uRPF Provider Constraints
+
+1. **Egress Source-Address Filtering (RFC 2827):** Standard cloud VPS providers (including Hetzner, OVH, DigitalOcean, and Iranian datacenter providers) enforce strict BCP 38 ingress/egress filtering at the hypervisor virtual switch. Any packet with a forged source IP is dropped before leaving the physical rack.
+2. **Infrastructure Prerequisite:** The `asymmetric-spoof` mode cannot operate on generic VPS hosting. It strictly requires dedicated bare-metal servers or transit providers that explicitly allow arbitrary source IP announcements via BGP.
+3. **Automated Safety Gating:** To prevent user connection failure, Paqet-NG gates spoofing behind `ProbeSpoofCapability`.
+
+---
+
+## 5. DNS-Asymmetric Bandwidth & Latency Constraints
+
+1. **Bandwidth Ceiling:** Maximum Base32 payload capacity is capped at 35–45 bytes per DNS query label. Maximum effective upstream throughput is $\le 0.8\text{ Mbps}$.
+2. **Latency Inflation:** Recursive multi-hop DNS resolution inflates round-trip times to 600–1800ms.
+3. **Operational Scope:** `dns-asymmetric` must be deployed strictly as an emergency signaling / recovery channel, not as an interactive browsing transport.

@@ -28,23 +28,48 @@ func newTimedConn(cfg *conf.Conf) (*timedConn, error) {
 }
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
-	if tc.cfg.Transport.Protocol == "stream" {
+	switch tc.cfg.Transport.Protocol {
+	case "stream", "aead-stream":
 		conn, err := stream.Dial(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs)
 		if err != nil {
 			return nil, err
 		}
 		return conn, nil
-	}
-
-	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
-	if err != nil {
+	case "sni-assisted":
+		conn, err := stream.DialSNIAssisted(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	case "auto":
+		// Auto selector: try sni-assisted, then aead-stream, then kcp
+		conn, err := stream.DialSNIAssisted(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)
+		if err == nil {
+			return conn, nil
+		}
+		conn, err = stream.Dial(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs)
+		if err == nil {
+			return conn, nil
+		}
+		if tc.cfg.Transport.KCP != nil {
+			kcpConn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
+			if err == nil {
+				_ = tc.sendTCPF(kcpConn)
+				return kcpConn, nil
+			}
+		}
 		return nil, err
+	default:
+		conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
+		if err != nil {
+			return nil, err
+		}
+		err = tc.sendTCPF(conn)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
 	}
-	err = tc.sendTCPF(conn)
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
 }
 
 func (tc *timedConn) sendTCPF(conn tnet.Conn) error {

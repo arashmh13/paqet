@@ -1,57 +1,98 @@
-# Architectural Decision Record (ADR): Paqet-NG
+# Architectural Decision Record (ADR): Paqet-NG Multi-Transport Platform
 
 ## 1. Context & Problem Statement
 
-Baseline Paqet demonstrates that raw TCP packet injection combined with KCP and an AES-256-GCM obfuscation layer can traverse certain middleboxes. However, empirical testing on the live Iran VPS to German VPS link revealed critical protocol and transport flaws:
-1. **TCP Sequence & Timestamp Defects:** Advancing TCP sequence numbers by a fixed `+128` regardless of payload size and decrementing `TSecr` creates severe TCP protocol anomalies detectable by any stateful conntrack firewall.
-2. **Cryptographic Replay Vulnerability:** The `internal/obfs` envelope lacks replay protection, allowing captured packets to be replayed indefinitely.
-3. **Active Probing Signature:** The server completes a 3-way handshake with any IP and then completely blackholes all subsequent non-authenticated traffic, creating an obvious "silent tarpit" fingerprint.
-4. **Architectural Rigidity:** The proxy logic (SOCKS5 and port forwarding) is hardcoded directly to KCP over raw pcap sockets, making it impossible to switch or benchmark alternative transports without rewriting core modules.
+Baseline Paqet demonstrated that raw TCP packet injection combined with KCP and an AES-GCM obfuscation layer can traverse certain middleboxes. However, extensive reverse engineering, code inspection, and live network experiments on the Iran VPS (`185.18.215.124`) to German VPS (`77.37.65.2`) network path exposed fundamental limitations across four distinct transport paradigms:
+
+1. **Raw Packet Injection (`raw-kcp`):**
+   - Fixed-step sequence advancement (`+128` per packet) and decrementing timestamps violated TCP RFCs and triggered stateful firewall drops.
+   - Requires root privileges (`CAP_NET_RAW`), raw interface binding, and exact router gateway MAC addresses.
+   - Incompatible with standard residential NAT/CGNAT; throughput capped at ~10.6 Mbps due to userspace pcap serialization.
+2. **Userspace Encrypted Streams (`aead-stream`):**
+   - Achieves high throughput (~72.8 Mbps), operates without root privileges, traverses NAT seamlessly, and neutralizes active probing via instant TCP RST/FIN.
+   - However, persistent high-entropy data on a single TCP port can be identified by statistical machine-learning classifiers or port-whitelisting firewalls.
+3. **SNI-Spoofing & Packet Manipulation (`patterniha`, `aleskxyz`, Xray-core #5969):**
+   - Out-of-window TCP sequence injection (`wrong_seq`) successfully tricks Iranian DPI into whitelisting flows, but classic TCP fragmentation is now reassembled and defeated.
+   - SNI manipulation is only meaningful when applied to the outer tunnel transport handshake, not to proxied end-to-end HTTPS payload streams.
+4. **Bidirectional IP Spoofing (`ParsaKSH/spoof-tunnel`):**
+   - Decouples IP addresses from logical sessions, but empirical live testing proved that datacenter switches enforce BCP 38 (RFC 2827) and uRPF (RFC 3704), dropping spoofed packets at egress before they cross international borders.
+5. **Asymmetric DNS Upstream (`patterniha/QS-Tunnel`):**
+   - Upstream DNS queries survive full TCP blackouts, but throughput is restricted to $< 1$ Mbps and return-path spoofing suffers the same BCP 38 drop failure on cloud VPS networks.
 
 ---
 
-## 2. Evaluation of Architectural Candidates
+## 2. Decision: A Decoupled Multi-Strategy Platform
 
-### Candidate A — Hardened Raw Paqet
-- **Concept:** Keep the raw Layer-2/Layer-3/Layer-4 packet injection architecture. Fix the sequence number tracking by computing actual byte-based `Seq` and `Ack` offsets from the initial handshake. Fix timestamp generation. Add a sliding-window replay filter to `internal/obfs`.
-- **Pros:** Preserves the raw packet concept; retains the ability to customize TCP flags (`local_flag`, `remote_flag`).
-- **Cons:**
-  - Still requires root privileges (`CAP_NET_RAW`, `libpcap`).
-  - Cannot function behind residential NAT routers without router DMZ or bridge mode.
-  - Still suffers from pcap serialization bottlenecks and high CPU usage under heavy load.
-  - Vulnerable to DPI classifiers that target raw encrypted payloads on custom ports.
+Paqet-NG is hereby established as a **modular multi-strategy networking platform** with an **evidence-based resilience selector**.
 
-### Candidate B — Pure Userspace TLS / Camouflage Transport
-- **Concept:** Discard raw packet injection entirely. Use standard kernel-managed TCP sockets with TLS 1.3 masquerade or HTTP/2 encapsulation.
-- **Pros:** Runs in userspace without root privileges; perfect TCP stateful conntrack compliance; operates cleanly behind any NAT; active probe resistance via web decoy fallback.
-- **Cons:** Loses the custom raw TCP flag manipulation capability that is effective against certain DPI middleboxes; higher protocol overhead.
+Rather than forcing fundamentally incompatible network mechanisms into one brittle protocol, Paqet-NG decomposes the system into strictly separated subsystems:
 
-### Candidate C — Modular Multi-Transport Architecture (Paqet-NG)
-- **Concept:** Architect Paqet-NG with a decoupled, modular transport subsystem:
-  1. **Core Service Layer:** SOCKS5, port forwarders, and client stream manager independent of the underlying wire transport.
-  2. **Pluggable Transport Interface (`Transport`):**
-     - **Mode 1: `raw-hardened` (Hardened Raw Packet Transport):** Repaired raw TCP injection with strict sequence tracking, valid timestamps, sliding-window anti-replay, and bounded padding.
-     - **Mode 2: `aead-stream` (Standard Secure Stream Transport):** Userspace TCP transport featuring AEAD-2022 session key derivation, monotonic timestamp headers, instant probe rejection, and zero raw socket requirements.
-     - **Mode 3: `tls-camouflaged` (TLS 1.3 Chameleon):** Disguises traffic as genuine TLS 1.3 records with real SNI camouflage.
-  3. **Unified Stream Multiplexer & Session Manager:** Standardized stream framing with version negotiation, keepalive, and flow control.
-- **Pros:**
-  - Solves the single-point-of-failure risk of a single transport.
-  - Provides a direct, scientific comparison platform between raw-packet injection and kernel-managed transports on the exact same VPS link.
-  - Supports non-root deployment (e.g. mobile or unprivileged containers) while retaining raw capabilities where advantageous.
-  - Eliminates all identified defects (sequence tracking, anti-replay, probe blackholing).
-- **Cons:** Slightly higher initial implementation scope.
+```text
++-----------------------------------------------------------------------------------+
+|                            Application Proxy Layer                                |
+|  - SOCKS5 Proxy Server (User/Pass Auth, IPv4/IPv6/Domain targets)                 |
+|  - Inbound TCP/UDP Port Forwarders                                                |
++-----------------------------------------------------------------------------------+
+                                          |
+                                          v
++-----------------------------------------------------------------------------------+
+|                        Logical Stream Multiplexer (smux v2)                       |
+|  - Channel Multiplexing, Stream Flow Control, Dynamic Buffer Management           |
++-----------------------------------------------------------------------------------+
+                                          |
+                                          v
++-----------------------------------------------------------------------------------+
+|                      Evidence-Based Strategy Selector (`auto`)                     |
+|  - Real-time Latency EMA, Sliding-Window Success Rate, Circuit Breaker            |
+|  - Hysteresis Switching (prevents flapping), Graceful Fallback Sequencing         |
++-----------------------------------------------------------------------------------+
+                                          |
+               +--------------------------+--------------------------+
+               |                          |                          |
+               v                          v                          v
+    +--------------------+     +--------------------+     +--------------------+
+    |  `aead-stream`     |     |  `sni-assisted`    |     |  `raw-kcp`         |
+    |  (High Throughput) |     |  (DPI SNI Cloaking)|     |  (Hardened Raw)    |
+    +--------------------+     +--------------------+     +--------------------+
+               |                          |                          |
+               v                          v                          v
+    +--------------------+     +--------------------+     +--------------------+
+    |  `asymmetric-spoof`|     |  `dns-asymmetric`  |     | Future Adaptors    |
+    |  (Gated by BCP 38) |     |  (Emergency Beacon)|     | (uTLS / REALITY)   |
+    +--------------------+     +--------------------+     +--------------------+
+```
 
 ---
 
-## 3. Decision & Technical Rationale
+## 3. Policy & Strategy Selection Rules
 
-**Selected Architecture: Candidate C (Modular Multi-Transport Paqet-NG)**
+### Strategy 1: `aead-stream` (Default High-Throughput Mode)
+- **Role:** Primary workhorse for standard operations.
+- **Characteristics:** ~72.8 Mbps, 100ms RTT, zero root requirement, fully NAT-compatible.
+- **Probe Defense:** Monotonic timestamps + 30-second sliding-window anti-replay filter; instant RST/FIN ($< 0.5$s) on unauthenticated probes.
 
-### Justification:
-1. **Empirical Evidence:** Benchmark results show that raw KCP over pcap on the Iran-Germany link is capped at ~10.6 Mbps due to pcap context switches and single-socket serialization. A modular architecture allows evaluating hardened raw transport against clean AEAD stream transport under identical conditions.
-2. **Robustness & Survivability:** In an active censorship event, if the raw packet signature is targeted by ISPs, users can switch the transport engine (e.g. to `aead-stream` or `tls-camouflaged`) via a single configuration flag without rebuilding or altering proxy bindings.
-3. **Security Standards:** All transports in Paqet-NG will enforce:
-   - Authenticated Encryption with Associated Data (AEAD) via AES-256-GCM or ChaCha20-Poly1305.
-   - 30-second sliding-window replay filter with bloom/hash cache.
-   - Bounded random padding with traffic-shaping options.
-   - Probe-resistant server admission (immediate disconnect or fallback rather than silent tarpit).
+### Strategy 2: `sni-assisted` (SNI Camouflage Mode)
+- **Role:** Active when national DPI enforces strict SNI blacklisting on foreign ports.
+- **Characteristics:** Injects synthetic TLS 1.3 ClientHello with decoy SNI (`hcaptcha.com`, `ebanking.ir`) to prime DPI flow cache, followed by authenticated AEAD session.
+- **Fallback:** Seamlessly supported on stream listener via automatic TLS record header detection.
+
+### Strategy 3: `raw-kcp` (Hardened Packet Injection Mode)
+- **Role:** Fallback when stateful middleboxes drop userspace TCP handshakes.
+- **Characteristics:** Layer 2/3 raw frame injection via `libpcap`, byte-accurate sequence advancement, RFC 7323 monotonic timestamps, 16,384-entry ring-buffer anti-replay cache.
+
+### Strategy 4: `dns-asymmetric` (Emergency Beacon / Survival Channel)
+- **Role:** Survival fallback when all foreign TCP and direct UDP traffic is blocked.
+- **Characteristics:** Encodes signaling data into Base32 DNS queries routed via public recursive resolvers; reassembles out-of-order chunks on destination. Throughput $< 1$ Mbps.
+
+### Strategy 5: `asymmetric-spoof` (Gated Experimental Mode)
+- **Role:** Specialized deployment on dedicated infrastructure where BCP 38 is disabled.
+- **Gating Invariant:** **Must execute pre-flight BCP 38 qualification probe**. If spoofed packets are dropped at egress, mode is marked `Unavailable` and rejected by the selector.
+
+---
+
+## 4. Consequences & Migration Path
+
+- **Backward Compatibility:** Existing `client.yaml` and `server.yaml` configurations using `protocol: "kcp"` or `protocol: "stream"` remain 100% compatible.
+- **Reliability Guarantee:** The automated strategy selector (`protocol: "auto"`) ensures that transient packet loss or middlebox rule changes do not cause permanent disconnection.
+- **Auditability:** Every transport exposes standardized `Capabilities()` and `Metrics()` reporting for real-time diagnostics.
+

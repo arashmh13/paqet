@@ -138,15 +138,103 @@ func (s *secureConn) Read(b []byte) (int, error) {
 
 // AEADStreamDialer establishes secure client sessions.
 type AEADStreamDialer struct {
-	psk    []byte
-	maxPad int
+	psk       []byte
+	maxPad    int
+	metrics   HealthMetrics
+	metricsMu sync.RWMutex
 }
 
 func NewAEADStreamDialer(psk []byte, maxPad int) *AEADStreamDialer {
-	return &AEADStreamDialer{psk: psk, maxPad: maxPad}
+	return &AEADStreamDialer{
+		psk:    psk,
+		maxPad: maxPad,
+		metrics: HealthMetrics{
+			Mode:         ModeAEADStream,
+			Available:    true,
+			CircuitState: "closed",
+		},
+	}
+}
+
+func (d *AEADStreamDialer) Mode() TransportMode {
+	return ModeAEADStream
+}
+
+func (d *AEADStreamDialer) Capabilities() TransportCapabilities {
+	return TransportCapabilities{
+		Mode:               ModeAEADStream,
+		RequiresRoot:       false,
+		SupportsNAT:        true,
+		MaxThroughputMbps:  75.0,
+		ExpectedLatencyMs:  105,
+		IsAsymmetric:       false,
+		PrerequisitesMet:   true,
+		PrerequisiteNotice: "High-throughput userspace TCP stream",
+	}
+}
+
+func (d *AEADStreamDialer) CheckHealth(ctx context.Context, addr string) (time.Duration, error) {
+	start := time.Now()
+	var netDialer net.Dialer
+	conn, err := netDialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		d.recordMetric(false, time.Since(start), err)
+		return 0, err
+	}
+	_ = conn.Close()
+	rtt := time.Since(start)
+	d.recordMetric(true, rtt, nil)
+	return rtt, nil
+}
+
+func (d *AEADStreamDialer) recordMetric(success bool, rtt time.Duration, err error) {
+	d.metricsMu.Lock()
+	defer d.metricsMu.Unlock()
+
+	d.metrics.TotalAttempts++
+	d.metrics.LastAttemptTime = time.Now()
+
+	if success {
+		d.metrics.TotalSuccesses++
+		d.metrics.FailureStreak = 0
+		d.metrics.CircuitState = "closed"
+		d.metrics.Available = true
+		d.metrics.LastSuccessTime = time.Now()
+		if d.metrics.LatencyEMA == 0 {
+			d.metrics.LatencyEMA = rtt
+		} else {
+			d.metrics.LatencyEMA = time.Duration(0.8*float64(d.metrics.LatencyEMA) + 0.2*float64(rtt))
+		}
+	} else {
+		d.metrics.FailureStreak++
+		if err != nil {
+			d.metrics.LastErrorReason = err.Error()
+		}
+		if d.metrics.FailureStreak >= 3 {
+			d.metrics.CircuitState = "open"
+			d.metrics.Available = false
+		}
+	}
+
+	if d.metrics.TotalAttempts > 0 {
+		d.metrics.SuccessRate = float64(d.metrics.TotalSuccesses) / float64(d.metrics.TotalAttempts)
+	}
+}
+
+func (d *AEADStreamDialer) Metrics() HealthMetrics {
+	d.metricsMu.RLock()
+	defer d.metricsMu.RUnlock()
+	return d.metrics
 }
 
 func (d *AEADStreamDialer) Dial(ctx context.Context, addr string) (Session, error) {
+	start := time.Now()
+	sess, err := d.dialInternal(ctx, addr)
+	d.recordMetric(err == nil, time.Since(start), err)
+	return sess, err
+}
+
+func (d *AEADStreamDialer) dialInternal(ctx context.Context, addr string) (Session, error) {
 	var netDialer net.Dialer
 	rawConn, err := netDialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -246,10 +334,42 @@ func (l *AEADStreamListener) Accept(ctx context.Context) (Session, error) {
 		// Perform handshake with strict timeout (3 seconds)
 		rawConn.SetDeadline(time.Now().Add(3 * time.Second))
 
-		var salt [SaltSize]byte
-		if _, err := io.ReadFull(rawConn, salt[:]); err != nil {
+		var lead [3]byte
+		if _, err := io.ReadFull(rawConn, lead[:]); err != nil {
 			rawConn.Close()
 			continue
+		}
+
+		var salt [SaltSize]byte
+		if lead[0] == 0x16 && lead[1] == 0x03 {
+			// Decoy TLS ClientHello preamble detected: consume record
+			var lenBytes [2]byte
+			if _, err := io.ReadFull(rawConn, lenBytes[:]); err != nil {
+				rawConn.Close()
+				continue
+			}
+			recLen := int(binary.BigEndian.Uint16(lenBytes[:]))
+			if recLen > 4096 {
+				rawConn.Close()
+				continue
+			}
+			decoyBuf := make([]byte, recLen)
+			if _, err := io.ReadFull(rawConn, decoyBuf); err != nil {
+				rawConn.Close()
+				continue
+			}
+			// Read the real AEAD salt
+			if _, err := io.ReadFull(rawConn, salt[:]); err != nil {
+				rawConn.Close()
+				continue
+			}
+		} else {
+			// Standard AEAD stream: lead contains first 3 bytes of salt
+			copy(salt[:3], lead[:])
+			if _, err := io.ReadFull(rawConn, salt[3:]); err != nil {
+				rawConn.Close()
+				continue
+			}
 		}
 
 		c2sKey, s2cKey, err := crypto.DeriveKeys(l.psk, salt[:])

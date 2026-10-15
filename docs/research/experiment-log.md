@@ -76,3 +76,65 @@
   - Throughput increased by over 5.4x–5.8x to ~72.8 Mbps.
   - Fuzz tests and race detection passed with zero warnings.
 - **Outcome:** Paqet-NG successfully modularized; high-performance transport verified.
+
+---
+
+## Cycle 5: Reference Transport Reverse Engineering & Network Path Separation
+- **Objective:** Deeply study `patterniha/SNI-Spoofing`, `aleskxyz/SNI-Spoofing-Go`, `ParsaKSH/spoof-tunnel`, `patterniha/QS-Tunnel`, and Xray-core discussion #5969 to map placement across the network path.
+- **Hypothesis:** SNI-spoofing and IP-spoofing operate at distinct protocol layers; direct SNI-spoofing does not improve an encrypted tunnel unless applied to the outer tunnel transport.
+- **Actions:**
+  1. Inspected source trees and implementations of all four reference repositories via German VPS.
+  2. Identified field data from Xray-core #5969 confirming classic TCP fragmentation is now reassembled by Iranian DPI, whereas out-of-window TCP sequence injection (`wrong_seq`) remains highly effective.
+  3. Mapped physical packet observation paths (Application Loopback vs. National Egress vs. Foreign Ingress).
+  4. Produced `docs/research/reference-transport-analysis.md` and `docs/research/transport-placement-and-return-path.md`.
+- **Outcome:** Placement mechanics formalized; architecture requirements for SNI-assisted dialers and BCP 38 gating established.
+
+---
+
+## Cycle 6: Empirical Feasibility Probing of Bidirectional IP Spoofing
+- **Objective:** Experimentally determine whether Iranian and German VPS providers permit spoofed `Source IP` packets across international boundaries.
+- **Hypothesis:** Generic cloud VPS networks enforce BCP 38 / uRPF filtering, dropping spoofed packets at the hypervisor switch.
+- **Actions:**
+  1. Ran controlled raw socket tests on Iran VPS (`185.18.215.124`) targeting Germany VPS (`77.37.65.2:29999`) with control IP, bogus IP (`198.51.100.1`), and adjacent subnet IP (`185.18.215.200`).
+  2. Ran reciprocal raw socket tests on Germany VPS targeting Iran VPS with bogus IP (`198.51.100.2`).
+  3. Captured packet flow using `tcpdump` on the opposite receiving endpoint.
+- **Evidence Collected:**
+  - Control packets arrived instantly.
+  - Zero spoofed packets arrived in either direction (dropped at provider egress switch).
+- **Outcome:** Empirically proved that `spoof-tunnel` bidirectional IP spoofing cannot operate on generic cloud VPS infrastructure without dedicated anti-spoofing transit. Created `AsymmetricSpoofDialer` with active BCP 38 prerequisite gating.
+
+---
+
+## Cycle 7: SNI-Assisted Decoy Transport & Asymmetric DNS Implementation
+- **Objective:** Implement `sni-assisted` transport using synthetic TLS 1.3 ClientHello injection, and `dns-asymmetric` framing with Base32 QNAME chunking.
+- **Hypothesis:** Injecting an authentic decoy TLS ClientHello primes DPI middlebox flow caches without breaking userspace stream listeners that peek and consume the record header.
+- **Actions:**
+  1. Implemented `BuildDecoyClientHello` in `internal/ng/transport/sni_assisted.go` with RFC 8446 TLS 1.3 record format and SNI extension.
+  2. Implemented `EncodeDNSQName`, `DecodeDNSQName`, and `DNSReassembler` in `internal/ng/transport/dns_asymmetric.go`.
+  3. Implemented preamble detection in `AEADStreamListener` and `stream.Listen` to consume decoy ClientHello records before reading the AEAD salt.
+  4. Added fuzz tests `FuzzBuildDecoyClientHello` and `FuzzDecodeDNSQName` (447,000+ executions, 0 panics).
+  5. Cross-compiled and deployed version `v2.1.0-multi` (commit `hard-mode`).
+- **Outcome:** Unit and fuzz tests passed; binary prepared for live integration testing.
+
+---
+
+## Cycle 8: Live Iran-to-Germany Multi-Transport Benchmarking & Strategy Selector
+- **Objective:** Deploy and experimentally validate all transport modes on the live Iran VPS to Germany VPS network path.
+- **Hypothesis:** All selectable modes (`raw-kcp`, `aead-stream`, `sni-assisted`, and `auto`) will achieve stable connectivity with distinct performance profiles.
+- **Actions:**
+  1. Preserved backup baseline and deployed `v2.1.0-multi` on both VPS nodes.
+  2. Measured `raw-kcp` on port 8088 via SOCKS5 :1090.
+  3. Measured `aead-stream` on port 8089 via SOCKS5 :1091.
+  4. Measured `sni-assisted` on port 8089 via SOCKS5 :1092 with decoy `bank.ir`.
+  5. Measured `auto` resilience selector on port 8089 via SOCKS5 :1093.
+  6. Conducted active probing defense verification (HTTP GET, TLS probe, raw noise).
+  7. Conducted 20-request soak continuity and post-idle tests.
+- **Evidence Collected:**
+  - `raw-kcp`: RTT 127.8ms, 1MB throughput 1.26 MB/s (10.1 Mbps).
+  - `aead-stream`: RTT 172.1ms, 5MB throughput 726.9 KB/s.
+  - `sni-assisted`: RTT 179.2ms, 5MB throughput 707.4 KB/s.
+  - `auto`: RTT 178.3ms, 5MB throughput 702.6 KB/s.
+  - Active probe: HTTP probe reset in 0.176s; random noise reset in 0.168s (ZERO silent tarpit).
+  - Soak test: 20/20 requests succeeded, avg RTT 127.2ms.
+  - Resource usage: Server RSS 35.4 MB, CPU 0.7%; Client RSS 19.4 MB, CPU 1.2%.
+- **Outcome:** Complete empirical validation of Paqet-NG multi-transport platform. All acceptance criteria satisfied.

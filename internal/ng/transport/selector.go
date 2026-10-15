@@ -1,0 +1,193 @@
+package transport
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+var (
+	ErrNoEligibleStrategy = errors.New("selector: no eligible transport strategy available")
+)
+
+// SelectorConfig configures the evidence-based strategy selector.
+type SelectorConfig struct {
+	Candidates          []Strategy
+	PreferredMode       TransportMode
+	HealthCheckInterval time.Duration
+	CircuitFailureLimit int
+	CircuitCooldown     time.Duration
+	HysteresisRatio     float64 // Required performance margin to switch (e.g. 0.25 = 25%)
+}
+
+// StrategySelector dynamically chooses and monitors the most resilient transport strategy.
+type StrategySelector struct {
+	cfg        SelectorConfig
+	mu         sync.RWMutex
+	current    Strategy
+	lastSwitch time.Time
+	cooldowns  map[TransportMode]time.Time
+	stopChan   chan struct{}
+	activeLog  []string
+}
+
+func NewStrategySelector(cfg SelectorConfig) *StrategySelector {
+	if cfg.HealthCheckInterval <= 0 {
+		cfg.HealthCheckInterval = 30 * time.Second
+	}
+	if cfg.CircuitFailureLimit <= 0 {
+		cfg.CircuitFailureLimit = 3
+	}
+	if cfg.CircuitCooldown <= 0 {
+		cfg.CircuitCooldown = 45 * time.Second
+	}
+	if cfg.HysteresisRatio <= 0 {
+		cfg.HysteresisRatio = 0.25
+	}
+
+	var initial Strategy
+	for _, strat := range cfg.Candidates {
+		if strat.Mode() == cfg.PreferredMode && strat.Capabilities().PrerequisitesMet {
+			initial = strat
+			break
+		}
+	}
+	if initial == nil && len(cfg.Candidates) > 0 {
+		for _, strat := range cfg.Candidates {
+			if strat.Capabilities().PrerequisitesMet {
+				initial = strat
+				break
+			}
+		}
+	}
+
+	sel := &StrategySelector{
+		cfg:        cfg,
+		current:    initial,
+		lastSwitch: time.Now(),
+		cooldowns:  make(map[TransportMode]time.Time),
+		stopChan:   make(chan struct{}),
+	}
+
+	return sel
+}
+
+func (s *StrategySelector) Current() Strategy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current
+}
+
+func (s *StrategySelector) Mode() TransportMode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.current != nil {
+		return s.current.Mode()
+	}
+	return ModeAuto
+}
+
+// Dial establishes a session using the best available strategy with automatic resilient fallback.
+func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, error) {
+	s.mu.Lock()
+	candidates := make([]Strategy, len(s.cfg.Candidates))
+	copy(candidates, s.cfg.Candidates)
+	cur := s.current
+	s.mu.Unlock()
+
+	// 1. Try current best strategy first
+	if cur != nil && s.isEligible(cur) {
+		sess, err := cur.Dial(ctx, addr)
+		if err == nil {
+			return sess, nil
+		}
+		s.recordFailure(cur.Mode(), err)
+	}
+
+	// 2. Fall back to other eligible strategies in order of resilience
+	for _, strat := range candidates {
+		if cur != nil && strat.Mode() == cur.Mode() {
+			continue // Already tried
+		}
+		if !s.isEligible(strat) {
+			continue
+		}
+
+		sess, err := strat.Dial(ctx, addr)
+		if err == nil {
+			s.mu.Lock()
+			s.current = strat
+			s.lastSwitch = time.Now()
+			s.mu.Unlock()
+			return sess, nil
+		}
+		s.recordFailure(strat.Mode(), err)
+	}
+
+	return nil, ErrNoEligibleStrategy
+}
+
+func (s *StrategySelector) isEligible(strat Strategy) bool {
+	caps := strat.Capabilities()
+	if !caps.PrerequisitesMet {
+		return false
+	}
+
+	s.mu.RLock()
+	cooldownUntil, hasCooldown := s.cooldowns[strat.Mode()]
+	s.mu.RUnlock()
+
+	if hasCooldown && time.Now().Before(cooldownUntil) {
+		return false
+	}
+
+	metrics := strat.Metrics()
+	if metrics.CircuitState == "open" && hasCooldown && time.Now().Before(cooldownUntil) {
+		return false
+	}
+
+	return true
+}
+
+func (s *StrategySelector) recordFailure(mode TransportMode, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cooldowns[mode] = time.Now().Add(s.cfg.CircuitCooldown)
+}
+
+// StatusReport returns a comprehensive diagnostic report of all candidate modes.
+func (s *StrategySelector) StatusReport() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	activeMode := "none"
+	if s.current != nil {
+		activeMode = string(s.current.Mode())
+	}
+
+	report := map[string]interface{}{
+		"active_mode": activeMode,
+		"last_switch": s.lastSwitch.Format(time.RFC3339),
+		"candidates":  make([]map[string]interface{}, 0, len(s.cfg.Candidates)),
+	}
+
+	for _, strat := range s.cfg.Candidates {
+		metrics := strat.Metrics()
+		caps := strat.Capabilities()
+		cMap := map[string]interface{}{
+			"mode":              string(strat.Mode()),
+			"prerequisites_met": caps.PrerequisitesMet,
+			"prerequisite_note": caps.PrerequisiteNotice,
+			"available":         metrics.Available,
+			"latency_ema_ms":    float64(metrics.LatencyEMA.Microseconds()) / 1000.0,
+			"success_rate":      metrics.SuccessRate,
+			"failure_streak":    metrics.FailureStreak,
+			"circuit_state":     metrics.CircuitState,
+			"last_error":        metrics.LastErrorReason,
+		}
+		report["candidates"] = append(report["candidates"].([]map[string]interface{}), cMap)
+	}
+
+	return report
+}

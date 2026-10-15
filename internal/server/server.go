@@ -25,13 +25,14 @@ func (s *Server) Start(ctx context.Context) error {
 	var listener tnet.Listener
 	var err error
 
-	if s.cfg.Transport.Protocol == "stream" {
+	switch s.cfg.Transport.Protocol {
+	case "stream", "aead-stream", "sni-assisted", "auto":
 		listener, err = stream.Listen(s.cfg.Listen.Addr.String(), s.cfg.Transport.Obfs)
 		if err != nil {
 			return fmt.Errorf("could not start stream listener: %w", err)
 		}
 		flog.Infof("server listening for stream connections on %s", s.cfg.Listen.Addr.String())
-	} else {
+	default:
 		listener, err = kcp.Listen(s.cfg.Transport.KCP, s.cfg.Transport.Obfs, s.cfg.Network)
 		if err != nil {
 			return fmt.Errorf("could not start KCP listener: %w", err)

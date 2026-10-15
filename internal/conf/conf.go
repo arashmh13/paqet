@@ -81,7 +81,8 @@ func (c *Conf) validate() error {
 		}
 	}
 
-	if c.Transport.Protocol != "stream" {
+	isRawMode := c.Transport.Protocol == "kcp" || c.Transport.Protocol == "raw-kcp" || c.Transport.Protocol == "asymmetric-spoof"
+	if isRawMode {
 		allErrors = append(allErrors, c.Network.validate()...)
 	}
 	allErrors = append(allErrors, c.Transport.validate()...)
@@ -89,7 +90,7 @@ func (c *Conf) validate() error {
 		allErrors = append(allErrors, c.Listen.validate()...)
 	} else {
 		allErrors = append(allErrors, c.Server.validate()...)
-		if c.Transport.Protocol != "stream" {
+		if isRawMode {
 			if c.Server.Addr != nil {
 				family, local := "IPv6", c.Network.IPv6.Addr
 				if c.Server.Addr.IP.To4() != nil {
