@@ -179,3 +179,176 @@ func TestAsymmetricReplayAndTamperRejection(t *testing.T) {
 		t.Fatalf("Unexpected content for frame2: %s", buf2)
 	}
 }
+
+func TestAsymmetricHeaderTamperingRejection(t *testing.T) {
+	sessionID := uint64(0x1122334455667788)
+	psk := []byte("secret-key-32-bytes-tamper-test!")
+
+	clientConn, err := NewClientAsymmetricConn(
+		sessionID,
+		psk,
+		1024,
+		NewMemoryPipeSender(make(chan []byte, 10)),
+		NewMemoryPipeReceiver(make(chan []byte, 10)),
+		mockAddr("client"),
+		mockAddr("server"),
+	)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricConn: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn := &AsymmetricConn{
+		sessionID: sessionID,
+		role:      RoleServer,
+		encKey:    clientConn.decKey,
+		decKey:    clientConn.encKey,
+	}
+
+	validFrame, err := serverConn.sealFrame(1, 100, []byte("Secure Payload"))
+	if err != nil {
+		t.Fatalf("sealFrame failed: %v", err)
+	}
+
+	// 1. Verify valid frame parses
+	_, _, _, err = clientConn.openFrame(validFrame)
+	if err != nil {
+		t.Fatalf("openFrame failed on valid frame: %v", err)
+	}
+
+	// 2. Tamper Magic (bytes 0..3)
+	badMagic := append([]byte(nil), validFrame...)
+	badMagic[0] ^= 0x01
+	if _, _, _, err := clientConn.openFrame(badMagic); err != ErrAsymmetricInvalidMagic {
+		t.Errorf("Expected ErrAsymmetricInvalidMagic, got %v", err)
+	}
+
+	// 3. Tamper SessionID (bytes 4..11)
+	badSess := append([]byte(nil), validFrame...)
+	badSess[5] ^= 0x01
+	if _, _, _, err := clientConn.openFrame(badSess); err == nil {
+		t.Errorf("Expected openFrame to fail on tampered session ID")
+	}
+
+	// 4. Tamper Seq (bytes 12..15) - Must fail AEAD AAD authentication!
+	badSeq := append([]byte(nil), validFrame...)
+	badSeq[15] ^= 0x01
+	if _, _, _, err := clientConn.openFrame(badSeq); err == nil {
+		t.Errorf("Expected openFrame to fail on tampered sequence number")
+	}
+
+	// 5. Tamper Ack (bytes 16..19) - Must fail AEAD AAD authentication!
+	badAck := append([]byte(nil), validFrame...)
+	badAck[19] ^= 0x01
+	if _, _, _, err := clientConn.openFrame(badAck); err == nil {
+		t.Errorf("Expected openFrame to fail on tampered ACK number")
+	}
+}
+
+func TestAsymmetricSequenceExhaustion(t *testing.T) {
+	sessionID := uint64(12345)
+	psk := []byte("secret-key-32-bytes-exhaust-tst!")
+
+	clientConn, err := NewClientAsymmetricConn(
+		sessionID,
+		psk,
+		1024,
+		NewMemoryPipeSender(make(chan []byte, 10)),
+		NewMemoryPipeReceiver(make(chan []byte, 10)),
+		mockAddr("client"),
+		mockAddr("server"),
+	)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricConn: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Simulate sequence reaching the maximum 32-bit threshold
+	clientConn.sendSeq.Store(0xFFFFFFFE)
+
+	_, err = clientConn.Write([]byte("Data that should be rejected due to exhaustion"))
+	if err != ErrSequenceExhausted {
+		t.Fatalf("Expected ErrSequenceExhausted, got %v", err)
+	}
+}
+
+func TestAsymmetricLossAndAutomaticRetransmission(t *testing.T) {
+	sessionID := uint64(0x99887766)
+	psk := []byte("secret-key-32-bytes-loss-test!!")
+
+	upCh := make(chan []byte, 20)
+	downCh := make(chan []byte, 20)
+
+	clientConn, err := NewClientAsymmetricConn(
+		sessionID,
+		psk,
+		1024,
+		NewMemoryPipeSender(upCh),
+		NewMemoryPipeReceiver(downCh),
+		mockAddr("client"),
+		mockAddr("server"),
+	)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricConn: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Configure small RTO for testing
+	clientConn.SetRTO(100 * time.Millisecond)
+
+	serverConn := &AsymmetricConn{
+		sessionID: sessionID,
+		role:      RoleServer,
+		encKey:    clientConn.decKey,
+		decKey:    clientConn.encKey,
+	}
+
+	// Client writes message
+	go func() {
+		_, _ = clientConn.Write([]byte("Crucial Data"))
+	}()
+
+	// 1. Read first frame from upCh and DROP IT (simulate packet loss)!
+	select {
+	case droppedFrame := <-upCh:
+		t.Logf("Simulating loss: dropped frame of len %d", len(droppedFrame))
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Timeout waiting for original frame")
+	}
+
+	// 2. Retransmission loop should re-emit the frame within ~100-200ms!
+	var retransmittedFrame []byte
+	select {
+	case retransmittedFrame = <-upCh:
+		t.Logf("Successfully captured retransmitted frame of len %d", len(retransmittedFrame))
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Timeout waiting for retransmission")
+	}
+
+	// Server opens retransmitted frame
+	seq, _, payload, err := serverConn.openFrame(retransmittedFrame)
+	if err != nil {
+		t.Fatalf("Server openFrame on retransmitted frame failed: %v", err)
+	}
+	if string(payload) != "Crucial Data" {
+		t.Fatalf("Payload mismatch: got %s, want Crucial Data", payload)
+	}
+
+	// Server sends ACK back
+	ackFrame, err := serverConn.sealFrame(1, seq, nil)
+	if err != nil {
+		t.Fatalf("sealFrame ACK failed: %v", err)
+	}
+	downCh <- ackFrame
+
+	// Give client a moment to process ACK and prune unacked buffer
+	time.Sleep(50 * time.Millisecond)
+
+	clientConn.unackedMu.Lock()
+	unackedLen := len(clientConn.unacked)
+	clientConn.unackedMu.Unlock()
+
+	if unackedLen != 0 {
+		t.Errorf("Expected unacked buffer to be empty after ACK, got %d items", unackedLen)
+	}
+}

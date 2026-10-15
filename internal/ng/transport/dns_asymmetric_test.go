@@ -3,6 +3,8 @@ package transport
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net"
 	"testing"
 	"time"
 )
@@ -99,5 +101,296 @@ func TestDNSOverheadAndThroughputBounds(t *testing.T) {
 
 	if conservativeThroughputBps > 100000 {
 		t.Errorf("Conservative DNS throughput unexpectedly exceeded 100 kbps")
+	}
+}
+
+func TestDNSQueryPackingAndTXTResponse(t *testing.T) {
+	qname := "p0.t1.o1.mzxw6ytb.c01.tunnel.local"
+	queryPkt := BuildDNSQuery(qname, 0x0010 /* TXT */, 0x1234)
+
+	id, parsedQName, qtype, err := ParseDNSQuery(queryPkt)
+	if err != nil {
+		t.Fatalf("ParseDNSQuery failed: %v", err)
+	}
+	if id != 0x1234 {
+		t.Errorf("ID mismatch: got 0x%x, want 0x1234", id)
+	}
+	if parsedQName != qname {
+		t.Errorf("QNAME mismatch: got %q, want %q", parsedQName, qname)
+	}
+	if qtype != 0x0010 {
+		t.Errorf("QTYPE mismatch: got 0x%x, want 0x0010", qtype)
+	}
+
+	// Test TXT response packing and extraction
+	txtData := []byte("SECRET-RETURN-DATA-FROM-DNS-SERVER")
+	respPkt, err := BuildDNSTXTResponse(queryPkt, txtData)
+	if err != nil {
+		t.Fatalf("BuildDNSTXTResponse failed: %v", err)
+	}
+
+	extracted, err := ParseDNSTXTResponse(respPkt)
+	if err != nil {
+		t.Fatalf("ParseDNSTXTResponse failed: %v", err)
+	}
+	if !bytes.Equal(extracted, txtData) {
+		t.Fatalf("Extracted TXT mismatch: got %q, want %q", extracted, txtData)
+	}
+}
+
+func TestRealSocketDNSAsymmetricCandidateAEndToEnd(t *testing.T) {
+	sessionID := uint64(0x7766554433221100)
+	psk := []byte("real-dns-socket-psk-32-bytes-ok!")
+	domainSuffix := "tunnel.paqet.local"
+	clientID := "c99"
+
+	// 1. Authoritative DNS Server listening on a real UDP socket
+	dnsServerConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP for DNS server failed: %v", err)
+	}
+	defer dnsServerConn.Close()
+
+	// 2. Client Downstream Receiver listening on a real UDP socket
+	clientDownstreamConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP for client downstream failed: %v", err)
+	}
+	defer clientDownstreamConn.Close()
+
+	// 3. Client Upstream Query Socket
+	clientQueryConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP for client query failed: %v", err)
+	}
+	defer clientQueryConn.Close()
+
+	clientSender := NewRealSocketDNSUpstreamSender(clientQueryConn, dnsServerConn.LocalAddr().(*net.UDPAddr), domainSuffix, clientID)
+	clientReceiver := NewRealSocketDirectUDPReceiver(clientDownstreamConn)
+
+	clientConn, err := NewClientAsymmetricConn(
+		sessionID,
+		psk,
+		64, // Small MTU to force multipart DNS query fragmentation
+		clientSender,
+		clientReceiver,
+		clientDownstreamConn.LocalAddr(),
+		dnsServerConn.LocalAddr(),
+	)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricConn failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn := &AsymmetricConn{
+		sessionID: sessionID,
+		role:      RoleServer,
+		encKey:    clientConn.decKey,
+		decKey:    clientConn.encKey,
+	}
+
+	reassembler := NewDNSReassembler(5 * time.Second)
+	stopServer := make(chan struct{})
+
+	// Server loop: receives DNS queries off the real wire, decodes QNAME, reassembles, and echoes via direct UDP
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-stopServer:
+				return
+			default:
+			}
+
+			_ = dnsServerConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, _, err := dnsServerConn.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+
+			_, qname, _, err := ParseDNSQuery(buf[:n])
+			if err != nil {
+				continue
+			}
+
+			cID, off, part, total, data, err := DecodeDNSQName(qname, domainSuffix)
+			if err != nil {
+				continue
+			}
+
+			fullFrame, ok := reassembler.PushFragment(cID, off, part, total, data)
+			if ok {
+				// Reassembled full frame from real DNS queries!
+				seq, _, payload, err := serverConn.openFrame(fullFrame)
+				if err != nil {
+					continue
+				}
+
+				// Echo back payload to clientDownstreamConn via direct UDP
+				replyFrame, err := serverConn.sealFrame(seq, seq, payload)
+				if err == nil {
+					_, _ = dnsServerConn.WriteToUDP(replyFrame, clientDownstreamConn.LocalAddr().(*net.UDPAddr))
+				}
+			}
+		}
+	}()
+	defer close(stopServer)
+
+	// Send message over client connection (crosses real OS UDP sockets and DNS protocol)
+	testMsg := []byte("REAL-SOCKET-DNS-UPSTREAM-DIRECT-UDP-DOWNSTREAM-SUCCESS")
+	go func() {
+		_, _ = clientConn.Write(testMsg)
+	}()
+
+	recvBuf := make([]byte, len(testMsg))
+	_, err = io.ReadFull(clientConn, recvBuf)
+	if err != nil {
+		t.Fatalf("io.ReadFull failed: %v", err)
+	}
+
+	if !bytes.Equal(recvBuf, testMsg) {
+		t.Fatalf("Received message mismatch: got %q, want %q", recvBuf, testMsg)
+	}
+}
+
+func TestRealSocketDNSAsymmetricCandidateBEndToEnd(t *testing.T) {
+	sessionID := uint64(0x11223344AABBCCDD)
+	psk := []byte("real-dns-candidate-b-psk-32-byte")
+	domainSuffix := "tunnel.paqet.local"
+	clientID := "c77"
+
+	// 1. Authoritative DNS Server socket
+	dnsServerConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP for DNS server failed: %v", err)
+	}
+	defer dnsServerConn.Close()
+
+	// 2. Client query socket (serves both query TX and response RX in Candidate B)
+	clientConnSocket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP for client failed: %v", err)
+	}
+	defer clientConnSocket.Close()
+
+	clientSender := NewRealSocketDNSUpstreamSender(clientConnSocket, dnsServerConn.LocalAddr().(*net.UDPAddr), domainSuffix, clientID)
+
+	// Channel for returning extracted frames from incoming DNS responses
+	downFrameCh := make(chan []byte, 10)
+	clientReceiver := NewMemoryPipeReceiver(downFrameCh)
+
+	clientConn, err := NewClientAsymmetricConn(
+		sessionID,
+		psk,
+		64,
+		clientSender,
+		clientReceiver,
+		clientConnSocket.LocalAddr(),
+		dnsServerConn.LocalAddr(),
+	)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricConn failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn := &AsymmetricConn{
+		sessionID: sessionID,
+		role:      RoleServer,
+		encKey:    clientConn.decKey,
+		decKey:    clientConn.encKey,
+	}
+
+	reassembler := NewDNSReassembler(5 * time.Second)
+	stopServer := make(chan struct{})
+
+	// Server loop: receives query, reassembles frame, echoes inside DNS TXT response to client
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-stopServer:
+				return
+			default:
+			}
+
+			_ = dnsServerConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, clientAddr, err := dnsServerConn.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+
+			reqPkt := buf[:n]
+			_, qname, _, err := ParseDNSQuery(reqPkt)
+			if err != nil {
+				continue
+			}
+
+			cID, off, part, total, data, err := DecodeDNSQName(qname, domainSuffix)
+			if err != nil {
+				continue
+			}
+
+			fullFrame, ok := reassembler.PushFragment(cID, off, part, total, data)
+			if ok {
+				// Reassembled upstream frame!
+				seq, _, payload, err := serverConn.openFrame(fullFrame)
+				if err != nil {
+					continue
+				}
+
+				// Craft reply frame
+				replyFrame, err := serverConn.sealFrame(seq, seq, payload)
+				if err != nil {
+					continue
+				}
+
+				// Embed replyFrame inside DNS TXT answer record!
+				respPkt, err := BuildDNSTXTResponse(reqPkt, replyFrame)
+				if err == nil {
+					_, _ = dnsServerConn.WriteTo(respPkt, clientAddr)
+				}
+			}
+		}
+	}()
+	defer close(stopServer)
+
+	// Client response listener: reads DNS responses on clientConnSocket and feeds TXT answers to downFrameCh
+	stopClientRx := make(chan struct{})
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-stopClientRx:
+				return
+			default:
+			}
+
+			_ = clientConnSocket.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, _, err := clientConnSocket.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+
+			txtAnswer, err := ParseDNSTXTResponse(buf[:n])
+			if err == nil && len(txtAnswer) > 0 {
+				downFrameCh <- txtAnswer
+			}
+		}
+	}()
+	defer close(stopClientRx)
+
+	testMsg := []byte("CANDIDATE-B-BIDIRECTIONAL-DNS-TXT-RESPONSE-SUCCESS")
+	go func() {
+		_, _ = clientConn.Write(testMsg)
+	}()
+
+	recvBuf := make([]byte, len(testMsg))
+	_, err = io.ReadFull(clientConn, recvBuf)
+	if err != nil {
+		t.Fatalf("io.ReadFull failed: %v", err)
+	}
+
+	if !bytes.Equal(recvBuf, testMsg) {
+		t.Fatalf("Message mismatch: got %q, want %q", recvBuf, testMsg)
 	}
 }

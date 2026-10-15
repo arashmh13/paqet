@@ -81,6 +81,122 @@ func TestFailureLab_DestinationPortBlockedFallback(t *testing.T) {
 	}
 }
 
+// TestFailureLab_SelectorRecoveryAfterPortUnblocked tests that selector avoids repeated
+// attempts during cooldown, and then automatically recovers to the preferred candidate when restored.
+func TestFailureLab_SelectorRecoveryAfterPortUnblocked(t *testing.T) {
+	psk := []byte("recovery-test-psk-32-bytes-long!")
+
+	// 1. Create working listener on Port B
+	listenerB, err := NewAEADStreamListener("127.0.0.1:0", psk)
+	if err != nil {
+		t.Fatalf("NewAEADStreamListener B failed: %v", err)
+	}
+	defer listenerB.Close()
+
+	go func() {
+		for {
+			sess, err := listenerB.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go func(s Session) {
+				defer s.Close()
+				strm, err := s.AcceptStream()
+				if err != nil {
+					return
+				}
+				defer strm.Close()
+				_, _ = io.Copy(strm, strm)
+			}(sess)
+		}
+	}()
+
+	// 2. Port A initially closed
+	dummyL, _ := net.Listen("tcp", "127.0.0.1:0")
+	addrA := dummyL.Addr().String()
+	dummyL.Close() // immediately closed
+
+	stratA := NewAEADStreamDialer(psk, 64)
+	stratB := NewAEADStreamDialer(psk, 64)
+
+	mockStratA := &targetDialer{Strategy: stratA, targetAddr: addrA}
+	mockStratB := &targetDialer{Strategy: stratB, targetAddr: listenerB.Addr().String()}
+
+	selector := NewStrategySelector(SelectorConfig{
+		Candidates:          []Strategy{mockStratA, mockStratB},
+		PreferredMode:       ModeAEADStream,
+		CircuitFailureLimit: 1,
+		CircuitCooldown:     200 * time.Millisecond,
+	})
+	selector.current = mockStratA
+
+	// Dial 1: Fails on A, falls back to B
+	sess1, err := selector.Dial(context.Background(), addrA)
+	if err != nil {
+		t.Fatalf("Dial 1 failed: %v", err)
+	}
+	sess1.Close()
+
+	if selector.Current() != mockStratB {
+		t.Errorf("Expected current to switch to B after failure on A")
+	}
+
+	// Dial 2: Immediate retry - A must be skipped because of active cooldown
+	sess2, err := selector.Dial(context.Background(), addrA)
+	if err != nil {
+		t.Fatalf("Dial 2 failed during cooldown: %v", err)
+	}
+	sess2.Close()
+
+	if selector.Current() != mockStratB {
+		t.Errorf("Expected current to remain B during cooldown")
+	}
+
+	// 3. Now start listener A on Port A (simulating unblocking / restoration)
+	listenerA, err := NewAEADStreamListener(addrA, psk)
+	if err != nil {
+		t.Fatalf("Failed to bind listener A on %s: %v", addrA, err)
+	}
+	defer listenerA.Close()
+
+	go func() {
+		for {
+			sess, err := listenerA.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go func(s Session) {
+				defer s.Close()
+				strm, err := s.AcceptStream()
+				if err != nil {
+					return
+				}
+				defer strm.Close()
+				_, _ = io.Copy(strm, strm)
+			}(sess)
+		}
+	}()
+
+	// Wait for cooldown on A to expire
+	time.Sleep(250 * time.Millisecond)
+
+	// In selector: set preferred candidate back to test if it attempts and recovers A
+	selector.mu.Lock()
+	selector.current = mockStratA
+	selector.mu.Unlock()
+
+	// Dial 3: After cooldown, should succeed on restored A
+	sess3, err := selector.Dial(context.Background(), addrA)
+	if err != nil {
+		t.Fatalf("Dial 3 failed to recover on restored A: %v", err)
+	}
+	defer sess3.Close()
+
+	if selector.Current() != mockStratA {
+		t.Errorf("Expected selector to recover and select mockStratA")
+	}
+}
+
 // targetDialer overrides the dial address for testing distinct ports.
 type targetDialer struct {
 	Strategy

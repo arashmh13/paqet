@@ -294,3 +294,29 @@
      - Scenario 3 (Asymmetric National Curfew): Verified simplex upstream + downstream communication under simulated total outbound TCP block.
   7. Produced `docs/research/hard-mode-capability-matrix.md`, `docs/research/asymmetric-transport-design.md`, and `docs/research/failure-laboratory.md`.
 - **Outcome:** Transport directionality is fully implemented and tested. Physical provider limitations are conclusively proven. Controlled failure laboratory tests pass 100%.
+
+---
+
+## Cycle 15: Operational Emergency Transport, Real-Socket DNS-Asymmetric Validation, Protocol Security Audit, and Selector Restoration
+- **Objective:** Reconcile DNS-asymmetric operational status (classify as Prototype pending public NS delegation), perform a security audit of `AsymmetricConn` header authentication and wraparound, build real OS network socket tests for Candidates A & B, probe Iranian TIC UDP/DNS filtering live, and test selector recovery.
+- **Actions:**
+  1. Audited `AsymmetricConn` (`internal/ng/transport/asymmetric.go`):
+     - Confirmed all 20 header bytes (`Magic`, `SessionID`, `Seq`, `Ack`) are authenticated via AEAD AAD. Added `TestAsymmetricHeaderTamperingRejection` proving mutation of any field fails authentication.
+     - Implemented sequence exhaustion protection (`ErrSequenceExhausted`) at $2^{32}-16$ frames (`TestAsymmetricSequenceExhaustion`), preventing catastrophic nonce reuse in AES-GCM.
+     - Implemented reliable retransmission queue (`unackedFrame`), RTO timer, and cumulative ACK pruning (`TestAsymmetricLossAndAutomaticRetransmission`), making `AsymmetricConn` reliable over lossy datagram channels.
+     - Hardened `DNSReassembler` against memory exhaustion by capping pending frames (`MaxPendingFrames = 1024`) and enforcing `totalParts <= 64`.
+  2. Implemented RFC 1035 wire encoding and real OS UDP network sockets (`dns_asymmetric.go`):
+     - `BuildDNSQuery`, `ParseDNSQuery`, `BuildDNSTXTResponse`, `ParseDNSTXTResponse`.
+     - `RealSocketDNSUpstreamSender`, `RealSocketDirectUDPReceiver`.
+     - Implemented and verified `TestRealSocketDNSAsymmetricCandidateAEndToEnd` (DNS upstream + direct UDP return) and `TestRealSocketDNSAsymmetricCandidateBEndToEnd` (DNS query + DNS TXT response return) over real network sockets.
+  3. Live Firewall Probing (Iran VPS -> Germany VPS):
+     - Arbitrary UDP ports (`5353`, `8999`, `9000`, `9998`): 100% BLOCKED / dropped by TIC border firewall.
+     - Direct UDP to foreign VPS on port 53 (`77.37.65.2:53`): BLOCKED / dropped by TIC (foreign destination IP filtering).
+     - UDP to public recursive resolver (`8.8.8.8:53`): **PERMITTED (authentic 61-byte response in < 90ms)**.
+     - **Definitive Operational Finding:** Point-to-point UDP DNS tunneling is blocked in Iran. A viable DNS tunnel strictly requires recursive delegation through public resolvers (`8.8.8.8` / `1.1.1.1`). Without public domain NS delegation, DNS-asymmetric cannot traverse public transit and is formally classified as a **PROTOTYPE**.
+  4. Selector Recovery Verification:
+     - Implemented `TestFailureLab_SelectorRecoveryAfterPortUnblocked`, verifying that selector avoids repeated attempts during candidate cooldown, and automatically recovers to the preferred candidate once restored.
+  5. Produced deliverables:
+     - `docs/research/asymmetric-protocol-security-audit.md`
+     - `docs/research/dns-asymmetric-end-to-end-validation.md`
+- **Outcome:** Zero data races (`go test -race ./internal/...` PASS), 100% test pass. True operational boundaries established. Emergency transport capacity accurately bounded to bootstrap/signaling ($5.6 - 28\text{ kbps}$) and disclaimed as a general SOCKS5 browsing transport.

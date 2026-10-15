@@ -28,6 +28,12 @@ const (
 
 	// AsymmetricSessionTimeout is the period of inactivity before tearing down an asymmetric session.
 	AsymmetricSessionTimeout = 60 * time.Second
+
+	// DefaultRTO is the retransmission timeout for unacknowledged frames over lossy channels.
+	DefaultRTO = 600 * time.Millisecond
+
+	// MaxRetries is the maximum retransmission attempts before marking frame dropped.
+	MaxRetries = 8
 )
 
 var (
@@ -35,7 +41,15 @@ var (
 	ErrAsymmetricSessionClosed  = errors.New("asymmetric: session is closed")
 	ErrAsymmetricShortFrame     = errors.New("asymmetric: frame too short")
 	ErrAsymmetricWindowOverflow = errors.New("asymmetric: receive window overflow")
+	ErrSequenceExhausted        = errors.New("asymmetric: sequence number space exhausted, session must terminate")
 )
+
+type unackedFrame struct {
+	seq     uint32
+	frame   []byte
+	sentAt  time.Time
+	retries int
+}
 
 // Role indicates whether the node is a client (initiator) or server (responder).
 type Role uint8
@@ -94,6 +108,10 @@ type AsymmetricConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
+	unackedMu sync.Mutex
+	unacked   map[uint32]*unackedFrame
+	rto       time.Duration
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -136,6 +154,8 @@ func NewClientAsymmetricConn(
 		pipeR:      pipeR,
 		pipeW:      pipeW,
 		reorder:    make(map[uint32][]byte),
+		unacked:    make(map[uint32]*unackedFrame),
+		rto:        DefaultRTO,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 		ctx:        ctx,
@@ -143,6 +163,7 @@ func NewClientAsymmetricConn(
 	}
 
 	go conn.recvLoop()
+	go conn.retransmitLoop()
 	return conn, nil
 }
 
@@ -164,13 +185,29 @@ func (c *AsymmetricConn) Write(b []byte) (int, error) {
 		}
 		chunk := b[offset : offset+chunkSize]
 
+		if c.sendSeq.Load() >= 0xFFFFFFF0 {
+			return totalSent, ErrSequenceExhausted
+		}
 		seq := c.sendSeq.Add(1)
+		if seq == 0 || seq >= 0xFFFFFFF0 {
+			return totalSent, ErrSequenceExhausted
+		}
 		ack := c.nextRecv.Load()
 
 		frame, err := c.sealFrame(seq, ack, chunk)
 		if err != nil {
 			return totalSent, fmt.Errorf("seal frame %d: %w", seq, err)
 		}
+
+		c.unackedMu.Lock()
+		if c.unacked != nil {
+			c.unacked[seq] = &unackedFrame{
+				seq:    seq,
+				frame:  frame,
+				sentAt: time.Now(),
+			}
+		}
+		c.unackedMu.Unlock()
 
 		if err := c.sender.SendUpstream(c.ctx, frame); err != nil {
 			return totalSent, fmt.Errorf("send upstream seq %d: %w", seq, err)
@@ -319,6 +356,19 @@ func (c *AsymmetricConn) recvLoop() {
 		}
 
 		c.lastAckRcv.Store(ack)
+		c.unackedMu.Lock()
+		if c.unacked != nil {
+			for s := range c.unacked {
+				if s <= ack {
+					delete(c.unacked, s)
+				}
+			}
+		}
+		c.unackedMu.Unlock()
+
+		if len(payload) == 0 {
+			continue // Pure ACK frame
+		}
 
 		c.reorderMu.Lock()
 		expected := c.nextRecv.Load() + 1
@@ -345,6 +395,53 @@ func (c *AsymmetricConn) recvLoop() {
 			}
 		}
 		c.reorderMu.Unlock()
+	}
+}
+
+func (c *AsymmetricConn) SetRTO(d time.Duration) {
+	c.unackedMu.Lock()
+	defer c.unackedMu.Unlock()
+	if d > 0 {
+		c.rto = d
+	}
+}
+
+func (c *AsymmetricConn) getRTO() time.Duration {
+	c.unackedMu.Lock()
+	defer c.unackedMu.Unlock()
+	if c.rto <= 0 {
+		return DefaultRTO
+	}
+	return c.rto
+}
+
+// retransmitLoop handles automatic retransmissions of unacknowledged frames over lossy channels.
+func (c *AsymmetricConn) retransmitLoop() {
+	rto := c.getRTO()
+	ticker := time.NewTicker(rto / 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			curRTO := c.getRTO()
+			c.unackedMu.Lock()
+			for _, entry := range c.unacked {
+				if now.Sub(entry.sentAt) >= curRTO {
+					if entry.retries < MaxRetries {
+						entry.retries++
+						entry.sentAt = now
+						if c.sender != nil {
+							_ = c.sender.SendUpstream(c.ctx, entry.frame)
+						}
+					}
+				}
+			}
+			c.unackedMu.Unlock()
+		}
 	}
 }
 

@@ -48,6 +48,7 @@
    - Aggressive (100 queries/second): **$28.00\text{ kbps}$**.
 3. **Latency Inflation:** Recursive multi-hop DNS resolution inflates round-trip times to 150–600ms.
 4. **Operational Scope:** `dns-asymmetric` must be deployed strictly as an emergency signaling, bootstrap, or text-terminal channel, not as an interactive browsing transport.
+5. **Public Delegation & Foreign UDP 53 Filtering Boundary:** Live probes from Iran confirmed that direct UDP port 53 datagrams sent to arbitrary foreign VPS IPs are dropped by TIC firewalls. A viable DNS tunnel strictly requires recursive traversal via public resolvers (e.g. `8.8.8.8`). This fundamentally requires public authoritative domain NS delegation (`tunnel.example.com IN NS ns1.example.com`). Without registered domain delegation, DNS-asymmetric remains a **PROTOTYPE** and cannot traverse the live international perimeter.
 
 ---
 

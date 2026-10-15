@@ -3,14 +3,15 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.4.2-verified`
-- **Active Binary SHA-256:** `0ee0d399a559a9b92ee8348b61473b8413ae62c232320f07c26c763019f6ee93`
+- **Current Version:** `v2.4.4-emergency`
+- **Active Binary SHA-256:** `df8c700ff1df6b97d99d789703d8efba4721ecdfaf09a3712f499e8225b3cd1a`
 - **Architectural Validation Status:**
   - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 11.60 Mbps line rate, CA certificate validation verified).
   - Candidate 2 (Raw TCP Decoy Sequence Injection): **COMPLETE & WIRE-VERIFIED** (`wrong_seq` out-of-window packet injection, silent kernel drop on Germany VPS, 123.4 ms RTT).
-  - Asymmetric Directional Decoupling (`AsymmetricConn`): **COMPLETE & TESTED** (independent `UpstreamSender` and `DownstreamReceiver` channels, AEAD framing, reassembly sliding window, and anti-replay DoS protection).
+  - Asymmetric Directional Decoupling (`AsymmetricConn`): **COMPLETE & HARDENED** (independent `UpstreamSender` and `DownstreamReceiver` channels, AAD header authentication, sequence exhaustion protection, RTO retransmission queue, and memory bounds).
+  - DNS-Asymmetric Transport: **PROTOTYPE (Gated by Public Domain NS Delegation)** (Candidate A and Candidate B verified over real OS UDP sockets; direct foreign UDP 53 proved dropped by TIC; recursive resolver delegation required).
   - BCP 38 / uRPF Spoofing Feasibility: **CONCLUDED & INFEASIBLE** (probes conclusively dropped by Panel01 and Hetzner egress routers).
-  - Controlled Failure Laboratory: **OPERATIONAL** (`failure_lab_test.go` passing 100% across port drops, idle resumptions, and national curfew simulations).
+  - Controlled Failure Laboratory: **OPERATIONAL & EXPANDED** (`failure_lab_test.go` passing across port drops, idle resumptions, national curfews, and automatic selector restoration after unblocking).
 - **Active Endpoints:**
   - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (`raw-kcp` with out-of-window SNI sequence injection), Genuine TLS on `127.0.0.1:1095` (`tls` on `:8443`).
   - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), Genuine TLS server on `:8443`.

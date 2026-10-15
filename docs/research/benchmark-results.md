@@ -26,8 +26,8 @@ All measurements conducted across 10 repeated latency trials and 5 repeated bulk
 | **Echo RTT (Mean)** | $84.8\text{ ms}$ | $121.7\text{ ms}$ | $124.8\text{ ms}$ | $90.5\text{ ms}$ | $89.4\text{ ms}$ | $90.9\text{ ms}$ |
 | **Echo RTT (P95)** | $86.1\text{ ms}$ | $132.9\text{ ms}$ | $149.8\text{ ms}$ | **$91.8\text{ ms}$** | $90.4\text{ ms}$ | $94.8\text{ ms}$ |
 | **5 MB Transfer Time (Median)**| $3.72\text{ s}$ | $4.03\text{ s}$ | $4.06\text{ s}$ | **$3.62\text{ s}$** | $3.50\text{ s}$ | $3.63\text{ s}$ |
-| **Throughput (Median)** | $11.27\text{ Mbps}$ | $10.41\text{ Mbps}$ | $10.31\text{ Mbps}$ | **$12.16\text{ Mbps}$** ($1.45\text{ MB/s}$)| $11.97\text{ Mbps}$ | $11.57\text{ Mbps}$ |
-| **Throughput (P95)** | $11.35\text{ Mbps}$ | $10.65\text{ Mbps}$ | $10.55\text{ Mbps}$ | **$12.24\text{ Mbps}$** | $12.17\text{ Mbps}$ | $11.63\text{ Mbps}$ |
+| **Throughput (Median)** | $11.27\text{ Mbps}$ | $10.41\text{ Mbps}$ | $10.31\text{ Mbps}$ | **$11.60\text{ Mbps}$** ($1.45\text{ MB/s}$)| $11.44\text{ Mbps}$ | $11.57\text{ Mbps}$ |
+| **Throughput (P95)** | $11.35\text{ Mbps}$ | $10.65\text{ Mbps}$ | $10.55\text{ Mbps}$ | **$11.68\text{ Mbps}$** | $11.63\text{ Mbps}$ | $11.63\text{ Mbps}$ |
 | **Client Memory (RSS)** | N/A | $29.3\text{ MB}$ | $29.5\text{ MB}$ | **$19.2\text{ MB}$** | $18.8\text{ MB}$ | $18.3\text{ MB}$ |
 | **Server Memory (RSS)** | N/A | $41.4\text{ MB}$ | $41.8\text{ MB}$ | **$19.5\text{ MB}$** | $18.8\text{ MB}$ | $18.8\text{ MB}$ |
 | **Client CPU Utilization** | N/A | $3.2\%$ | $3.3\%$ | **$2.2\%$** | $2.2\%$ | $2.3\%$ |
@@ -74,3 +74,20 @@ Direct curl downloads bypassing Paqet entirely between Iran VPS and German VPS m
 3. **Survivability Trade-off:**
    - Use `raw-hardened` when operating on networks where standard TCP handshakes are subjected to protocol-specific DPI interference and custom TCP flags (`PA`, `SA`) are required to bypass middlebox state machines.
    - Use `aead-stream` when operating behind residential NAT routers or requiring high throughput and low CPU overhead.
+
+---
+
+## 5. DNS-Asymmetric Protocol Performance Envelope & Bounds
+
+Tested via `dns_asymmetric_test.go` and verified on real network sockets:
+
+| Parameter | Measured Specification | Practical Operational Boundary |
+| :--- | :--- | :--- |
+| **Payload per DNS Label** | $35\text{ bytes}$ ($56$ Base32 characters) | RFC 1035 label limit ($63$ chars) |
+| **Wire Query Size** | $126\text{ bytes}$ (Header + QNAME + Question) | Fixed UDP framing overhead |
+| **Wire Amplification** | **$3.60\times$** ($126\text{B} / 35\text{B}$) | High overhead on DNS recursors |
+| **Conservative Rate (20 qps)** | **$5.60\text{ kbps}$** ($700\text{ B/s}$) | Safe below public resolver rate limits |
+| **Aggressive Rate (100 qps)** | **$28.00\text{ kbps}$** ($3.50\text{ KB/s}$) | May trigger resolver rate limiting (RRL) |
+| **Round-Trip Latency** | $150\text{ ms} - 450\text{ ms}$ | High latency due to recursive resolution |
+| **Operational Classification** | **Emergency Signaling / Bootstrap** | Unsuitable for general SOCKS5 browsing |
+
