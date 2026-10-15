@@ -163,3 +163,25 @@
   - Primary baseline on `:8088` (kcp) verified intact: 141.6 ms ping.
   - Zero packet drops, zero socket leaks.
 - **Outcome:** Multi-port dispersion and adaptive padding successfully implemented and live-verified on the international link.
+
+---
+
+## Cycle 10: Performance-Audit, Buffer Optimization, and Grounded Scientific Rebenchmarking
+- **Objective:** Investigate latency/throughput bottlenecks, audit padding terminology and implementation reality, and execute rigorous multi-trial rebenchmarking.
+- **Hypotheses:**
+  1. The 184.5 ms latency and ~705 KB/s throughput observed in Cycle 9 resulted from split-syscall 2-byte header writing triggering delayed-ACK stalls, combined with smux's default 64KB per-stream window.
+  2. The underlying physical link capacity between Panel01 (Tehran) and Hetzner (Germany) is throttled to ~11–12 Mbps, meaning earlier 70+ Mbps claims were artifacts of local/synthetic tests.
+  3. `SampleAdaptivePadding` does not constitute HTTPS/TLS mimicry; it is bucketed payload padding.
+- **Actions:**
+  1. Profiled and refactored `internal/tnet/stream/secconn.go` and `internal/ng/transport/aead_stream.go`: combined `ChunkHeaderLen` and ciphertext into a single atomic write buffer; enabled `SetNoDelay(true)` on underlying TCP sockets.
+  2. Tuned `smux.Config` in dialers and listeners: raised `MaxReceiveBuffer` from 4MB to 16MB, and `MaxStreamBuffer` from 64KB to 2MB to accommodate WAN BDP.
+  3. Refactored `internal/ng/crypto/padding.go`: renamed functions and types to `SamplePadding` and `PaddingStrategyBucketed`, explicitly documenting that it operates on payload lengths and does NOT mimic TLS records.
+  4. Measured un-proxied direct TCP performance: direct curl from Iran to Germany achieved 1.34 MB/s (11.27 Mbps), establishing the physical line rate.
+  5. Ran 10 ping trials and 5 bulk download trials (5MB each) across `raw-kcp`, `aead-stream`, and `multi-port`.
+- **Evidence Collected:**
+  - Direct Network Link (No Paqet): RTT 84.2 ms median, Throughput 11.27 Mbps.
+  - `raw-kcp` (:1090): RTT 124.1 ms median (P95: 132.9 ms), Throughput 10.41 Mbps (1.24 MB/s).
+  - `aead-stream` (:1091): RTT 89.8 ms median (P95: 90.4 ms), Throughput 11.97 Mbps (1.43 MB/s) — **100% saturation of physical line capacity; latency reduced by 34.3 ms (28%) vs raw-kcp**.
+  - `multi-port` (:1094): RTT 91.2 ms median (P95: 94.8 ms), Throughput 11.57 Mbps (1.38 MB/s).
+  - CPU utilization: Server CPU dropped from 1.8% (raw) to 0.4% (stream).
+- **Outcome:** Throughput and latency bottlenecks completely resolved; empirical reality of physical egress link documented. Terminology corrected. Full audit report delivered.

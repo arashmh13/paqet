@@ -42,3 +42,35 @@
 1. **Bandwidth Ceiling:** Maximum Base32 payload capacity is capped at 35–45 bytes per DNS query label. Maximum effective upstream throughput is $\le 0.8\text{ Mbps}$.
 2. **Latency Inflation:** Recursive multi-hop DNS resolution inflates round-trip times to 600–1800ms.
 3. **Operational Scope:** `dns-asymmetric` must be deployed strictly as an emergency signaling / recovery channel, not as an interactive browsing transport.
+
+---
+
+## 6. Unit Test Correctness vs. Censorship Resistance Claims
+
+Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middlebox drop scripts proves **software correctness, memory safety, and protocol specification adherence**; it does **not** prove evasion of China's Great Firewall (GFW), Russia's TSPU, or un-tested Iranian residential mobile operators (MCI / Irancell).
+- **GFW vs. Iran TIC:** The GFW employs active probing with distinct TLS/QUIC probe sequences, extensive BGP-level route poisoning, and dynamic deep-learning classifiers trained on massive international egress pipes.
+- **Controlled Lab Boundary:** Our live tests establish that Paqet-NG bypasses specific stateful conntrack drops and silent tarpit active-probing signatures between Panel01 (Tehran) and Hetzner (Germany). Broader claims of universal invulnerability are scientifically unverified.
+
+---
+
+## 7. Padding Reality vs. Genuine TLS Record Layer Mimicry
+
+- **Scope of Payload Padding:** `SamplePadding` with `PaddingStrategyBucketed` clusters application payload lengths into standard discrete sizes (e.g. 64, 128, 256, 512, 1024, 1420 bytes) plus small random jitter.
+- **What It Does NOT Do:** It operates strictly inside the encrypted AEAD datagram or stream chunk. It does **not** generate genuine TLS 1.3 `0x17` ApplicationData records, nor does it emit valid TLS record layer headers on the wire.
+- **Classification Reality:** A passive DPI sensor inspecting raw packet streams will observe custom binary framing or high-entropy TCP segments, not an authentic TLS handshake and session. Claiming "HTTPS mimicry" without a full TLS record layer wrapper is inaccurate.
+
+---
+
+## 8. Multi-Port Pooling vs. Deep Packet Inspection
+
+- **Scope of Multi-Port Pooling:** Distributing client connections across multiple ports (e.g. `:8089` and `:8443`) on the same destination IP address mitigates **port-specific heuristic rate-limiting** and **single-port firewall blocks**.
+- **What It Does NOT Do:** It does **not** prevent DPI classification if the DPI inspects payload contents, entropy distributions, or the underlying transport framing.
+- **Operational Reality:** Multi-port pooling is a traffic-distribution and availability feature; it is not a standalone DPI circumvention technique.
+
+---
+
+## 9. Physical Egress Bandwidth Ceiling (Panel01 Iran VPS)
+
+- **Measured Egress Limit:** Direct un-proxied TCP curl downloads from Iran VPS (`185.18.215.124`) to German VPS (`77.37.65.2`) are physically shaped to $1.34\text{ MB/s}$ ($11.27\text{ Mbps}$).
+- **Transport Utilization:** `aead-stream` achieves $1.43\text{ MB/s}$ ($11.97\text{ Mbps}$), representing 100% saturation of the allocated link capacity.
+- **Throughput Reporting:** Measurements reporting 70+ Mbps reflect unthrottled local loopback or synthetic lab conditions, not the real-world egress limit of this specific virtual machine path.

@@ -5,17 +5,28 @@ import (
 	"encoding/binary"
 )
 
-// PaddingProfile represents the packet shaping profile.
-type PaddingProfile string
+// PaddingStrategy defines how payload padding lengths are chosen.
+type PaddingStrategy string
 
 const (
-	PaddingProfileUniform   PaddingProfile = "uniform"
-	PaddingProfileTLSBimodal PaddingProfile = "tls_bimodal"
+	// PaddingStrategyUniform selects a uniform random padding length between 0 and maxPad.
+	PaddingStrategyUniform PaddingStrategy = "uniform"
+
+	// PaddingStrategyBucketed aligns total frame length to discrete size boundaries
+	// (64, 128, 256, 512, 1024, 1420 bytes) plus small random jitter.
+	// NOTE: This operates strictly on inner payload length to reduce traffic analysis
+	// correlation. It does NOT generate or mimic TLS record layer headers.
+	PaddingStrategyBucketed PaddingStrategy = "bucketed"
 )
 
-// SampleAdaptivePadding calculates padding length according to the selected profile.
-// It guarantees that 0 <= padLen <= maxPad and (plainLen + padLen) <= maxFrame.
-func SampleAdaptivePadding(plainLen, maxPad, maxFrame int, profile PaddingProfile) int {
+// SamplePadding calculates the padding bytes to append to an application payload.
+// It guarantees that:
+//  1. 0 <= padLen <= maxPad
+//  2. (plainLen + padLen) <= maxFrame
+//
+// Technical Note: This function operates strictly on payload framing inside the
+// obfuscated datagram or stream chunk. It does NOT provide HTTPS protocol mimicry.
+func SamplePadding(plainLen, maxPad, maxFrame int, strategy PaddingStrategy) int {
 	if maxPad <= 0 || maxFrame <= plainLen {
 		return 0
 	}
@@ -34,9 +45,9 @@ func SampleAdaptivePadding(plainLen, maxPad, maxFrame int, profile PaddingProfil
 	}
 	randVal := int(binary.BigEndian.Uint16(b[:]))
 
-	switch profile {
-	case PaddingProfileTLSBimodal:
-		// Target discrete TLS record size buckets: 64, 128, 256, 512, 1024, 1420
+	switch strategy {
+	case PaddingStrategyBucketed:
+		// Target discrete size boundaries to reduce size-correlation attack fidelity
 		targetBuckets := []int{64, 128, 256, 512, 1024, 1420}
 		for _, bucket := range targetBuckets {
 			if bucket >= plainLen {
@@ -52,7 +63,7 @@ func SampleAdaptivePadding(plainLen, maxPad, maxFrame int, profile PaddingProfil
 				break
 			}
 		}
-		// For larger frames, pick a small random jitter
+		// For larger frames exceeding bucket steps, fallback to bounded random
 		return randVal % (budget + 1)
 
 	default: // Uniform random

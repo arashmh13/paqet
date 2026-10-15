@@ -31,6 +31,9 @@ func Dial(addr string, obfsCfg *conf.Obfs) (tnet.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stream: failed to dial %s: %w", addr, err)
 	}
+	if tcp, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 
 	// 1. Send random salt
 	var salt [transport.SaltSize]byte
@@ -89,6 +92,8 @@ func Dial(addr string, obfsCfg *conf.Obfs) (tnet.Conn, error) {
 
 	smuxCfg := smux.DefaultConfig()
 	smuxCfg.Version = 2
+	smuxCfg.MaxReceiveBuffer = 16 * 1024 * 1024
+	smuxCfg.MaxStreamBuffer = 2 * 1024 * 1024
 	sess, err := smux.Client(secConn, smuxCfg)
 	if err != nil {
 		secConn.Close()
@@ -215,6 +220,8 @@ func DialSNIAssisted(addr string, obfsCfg *conf.Obfs, sniCfg *conf.SNI) (tnet.Co
 
 	smuxCfg := smux.DefaultConfig()
 	smuxCfg.Version = 2
+	smuxCfg.MaxReceiveBuffer = 16 * 1024 * 1024
+	smuxCfg.MaxStreamBuffer = 2 * 1024 * 1024
 	sess, err := smux.Client(secConn, smuxCfg)
 	if err != nil {
 		secConn.Close()

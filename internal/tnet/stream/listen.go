@@ -124,9 +124,14 @@ func (l *Listener) Accept() (tnet.Conn, error) {
 		}
 
 		rawConn.SetDeadline(time.Time{})
+		if tcp, ok := rawConn.(*net.TCPConn); ok {
+			_ = tcp.SetNoDelay(true)
+		}
 
 		smuxCfg := smux.DefaultConfig()
 		smuxCfg.Version = 2
+		smuxCfg.MaxReceiveBuffer = 16 * 1024 * 1024
+		smuxCfg.MaxStreamBuffer = 2 * 1024 * 1024
 		sess, err := smux.Server(secConn, smuxCfg)
 		if err != nil {
 			secConn.Close()

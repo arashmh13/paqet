@@ -46,15 +46,11 @@ func (s *secureStreamConn) Write(p []byte) (int, error) {
 		nonce := s.makeNonce(s.encNonce)
 		s.encNonce++
 
-		ciphertext := s.enc.Seal(nil, nonce[:], chunk, nil)
-		frameLen := uint16(len(ciphertext))
+		frame := make([]byte, transport.ChunkHeaderLen, transport.ChunkHeaderLen+chunkSize+crypto.TagSize)
+		ciphertext := s.enc.Seal(frame, nonce[:], chunk, nil)
+		frameLen := uint16(len(ciphertext) - transport.ChunkHeaderLen)
+		binary.BigEndian.PutUint16(ciphertext[:transport.ChunkHeaderLen], frameLen)
 
-		var hdr [transport.ChunkHeaderLen]byte
-		binary.BigEndian.PutUint16(hdr[:], frameLen)
-
-		if _, err := s.Conn.Write(hdr[:]); err != nil {
-			return totalSent, err
-		}
 		if _, err := s.Conn.Write(ciphertext); err != nil {
 			return totalSent, err
 		}

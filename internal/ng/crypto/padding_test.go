@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-func TestSampleAdaptivePadding(t *testing.T) {
+func TestSamplePadding(t *testing.T) {
 	maxFrame := 1460
 	maxPad := 128
 
@@ -15,7 +15,7 @@ func TestSampleAdaptivePadding(t *testing.T) {
 			plainLen = 1400
 		}
 
-		padUniform := SampleAdaptivePadding(plainLen, maxPad, maxFrame, PaddingProfileUniform)
+		padUniform := SamplePadding(plainLen, maxPad, maxFrame, PaddingStrategyUniform)
 		if padUniform < 0 || padUniform > maxPad {
 			t.Fatalf("Uniform padding out of bounds: %d (maxPad=%d)", padUniform, maxPad)
 		}
@@ -23,23 +23,23 @@ func TestSampleAdaptivePadding(t *testing.T) {
 			t.Fatalf("Uniform total length exceeds maxFrame: %d > %d", plainLen+padUniform, maxFrame)
 		}
 
-		padTLS := SampleAdaptivePadding(plainLen, maxPad, maxFrame, PaddingProfileTLSBimodal)
-		if padTLS < 0 || padTLS > maxPad {
-			t.Fatalf("TLS padding out of bounds: %d (maxPad=%d)", padTLS, maxPad)
+		padBucketed := SamplePadding(plainLen, maxPad, maxFrame, PaddingStrategyBucketed)
+		if padBucketed < 0 || padBucketed > maxPad {
+			t.Fatalf("Bucketed padding out of bounds: %d (maxPad=%d)", padBucketed, maxPad)
 		}
-		if plainLen+padTLS > maxFrame {
-			t.Fatalf("TLS total length exceeds maxFrame: %d > %d", plainLen+padTLS, maxFrame)
+		if plainLen+padBucketed > maxFrame {
+			t.Fatalf("Bucketed total length exceeds maxFrame: %d > %d", plainLen+padBucketed, maxFrame)
 		}
 	}
 }
 
-func TestSampleAdaptivePaddingTLSBucketAlignment(t *testing.T) {
-	// A 50-byte plain payload with maxPad=64 should pad close to 64 bytes
+func TestSamplePaddingBucketAlignment(t *testing.T) {
+	// A 50-byte plain payload with maxPad=32 should pad into the 64-byte bucket
 	plainLen := 50
 	maxPad := 32
 	maxFrame := 1460
 
-	pad := SampleAdaptivePadding(plainLen, maxPad, maxFrame, PaddingProfileTLSBimodal)
+	pad := SamplePadding(plainLen, maxPad, maxFrame, PaddingStrategyBucketed)
 	total := plainLen + pad
 	if total < 64 {
 		t.Errorf("Expected padded total >= 64, got %d", total)

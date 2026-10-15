@@ -79,15 +79,11 @@ func (s *secureConn) Write(p []byte) (int, error) {
 		nonce := s.makeNonce(s.encNonce)
 		s.encNonce++
 
-		ciphertext := s.enc.Seal(nil, nonce[:], chunk, nil)
-		frameLen := uint16(len(ciphertext))
+		frame := make([]byte, ChunkHeaderLen, ChunkHeaderLen+chunkSize+crypto.TagSize)
+		ciphertext := s.enc.Seal(frame, nonce[:], chunk, nil)
+		frameLen := uint16(len(ciphertext) - ChunkHeaderLen)
+		binary.BigEndian.PutUint16(ciphertext[:ChunkHeaderLen], frameLen)
 
-		var hdr [ChunkHeaderLen]byte
-		binary.BigEndian.PutUint16(hdr[:], frameLen)
-
-		if _, err := s.Conn.Write(hdr[:]); err != nil {
-			return totalSent, err
-		}
 		if _, err := s.Conn.Write(ciphertext); err != nil {
 			return totalSent, err
 		}
@@ -288,6 +284,8 @@ func (d *AEADStreamDialer) dialInternal(ctx context.Context, addr string) (Sessi
 	// 4. Initialize smux multiplexer
 	smuxCfg := smux.DefaultConfig()
 	smuxCfg.Version = 2
+	smuxCfg.MaxReceiveBuffer = 16 * 1024 * 1024
+	smuxCfg.MaxStreamBuffer = 2 * 1024 * 1024
 	sess, err := smux.Client(secConn, smuxCfg)
 	if err != nil {
 		secConn.Close()
@@ -402,9 +400,14 @@ func (l *AEADStreamListener) Accept(ctx context.Context) (Session, error) {
 		}
 
 		rawConn.SetDeadline(time.Time{}) // Clear handshake deadline
+		if tcp, ok := rawConn.(*net.TCPConn); ok {
+			_ = tcp.SetNoDelay(true)
+		}
 
 		smuxCfg := smux.DefaultConfig()
 		smuxCfg.Version = 2
+		smuxCfg.MaxReceiveBuffer = 16 * 1024 * 1024
+		smuxCfg.MaxStreamBuffer = 2 * 1024 * 1024
 		sess, err := smux.Server(secConn, smuxCfg)
 		if err != nil {
 			secConn.Close()
