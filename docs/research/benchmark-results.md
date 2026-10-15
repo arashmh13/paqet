@@ -106,22 +106,30 @@ Conducted across 10 sequential 64-byte authenticated application payloads transm
 | **Resolver Diversity Confirmed** | Google (`8.8.8.8`, $142\text{ms}$), Cloudflare (`1.1.1.1`, $136.9\text{ms}$), Quad9 (`9.9.9.9`, $299.3\text{ms}$) |
 | **Conventional TCP Blackhole Survival** | **Verified:** Message succeeded while ports 8088, 8089, 8443 were blocked. |
 
-### 5.2 Phase 10 Hardened Multi-Resolver Rate-Limited Soak Benchmark (45 Trials)
+### 5.2 Phase 10 Hardened Multi-Resolver Rate-Limited Soak Benchmark & Statistical Reconciliation (45 Trials)
 
 Executed against `v2.5.2-hardened` (`secp0hardened`, SHA-256 `c6c2331188d650d00b78ddc81b955811977a97fc6f49021c610bb401cbbc7475`) using 16B, 64B, and 140B cryptographic random hex payloads at 0.8s rate-limited pacing across Google (`8.8.8.8`), Cloudflare (`1.1.1.1`), and Quad9 (`9.9.9.9`):
 
-| Resolver | Sample Size | Success Rate | Byte-Exact Echo Rate | Min RTT | Median RTT | Mean RTT | P95 RTT | Max RTT |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Google Public DNS (`8.8.8.8:53`)** | 15 trials | 66.7% | 66.7% | $99.08\text{ ms}$ | $146.77\text{ ms}$ | $142.09\text{ ms}$ | $157.71\text{ ms}$ | $166.73\text{ ms}$ |
-| **Cloudflare DNS (`1.1.1.1:53`)** | 15 trials | 66.7% | 66.7% | $132.78\text{ ms}$ | $147.77\text{ ms}$ | $154.79\text{ ms}$ | $177.46\text{ ms}$ | $180.35\text{ ms}$ |
-| **Quad9 DNS (`9.9.9.9:53`)** | 15 trials | 80.0% | 80.0% | $126.84\text{ ms}$ | $150.82\text{ ms}$ | $351.44\text{ ms}$ | $196.34\text{ ms}$ | $2,558.48\text{ ms}$ |
+#### Reconciled Summary Table (NIST / Hyndman-Fan Type 7 Linear Interpolation)
+| Resolver | Total Attempts | Successful (Ratio) | Success Rate | Echo Verified | Min RTT | Median RTT | Mean RTT | Reconciled P95 RTT | Max RTT | All-Attempt Mean Elapsed |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Google Public DNS (`8.8.8.8:53`)** | 15 trials | 10/15 | 66.67% | 10/15 (66.67%) | $99.08\text{ ms}$ | $146.77\text{ ms}$ | $142.09\text{ ms}$ | $162.67\text{ ms}$ | $166.73\text{ ms}$ | $1,508.12\text{ ms}$ |
+| **Cloudflare DNS (`1.1.1.1:53`)** | 15 trials | 10/15 | 66.67% | 10/15 (66.67%) | $132.78\text{ ms}$ | $147.77\text{ ms}$ | $154.79\text{ ms}$ | $179.05\text{ ms}$ | $180.35\text{ ms}$ | $1,514.40\text{ ms}$ |
+| **Quad9 DNS (`9.9.9.9:53`)** | 15 trials | 12/15 | 80.00% | 12/15 (80.00%) | $126.84\text{ ms}$ | $150.82\text{ ms}$ | $351.44\text{ ms}$ | **$1,259.31\text{ ms}$** | $2,558.48\text{ ms}$ | $1,129.83\text{ ms}$ |
 
-#### Key Empirical Takeaways:
-1. **Payload Size vs Reliability Boundary:**
-   - Payloads $\le 64\text{ bytes}$ (1 to 2 fragments): **100.0% delivery rate (30/30)** with median latency of **$148.2\text{ ms}$** and 100% byte-exact echo verification.
-   - Payloads $\ge 140\text{ bytes}$ (6 fragments): Fragment loss probability across international recursive paths increases significantly; retransmissions complete with latency of $\approx 2.5 - 4.2\text{ s}$.
-2. **Design Directive for Emergency Control Plane:**
-   - All critical recovery signaling (alerts, endpoint bootstrap, status) must be designed to fit $\le 64\text{ bytes}$ to ensure deterministic, single-round-trip survival.
-3. **Artifact Reference:** Full sample dataset preserved in `docs/research/emergency_dns_hardened_soak_stats.json`.
+#### Reconciliation of the Quad9 P95 Metric Discrepancy
+- **Prior Error:** Early ad-hoc reporting calculated percentile index via `p95_idx = max(0, int(0.95 * len(rtts)) - 1)`. For $N=12$, this truncated index to $10$, selecting the 11th sorted element ($196.34\text{ ms}$) instead of interpolating toward the 12th element ($2,558.48\text{ ms}$). This caused the paradoxical observation where Mean ($351.44\text{ ms}$) exceeded the reported P95 ($196.34\text{ ms}$).
+- **Mathematical Correction:** Implemented standard continuous linear interpolation (Hyndman-Fan Type 7):
+  $$\text{Rank } r = p \times (N - 1) = 0.95 \times 11 = 10.45$$
+  $$P_{95} = X_{10} + 0.45 \times (X_{11} - X_{10}) = 196.34 + 0.45 \times (2558.48 - 196.34) = \mathbf{1,259.31\text{ ms}}$$
+  This resolves the statistical anomaly.
+- **Separation of Distributions:** Successful response RTTs (reflecting packet transit) are explicitly decoupled from all-attempt elapsed times (which include 4-second timeout and backoff periods on dropped 140B packets).
+
+#### Breakdown by Payload Size (All Resolvers Combined)
+1. **16-byte payloads (1 fragment):** **15/15 SUCCESS (100.0%)**, median RTT **$144.5\text{ ms}$**, 100% byte-exact echo verification.
+2. **64-byte payloads (2 fragments):** **15/15 SUCCESS (100.0%)**, median RTT **$151.8\text{ ms}$**, 100% byte-exact echo verification.
+3. **140-byte payloads (6 fragments):** **2/15 SUCCESS (13.3%)** ($2/5$ on Quad9, $0/5$ on Google/Cloudflare). Demonstrates that multi-fragment queries suffer heavy packet loss across recursive caches.
+4. **Conclusion:** All empirical figures are observations from the tested sample under specific cross-border network conditions. Emergency control signaling must remain strictly $\le 64\text{ bytes}$.
+5. **Artifact Reference:** Reconciled JSON dataset preserved in `docs/research/emergency_dns_hardened_soak_stats.json`. Deterministic calculation engine in `internal/ng/dns/benchmark_analysis.go`.
 
 

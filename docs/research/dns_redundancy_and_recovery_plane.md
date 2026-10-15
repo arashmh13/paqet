@@ -108,3 +108,68 @@ When conventional ports are severed, the client issues a `bootstrap_request`. Th
      - Add `ns2.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir` `A` $\longrightarrow$ `<Node2_IP>`.
      - Add `tunnel...` `NS` $\longrightarrow$ `ns2...` alongside `ns-de...`.
   3. Verify delegation via `dig +trace` and `paqet emergency scan`.
+
+---
+
+## 5. Controlled Recovery State Machine Architecture (Phase 11)
+
+To ensure reliable, non-flapping failover when primary transports degrade, Paqet-NG implements an explicit finite state machine (`RecoveryStateMachine` in `internal/ng/transport/recovery_state_machine.go`):
+
+```
+                       +-------------------+
+                       |  PRIMARY_HEALTHY  |<--------------------+
+                       +-------------------+                     |
+                                 |                               |
+                   Failure Count >= Threshold                    |
+                                 v                               |
+                       +-------------------+                     |
+        +------------->|  PRIMARY_DEGRADED |                     |
+        |              +-------------------+                     |
+        |                        |                               |
+        |                  Degraded Timeout                      |
+        |                        v                               |
+        |              +-------------------+                     |
+        |              |EMERGENCY_SIGNALING|                     |
+        |              +-------------------+                     |
+        |                        |                               |
+        |                 DNS Bootstrap OK                       |
+        |                        v                               |
+        |              +-------------------+                     |
+        |              | BOOTSTRAP_RECEIVED|                     |
+        |              +-------------------+                     |
+        |                        |                               |
+        |                        v                               |
+        |              +-------------------+                     |
+        |              | CANDIDATE_ENDPOINT|                     |
+        |              |    VALIDATING     |                     |
+        |              +-------------------+                     |
+        |                   /             \                      |
+        |          Validation Failed   Validation Passed         |
+        |                 /                 \                    |
+        |                v                   v                   |
+        |       +-----------------+  +----------------+          |
+        |       | RECOVERY_FAILED |  | RECOVERY_READY |          |
+        |       +-----------------+  +----------------+          |
+        |                |                   |                   |
+        |                v                   |                   |
+        |       +-----------------+          |                   |
+        |       |    COOLDOWN     |          |                   |
+        |       +-----------------+          |                   |
+        |                |                   |                   |
+        +----------------+                   |                   |
+        Cooldown Expired                     |                   |
+                                             v                   |
+                                    Rollback / Restored ---------+
+```
+
+### 5.1 State Machine Design Invariants
+1. **Hysteresis & Flap Prevention:**
+   A single transient packet drop does not trigger emergency failover. `PrimaryFailureThreshold` (default 3) consecutive failures are required to transition from `PRIMARY_HEALTHY` to `PRIMARY_DEGRADED`.
+   If primary traffic succeeds during `PRIMARY_DEGRADED`, the engine immediately reverts to `PRIMARY_HEALTHY` without initiating emergency signaling.
+2. **Untrusted Candidate Validation:**
+   Receiving bootstrap coordinates over DNS is treated as an untrusted recommendation. The engine does NOT activate the endpoint until `CandidateValidator` independently executes a live TCP/AEAD handshake with the target (`CANDIDATE_ENDPOINT_VALIDATING`).
+3. **Graceful Connection Scoping:**
+   When reaching `RECOVERY_READY`, the candidate endpoint is activated strictly for **new connections** (`ActiveEndpoint()`). Existing sessions are not forcefully severed.
+4. **Deterministic Rollback:**
+   `ResetRollback(reason)` clears all temporary failover routes and restores `PRIMARY_HEALTHY`.
+

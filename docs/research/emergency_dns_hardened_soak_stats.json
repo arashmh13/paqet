@@ -1,34 +1,313 @@
 {
-  "summary": {
-    "8.8.8.8:53": {
-      "trials": 15,
-      "success_rate": "66.7%",
-      "echo_verified_rate": "66.7%",
-      "min_ms": 99.08,
-      "median_ms": 146.77,
-      "mean_ms": 142.09,
-      "p95_ms": 157.71,
-      "max_ms": 166.73
-    },
+  "statistical_method": "NIST/Hyndman-Fan Type 7 linear interpolation (rank r = p*(n-1))",
+  "summary_by_resolver": {
     "1.1.1.1:53": {
-      "trials": 15,
-      "success_rate": "66.7%",
-      "echo_verified_rate": "66.7%",
-      "min_ms": 132.78,
-      "median_ms": 147.77,
-      "mean_ms": 154.79,
-      "p95_ms": 177.46,
-      "max_ms": 180.35
+      "total_trials": 15,
+      "success_count": 10,
+      "success_ratio": "10/15",
+      "success_rate_pct": 66.67,
+      "echo_verified_count": 10,
+      "echo_verified_ratio": "10/15",
+      "echo_verified_rate_pct": 66.67,
+      "successful_rtt": {
+        "count": 10,
+        "min_ms": 132.78,
+        "median_ms": 147.77,
+        "mean_ms": 154.79,
+        "p95_ms": 179.05,
+        "max_ms": 180.35
+      },
+      "all_attempt_elapsed": {
+        "count": 15,
+        "min_ms": 132.78,
+        "median_ms": 171.52,
+        "mean_ms": 1514.4,
+        "p95_ms": 4253.69,
+        "max_ms": 4258.15
+      }
+    },
+    "8.8.8.8:53": {
+      "total_trials": 15,
+      "success_count": 10,
+      "success_ratio": "10/15",
+      "success_rate_pct": 66.67,
+      "echo_verified_count": 10,
+      "echo_verified_ratio": "10/15",
+      "echo_verified_rate_pct": 66.67,
+      "successful_rtt": {
+        "count": 10,
+        "min_ms": 99.08,
+        "median_ms": 146.77,
+        "mean_ms": 142.09,
+        "p95_ms": 162.67,
+        "max_ms": 166.73
+      },
+      "all_attempt_elapsed": {
+        "count": 15,
+        "min_ms": 99.08,
+        "median_ms": 155.2,
+        "mean_ms": 1508.12,
+        "p95_ms": 4258.23,
+        "max_ms": 4259.71
+      }
     },
     "9.9.9.9:53": {
-      "trials": 15,
-      "success_rate": "80.0%",
-      "echo_verified_rate": "80.0%",
-      "min_ms": 126.84,
-      "median_ms": 150.82,
-      "mean_ms": 351.44,
-      "p95_ms": 196.34,
-      "max_ms": 2558.48
+      "total_trials": 15,
+      "success_count": 12,
+      "success_ratio": "12/15",
+      "success_rate_pct": 80,
+      "echo_verified_count": 12,
+      "echo_verified_ratio": "12/15",
+      "echo_verified_rate_pct": 80,
+      "successful_rtt": {
+        "count": 12,
+        "min_ms": 126.84,
+        "median_ms": 150.82,
+        "mean_ms": 351.44,
+        "p95_ms": 1259.31,
+        "max_ms": 2558.48
+      },
+      "all_attempt_elapsed": {
+        "count": 15,
+        "min_ms": 126.84,
+        "median_ms": 154.14,
+        "mean_ms": 1129.83,
+        "p95_ms": 4246.2,
+        "max_ms": 4305.65
+      }
+    }
+  },
+  "summary_by_resolver_and_size": {
+    "1.1.1.1:53": {
+      "140": {
+        "total_trials": 5,
+        "success_count": 0,
+        "success_ratio": "0/5",
+        "success_rate_pct": 0,
+        "echo_verified_count": 0,
+        "echo_verified_ratio": "0/5",
+        "echo_verified_rate_pct": 0,
+        "successful_rtt": {
+          "count": 0,
+          "min_ms": 0,
+          "median_ms": 0,
+          "mean_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 4200.38,
+          "median_ms": 4250.89,
+          "mean_ms": 4233.62,
+          "p95_ms": 4256.88,
+          "max_ms": 4258.15
+        }
+      },
+      "16": {
+        "total_trials": 5,
+        "success_count": 5,
+        "success_ratio": "5/5",
+        "success_rate_pct": 100,
+        "echo_verified_count": 5,
+        "echo_verified_ratio": "5/5",
+        "echo_verified_rate_pct": 100,
+        "successful_rtt": {
+          "count": 5,
+          "min_ms": 132.78,
+          "median_ms": 171.52,
+          "mean_ms": 161.53,
+          "p95_ms": 179.77,
+          "max_ms": 180.35
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 132.78,
+          "median_ms": 171.52,
+          "mean_ms": 161.53,
+          "p95_ms": 179.77,
+          "max_ms": 180.35
+        }
+      },
+      "64": {
+        "total_trials": 5,
+        "success_count": 5,
+        "success_ratio": "5/5",
+        "success_rate_pct": 100,
+        "echo_verified_count": 5,
+        "echo_verified_ratio": "5/5",
+        "echo_verified_rate_pct": 100,
+        "successful_rtt": {
+          "count": 5,
+          "min_ms": 138.5,
+          "median_ms": 144.75,
+          "mean_ms": 148.05,
+          "p95_ms": 164.8,
+          "max_ms": 168.49
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 138.5,
+          "median_ms": 144.75,
+          "mean_ms": 148.05,
+          "p95_ms": 164.8,
+          "max_ms": 168.49
+        }
+      }
+    },
+    "8.8.8.8:53": {
+      "140": {
+        "total_trials": 5,
+        "success_count": 0,
+        "success_ratio": "0/5",
+        "success_rate_pct": 0,
+        "echo_verified_count": 0,
+        "echo_verified_ratio": "0/5",
+        "echo_verified_rate_pct": 0,
+        "successful_rtt": {
+          "count": 0,
+          "min_ms": 0,
+          "median_ms": 0,
+          "mean_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 4213.19,
+          "median_ms": 4244.09,
+          "mean_ms": 4240.17,
+          "p95_ms": 4259.29,
+          "max_ms": 4259.71
+        }
+      },
+      "16": {
+        "total_trials": 5,
+        "success_count": 5,
+        "success_ratio": "5/5",
+        "success_rate_pct": 100,
+        "echo_verified_count": 5,
+        "echo_verified_ratio": "5/5",
+        "echo_verified_rate_pct": 100,
+        "successful_rtt": {
+          "count": 5,
+          "min_ms": 99.08,
+          "median_ms": 147.47,
+          "mean_ms": 143.41,
+          "p95_ms": 164.92,
+          "max_ms": 166.73
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 99.08,
+          "median_ms": 147.47,
+          "mean_ms": 143.41,
+          "p95_ms": 164.92,
+          "max_ms": 166.73
+        }
+      },
+      "64": {
+        "total_trials": 5,
+        "success_count": 5,
+        "success_ratio": "5/5",
+        "success_rate_pct": 100,
+        "echo_verified_count": 5,
+        "echo_verified_ratio": "5/5",
+        "echo_verified_rate_pct": 100,
+        "successful_rtt": {
+          "count": 5,
+          "min_ms": 130.28,
+          "median_ms": 133.53,
+          "mean_ms": 140.78,
+          "p95_ms": 154.52,
+          "max_ms": 155.2
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 130.28,
+          "median_ms": 133.53,
+          "mean_ms": 140.78,
+          "p95_ms": 154.52,
+          "max_ms": 155.2
+        }
+      }
+    },
+    "9.9.9.9:53": {
+      "140": {
+        "total_trials": 5,
+        "success_count": 2,
+        "success_ratio": "2/5",
+        "success_rate_pct": 40,
+        "echo_verified_count": 2,
+        "echo_verified_ratio": "2/5",
+        "echo_verified_rate_pct": 40,
+        "successful_rtt": {
+          "count": 2,
+          "min_ms": 147.7,
+          "median_ms": 1353.09,
+          "mean_ms": 1353.09,
+          "p95_ms": 2437.94,
+          "max_ms": 2558.48
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 147.7,
+          "median_ms": 4203.77,
+          "mean_ms": 3087.27,
+          "p95_ms": 4288.67,
+          "max_ms": 4305.65
+        }
+      },
+      "16": {
+        "total_trials": 5,
+        "success_count": 5,
+        "success_ratio": "5/5",
+        "success_rate_pct": 100,
+        "echo_verified_count": 5,
+        "echo_verified_ratio": "5/5",
+        "echo_verified_rate_pct": 100,
+        "successful_rtt": {
+          "count": 5,
+          "min_ms": 126.84,
+          "median_ms": 140.84,
+          "mean_ms": 141.1,
+          "p95_ms": 157.24,
+          "max_ms": 160.64
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 126.84,
+          "median_ms": 140.84,
+          "mean_ms": 141.1,
+          "p95_ms": 157.24,
+          "max_ms": 160.64
+        }
+      },
+      "64": {
+        "total_trials": 5,
+        "success_count": 5,
+        "success_ratio": "5/5",
+        "success_rate_pct": 100,
+        "echo_verified_count": 5,
+        "echo_verified_ratio": "5/5",
+        "echo_verified_rate_pct": 100,
+        "successful_rtt": {
+          "count": 5,
+          "min_ms": 140.38,
+          "median_ms": 154.14,
+          "mean_ms": 161.13,
+          "p95_ms": 189.24,
+          "max_ms": 196.34
+        },
+        "all_attempt_elapsed": {
+          "count": 5,
+          "min_ms": 140.38,
+          "median_ms": 154.14,
+          "mean_ms": 161.13,
+          "p95_ms": 189.24,
+          "max_ms": 196.34
+        }
+      }
     }
   },
   "trials": [

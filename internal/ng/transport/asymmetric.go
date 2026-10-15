@@ -335,8 +335,11 @@ func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, e
 	return frame, nil
 }
 
-// openFrame parses, verifies replay, and decrypts an incoming wire datagram.
-func (c *AsymmetricConn) openFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
+// VerifyFrame cryptographically verifies the frame's header, magic, session ID,
+// and AEAD authentication tag, and returns the decrypted plaintext WITHOUT
+// updating or checking the sliding replay window.
+// This allows authenticating retransmissions before consulting the duplicate reply cache.
+func (c *AsymmetricConn) VerifyFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
 	if len(frame) < AsymmetricHeaderLen+crypto.TagSize {
 		return 0, 0, nil, ErrAsymmetricShortFrame
 	}
@@ -354,7 +357,6 @@ func (c *AsymmetricConn) openFrame(frame []byte) (seq, ack uint32, plaintext []b
 	seq = binary.BigEndian.Uint32(frame[12:16])
 	ack = binary.BigEndian.Uint32(frame[16:20])
 
-	// Nonce construction matching peer role
 	peerRole := RoleServer
 	if c.role == RoleServer {
 		peerRole = RoleClient
@@ -375,6 +377,16 @@ func (c *AsymmetricConn) openFrame(frame []byte) (seq, ack uint32, plaintext []b
 	plaintext, err = aead.Open(nil, nonce, ciphertext, header)
 	if err != nil {
 		return 0, 0, nil, fmt.Errorf("aead open: %w", err)
+	}
+
+	return seq, ack, plaintext, nil
+}
+
+// openFrame parses, verifies replay, and decrypts an incoming wire datagram.
+func (c *AsymmetricConn) openFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
+	seq, ack, plaintext, err = c.VerifyFrame(frame)
+	if err != nil {
+		return 0, 0, nil, err
 	}
 
 	// Replay verification and recording ONLY AFTER successful authentication

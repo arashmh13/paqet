@@ -93,3 +93,34 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
 - **Payload Bound:** Strictly capped at `MaxEmergencyPayloadBytes = 512`.
 - Any message with an invalid type or oversized payload is rejected with `FORMERR (1)`.
 - No remote command execution is permitted. The control plane only exchanges typed signaling datagrams.
+
+---
+
+## 7. Reply-Cache Authentication Defect Remediation & Concurrency Safety Audit (Phase 11)
+
+### 7.1 Reply-Cache Authentication Defect Analysis & Fix
+- **Prior Defect:** In early prototypes, `EmergencyDNSServer.processQuery` inspected cleartext `sessionID` and `reqSeq` and returned cached responses from `replyCache` **before** running AEAD cryptographic authentication on the newly arrived frame.
+- **Vulnerability Impact:** An attacker knowing or observing a valid `sessionID` and sequence number could retrieve the secret cached reply by sending an arbitrary corrupt, unauthenticated packet without knowing the PSK.
+- **Remediation:**
+  1. Added `VerifyFrame(frame []byte)` to `AsymmetricConn`. This performs cryptographic validation of header magic, session ID, nonce, and the AEAD authentication tag, returning decrypted plaintext without mutating the sliding anti-replay bitmap.
+  2. Each entry in `replyCache` stores:
+     * `requestFingerprint [32]byte`: The exact SHA-256 digest of the complete original authenticated wire frame.
+     * `requestID string`
+     * `respSeq uint32`
+     * `replyFrame []byte`
+  3. When an incoming sequence number exists in `replyCache`:
+     - The server calls `entry.conn.VerifyFrame(fullFrame)`. If AEAD authentication fails, the query is rejected immediately with `REFUSED (5)`.
+     - The server compares `sha256(fullFrame)` with `cached.requestFingerprint`. If the fingerprint does not match (e.g. sequence reused with different ciphertext or payload), the query is rejected with `REFUSED (5)`.
+     - Only when both AEAD verification and fingerprint matching succeed is the cached response returned.
+  4. Tested via `TestReplyCacheFingerprintMismatchRejection` and `TestReplyCacheEvictionBoundary`.
+
+### 7.2 First-Session Establishment Concurrency Audit
+- **Prior Race Condition:** The server previously checked `s.sessions` under a read lock, released the lock during `NewServerAsymmetricSession` and `openFrame`, and then re-acquired the lock to insert the session. If two concurrent first packets arrived for an unseen `sessionID`, the second goroutine would overwrite `s.sessions[sessionID]`, destroying the first session's replay state and reply cache.
+- **Remediation:**
+  1. Ephemeral candidate session is authenticated outside the global lock.
+  2. When committing, the server locks `s.mu` and re-checks `existingEntry, alreadyCreated := s.sessions[sessionID]`.
+  3. If already created by a concurrent request, the candidate session is discarded and the request is safely processed through `existingEntry`.
+  4. Per-session state operations (`replay`, `replyCache`, `inFlight`) are serialized under a per-session `sync.Mutex` (`entry.mu`), ensuring zero data races across concurrent requests.
+  5. Implemented single-flight request coordination: `entry.inFlight[reqSeq]` blocks concurrent duplicate requests until the active handler completes, ensuring the handler is invoked strictly once.
+  6. Added `activeOps` atomic refcount: sessions actively handling in-flight requests are protected from premature eviction by `evictIdleSessionsLocked`.
+  7. Regression-tested under `go test -race` with 25 simultaneous first packets (`TestConcurrentFirstPacketsSameSession`) and delayed handler duplicates (`TestConcurrentDuplicatesWithHandlerDelay`). Zero data races detected.

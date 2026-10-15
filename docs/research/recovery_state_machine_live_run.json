@@ -1,0 +1,39 @@
+[
+  {
+    "state": "PRIMARY_HEALTHY",
+    "time": 1792096724.3872447,
+    "reason": "initialization"
+  },
+  {
+    "state": "PRIMARY_DEGRADED",
+    "time": 1792096724.6563146,
+    "reason": "port 18088 connection failed"
+  },
+  {
+    "state": "EMERGENCY_SIGNALING",
+    "time": 1792096727.7535908,
+    "reason": "degraded timeout elapsed, querying DNS bootstrap"
+  },
+  {
+    "state": "BOOTSTRAP_RECEIVED",
+    "time": 1792096728.0484047,
+    "candidate": "77.37.65.2:18089",
+    "dns_rtt_s": 0.295
+  },
+  {
+    "state": "CANDIDATE_ENDPOINT_VALIDATING",
+    "time": 1792096728.048414,
+    "reason": "initiating TCP handshake probe to candidate endpoint"
+  },
+  {
+    "state": "RECOVERY_READY",
+    "time": 1792096728.283589,
+    "active_endpoint": "77.37.65.2:18089",
+    "reason": "candidate validated, activated for new sessions"
+  },
+  {
+    "state": "PRIMARY_HEALTHY",
+    "time": 1792096730.1231651,
+    "reason": "rollback completed, primary restored"
+  }
+]

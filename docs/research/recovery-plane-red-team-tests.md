@@ -66,3 +66,36 @@ Conducted a 45-trial empirical soak test across Google (`8.8.8.8`), Cloudflare (
 
 ### 3.3 Engineering Conclusion
 Emergency control-plane messages (status reporting, endpoint bootstrap, port failover alerts) should be bounded to $\le 64\text{ bytes}$ ($\le 2$ fragments). At this size, the emergency channel delivers **100% reliability with median latency $< 152\text{ ms}$** across all major public recursive resolvers.
+
+---
+
+## 4. Phase 11 Red-Team Adversarial & Recovery Validation Suite
+
+### 4.1 Reply-Cache Security & Tamper Resistance
+- `TestReplyCacheFingerprintMismatchRejection`: Verified that an attacker sending a frame with a known session ID and sequence number but tampered ciphertext is rejected with `REFUSED (5)`. Zero cached response bytes leaked, zero handler invocations. Exact authenticated duplicates recover the cached response with zero duplicate handler invocations.
+- `TestReplyCacheEvictionBoundary`: Verified that when a sequence number is evicted from the bounded reply cache ($> 32$ entries), a retransmitted query is rejected by the anti-replay window (`replay: duplicate sequence`) rather than invoking the handler again.
+
+### 4.2 Concurrency Stress & Single-Flight Deduping
+- `TestConcurrentFirstPacketsSameSession`: Dispatched 25 concurrent goroutines sending the exact same initial frame simultaneously to an uninitialized session. Result: strictly 1 handler invocation, 25/25 successful replies returned, exactly 1 session entry tracked in server map. Zero data races.
+- `TestConcurrentDuplicatesWithHandlerDelay`: Injected a 50ms handler delay to simulate slow operations. Dispatched 5 concurrent duplicate frames. Result: single-flight lock blocked duplicate processing until the first query finished; handler executed strictly 1 time; all 5 callers received the response.
+
+### 4.3 Dual-Authoritative Cross-Server Redundancy Verification
+- `TestDualAuthoritativeServerCrossServerRetriesAndReplay`:
+  1. Sent request 1 (`seq=1`) to Server A. Dropped response.
+  2. Retransmitted request 1 (`seq=1`) to Server B. Server B authenticated and returned response. Verified cross-server retry recovery for initial datagrams!
+  3. Replayed request 1 to Server B again. Server B returned cached reply without re-invoking handler.
+  4. Multipart query split test: Part 0 sent to Server A, Part 1 sent to Server B. Result: Neither server could reassemble the frame; both returned empty intermediate TXT records. Conclusively proved: **uncoordinated dual-authoritative DNS pools strictly require single-query datagrams ($\le 35\text{ bytes}$) or shared state replication**.
+
+### 4.4 Live Recovery State Machine Validation (Cross-Border)
+Executed live across Iran VPS (`185.18.215.124`) and Germany VPS (`77.37.65.2`):
+- Spawns test primary listener on `:18088` and candidate recovery listener on `:18089`.
+- Monitored state transitions:
+  1. `PRIMARY_HEALTHY` $\longrightarrow$ Initial baseline verified reachable.
+  2. `PRIMARY_DEGRADED` $\longrightarrow$ Egress to `:18088` dropped via isolated iptables rule on Iran VPS (`TIMEOUT`).
+  3. `EMERGENCY_SIGNALING` $\longrightarrow$ Degraded hysteresis timer elapsed; emergency DNS query dispatched to Google `8.8.8.8:53`.
+  4. `BOOTSTRAP_RECEIVED` $\longrightarrow$ Received candidate endpoint `77.37.65.2:18089` in $228.7\text{ ms}$.
+  5. `CANDIDATE_ENDPOINT_VALIDATING` $\longrightarrow$ Handshake probe dispatched to `77.37.65.2:18089` (`VALIDATED`).
+  6. `RECOVERY_READY` $\longrightarrow$ Candidate endpoint activated for new connections.
+  7. `PRIMARY_HEALTHY` $\longrightarrow$ Rollback completed, test rule removed, test listeners stopped.
+  8. Production SOCKS5 proxy on `127.0.0.1:1090` remained healthy ($0.163\text{ s}$, HTTP 200).
+- Preserved audit log in `docs/research/recovery_state_machine_live_run.json`.

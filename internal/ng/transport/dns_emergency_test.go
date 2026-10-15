@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -406,5 +409,417 @@ func TestOversizedPayloadRejection(t *testing.T) {
 	_, _, err = client.Exchange(context.Background(), msg)
 	if err == nil {
 		t.Fatalf("Expected payload > 512 bytes to be rejected, but succeeded")
+	}
+}
+
+func TestReplyCacheFingerprintMismatchRejection(t *testing.T) {
+	domainSuffix := "tunnel.emergency.local"
+	psk := []byte("emergency-psk-32-bytes-super-key")
+
+	var handlerInvocations int32
+	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          psk,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			atomic.AddInt32(&handlerInvocations, 1)
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				Reply:     append([]byte("REPLY_FOR:"), msg.Payload...),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
+	}
+	defer server.Stop()
+
+	sessionID := uint64(0x9876543210ABCDEF)
+	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", server.Addr().String())
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Send legitimate initial request (seq=1)
+	msg1 := &EmergencyMessage{
+		ID:        "msg-001",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("Original Secret Request"),
+		Timestamp: time.Now().Unix(),
+	}
+	rawMsg1, _ := json.Marshal(msg1)
+	frame1, err := clientConn.sealFrame(1, 0, rawMsg1)
+	if err != nil {
+		t.Fatalf("sealFrame failed: %v", err)
+	}
+
+	qname1 := EncodeDNSQName(domainSuffix, "c01", 1001, 0, 1, frame1)
+	pkt1 := BuildDNSQuery(qname1, 0x0010 /* TXT */, 0x1111)
+	_, _ = conn.WriteToUDP(pkt1, udpAddr)
+
+	buf := make([]byte, 2048)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("Read reply 1 failed: %v", err)
+	}
+	ans1, err := ParseDNSTXTResponse(buf[:n])
+	if err != nil {
+		t.Fatalf("ParseDNSTXTResponse 1 failed: %v", err)
+	}
+	_, _, pt1, err := clientConn.openFrame(ans1)
+	if err != nil {
+		t.Fatalf("Decrypt reply 1 failed: %v", err)
+	}
+	var resp1 EmergencyResponse
+	_ = json.Unmarshal(pt1, &resp1)
+	if string(resp1.Reply) != "REPLY_FOR:Original Secret Request" {
+		t.Fatalf("Unexpected response: %s", string(resp1.Reply))
+	}
+	if atomic.LoadInt32(&handlerInvocations) != 1 {
+		t.Fatalf("Expected 1 handler invocation, got %d", atomic.LoadInt32(&handlerInvocations))
+	}
+
+	// 2. Attack attempt: send a frame with the same visible sessionID and same seq=1,
+	// but with corrupted/modified ciphertext.
+	tamperedFrame := append([]byte(nil), frame1...)
+	tamperedFrame[len(tamperedFrame)-5] ^= 0xFF // Corrupt ciphertext / AEAD tag
+
+	qnameTampered := EncodeDNSQName(domainSuffix, "c01", 1002, 0, 1, tamperedFrame)
+	pktTampered := BuildDNSQuery(qnameTampered, 0x0010 /* TXT */, 0x2222)
+	_, _ = conn.WriteToUDP(pktTampered, udpAddr)
+
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	n, _, err = conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("Expected response packet for tampered frame, got error: %v", err)
+	}
+	// Server must return REFUSED (RCODE 5)
+	rcode := buf[3] & 0x0F
+	if rcode != 5 {
+		t.Fatalf("Security failure: expected REFUSED (5) for tampered frame, got RCODE %d", rcode)
+	}
+	// Verify cached reply was NOT leaked
+	if bytes.Contains(buf[:n], []byte("Original Secret Request")) {
+		t.Fatalf("Critical security leak: tampered frame retrieved cached reply!")
+	}
+	// Handler was NOT invoked
+	if atomic.LoadInt32(&handlerInvocations) != 1 {
+		t.Fatalf("Handler was invoked for tampered frame! Got %d invocations", atomic.LoadInt32(&handlerInvocations))
+	}
+
+	// 3. Send legitimate exact duplicate of request 1.
+	pktDup := BuildDNSQuery(qname1, 0x0010 /* TXT */, 0x3333)
+	_, _ = conn.WriteToUDP(pktDup, udpAddr)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err = conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("Read duplicate reply failed: %v", err)
+	}
+	ansDup, err := ParseDNSTXTResponse(buf[:n])
+	if err != nil {
+		t.Fatalf("Parse duplicate answer failed: %v", err)
+	}
+	// VerifyFrame on duplicate should succeed
+	_, _, ptDup, err := clientConn.VerifyFrame(ansDup)
+	if err != nil {
+		t.Fatalf("Verify duplicate reply failed: %v", err)
+	}
+	var respDup EmergencyResponse
+	_ = json.Unmarshal(ptDup, &respDup)
+	if string(respDup.Reply) != "REPLY_FOR:Original Secret Request" {
+		t.Fatalf("Duplicate response mismatch: %s", string(respDup.Reply))
+	}
+	// Handler STILL executed only once!
+	if atomic.LoadInt32(&handlerInvocations) != 1 {
+		t.Fatalf("Duplicate frame triggered second handler invocation! Got %d", atomic.LoadInt32(&handlerInvocations))
+	}
+}
+
+func TestReplyCacheEvictionBoundary(t *testing.T) {
+	domainSuffix := "tunnel.emergency.local"
+	psk := []byte("emergency-psk-32-bytes-super-key")
+
+	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          psk,
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
+	}
+	defer server.Stop()
+
+	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
+		ResolverAddr: server.Addr().String(),
+		DomainSuffix: domainSuffix,
+		PSK:          psk,
+		SessionID:    0x1122334455667788,
+		Timeout:      2 * time.Second,
+		MaxRetries:   0,
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
+	}
+
+	// 1. Send first request (seq=1) and save its frame
+	msg1 := &EmergencyMessage{
+		ID:        "msg-seq-1",
+		Type:      MsgTypePing,
+		Payload:   []byte("First Message"),
+		Timestamp: time.Now().Unix(),
+	}
+	rawMsg1, _ := json.Marshal(msg1)
+	frame1, err := client.session.sealFrame(1, 0, rawMsg1)
+	if err != nil {
+		t.Fatalf("sealFrame failed: %v", err)
+	}
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", server.Addr().String())
+	conn, _ := net.ListenUDP("udp", nil)
+	defer conn.Close()
+
+	qname1 := EncodeDNSQName(domainSuffix, "c01", 100, 0, 1, frame1)
+	pkt1 := BuildDNSQuery(qname1, 0x0010, 0x0101)
+	_, _ = conn.WriteToUDP(pkt1, udpAddr)
+
+	buf := make([]byte, 2048)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("Read reply 1 failed: %v", err)
+	}
+	if buf[3]&0x0F != 0 {
+		t.Fatalf("First query failed with RCODE %d", buf[3]&0x0F)
+	}
+
+	// 2. Send 35 distinct requests (seq 2 to 36) to overflow MaxCachedRepliesPerSession (32)
+	for s := uint32(2); s <= 36; s++ {
+		msg := &EmergencyMessage{
+			ID:        fmt.Sprintf("msg-seq-%d", s),
+			Type:      MsgTypePing,
+			Payload:   []byte(fmt.Sprintf("Msg %d", s)),
+			Timestamp: time.Now().Unix(),
+		}
+		raw, _ := json.Marshal(msg)
+		frame, _ := client.session.sealFrame(s, 0, raw)
+		qname := EncodeDNSQName(domainSuffix, "c01", uint64(100+s), 0, 1, frame)
+		pkt := BuildDNSQuery(qname, 0x0010, uint16(0x0100+s))
+		_, _ = conn.WriteToUDP(pkt, udpAddr)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _, _ = conn.ReadFrom(buf)
+	}
+
+	// 3. Now re-send request with seq=1 (which was evicted from replyCache)
+	// Because it was evicted, it must not be served from cache.
+	// And because seq=1 was already recorded in anti-replay window, openFrame will reject it as duplicate!
+	pktEvicted := BuildDNSQuery(qname1, 0x0010, 0x9999)
+	_, _ = conn.WriteToUDP(pktEvicted, udpAddr)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err = conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("Read evicted reply failed: %v", err)
+	}
+	rcode := buf[3] & 0x0F
+	if rcode != 5 {
+		t.Fatalf("Expected REFUSED (5) for replay of evicted sequence, got RCODE %d", rcode)
+	}
+	_ = n
+}
+
+func TestConcurrentFirstPacketsSameSession(t *testing.T) {
+	domainSuffix := "tunnel.emergency.local"
+	psk := []byte("emergency-psk-32-bytes-super-key")
+
+	var handlerInvocations int32
+	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          psk,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			atomic.AddInt32(&handlerInvocations, 1)
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				Reply:     append([]byte("CONCURRENCY_OK:"), msg.Payload...),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
+	}
+	defer server.Stop()
+
+	sessionID := uint64(0xFEDCBA9876543210)
+	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
+	}
+
+	// Prepare one authenticated first packet
+	msg := &EmergencyMessage{
+		ID:        "msg-concurrent-001",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("First Packet Race"),
+		Timestamp: time.Now().Unix(),
+	}
+	rawMsg, _ := json.Marshal(msg)
+	frame, err := clientConn.sealFrame(1, 0, rawMsg)
+	if err != nil {
+		t.Fatalf("sealFrame failed: %v", err)
+	}
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", server.Addr().String())
+
+	// Launch 25 concurrent goroutines sending the exact same first frame simultaneously
+	concurrency := 25
+	var wg sync.WaitGroup
+	var successCount int32
+
+	startBarrier := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(txID int) {
+			defer wg.Done()
+
+			c, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+
+			qname := EncodeDNSQName(domainSuffix, "c01", uint64(2000+txID), 0, 1, frame)
+			pkt := BuildDNSQuery(qname, 0x0010, uint16(txID))
+
+			<-startBarrier // Synchronize launch
+
+			_, _ = c.WriteToUDP(pkt, udpAddr)
+			buf := make([]byte, 2048)
+			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, _, err := c.ReadFrom(buf)
+			if err == nil && n >= 12 && (buf[3]&0x0F) == 0 {
+				ans, err := ParseDNSTXTResponse(buf[:n])
+				if err == nil && len(ans) > 0 {
+					atomic.AddInt32(&successCount, 1)
+				}
+			}
+		}(i + 1)
+	}
+
+	close(startBarrier)
+	wg.Wait()
+
+	// Verify that exactly 1 handler invocation occurred!
+	invocations := atomic.LoadInt32(&handlerInvocations)
+	if invocations != 1 {
+		t.Fatalf("Race condition detected! Expected strictly 1 handler invocation, got %d", invocations)
+	}
+
+	// Verify that all 25 concurrent callers received the response
+	successes := atomic.LoadInt32(&successCount)
+	if successes != int32(concurrency) {
+		t.Fatalf("Expected all %d concurrent requests to succeed, got %d", concurrency, successes)
+	}
+
+	// Verify that exactly 1 session is tracked in the server map
+	if server.ActiveSessionsCount() != 1 {
+		t.Fatalf("Expected 1 active session, got %d", server.ActiveSessionsCount())
+	}
+}
+
+func TestConcurrentDuplicatesWithHandlerDelay(t *testing.T) {
+	domainSuffix := "tunnel.emergency.local"
+	psk := []byte("emergency-psk-32-bytes-super-key")
+
+	var handlerInvocations int32
+	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          psk,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			atomic.AddInt32(&handlerInvocations, 1)
+			// Simulate slow handler (50ms) to ensure concurrent duplicates arrive mid-processing
+			time.Sleep(50 * time.Millisecond)
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				Reply:     append([]byte("SLOW_HANDLER_REPLY:"), msg.Payload...),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
+	}
+	defer server.Stop()
+
+	sessionID := uint64(0x3344556677889900)
+	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
+	}
+
+	msg := &EmergencyMessage{
+		ID:        "msg-slow-001",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("Slow In Flight"),
+		Timestamp: time.Now().Unix(),
+	}
+	rawMsg, _ := json.Marshal(msg)
+	frame, _ := clientConn.sealFrame(1, 0, rawMsg)
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", server.Addr().String())
+
+	// Send 5 concurrent duplicates
+	concurrency := 5
+	var wg sync.WaitGroup
+	var successCount int32
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(txID int) {
+			defer wg.Done()
+			c, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+
+			qname := EncodeDNSQName(domainSuffix, "c01", uint64(3000+txID), 0, 1, frame)
+			pkt := BuildDNSQuery(qname, 0x0010, uint16(txID))
+
+			_, _ = c.WriteToUDP(pkt, udpAddr)
+			buf := make([]byte, 2048)
+			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, _, err := c.ReadFrom(buf)
+			if err == nil && n >= 12 && (buf[3]&0x0F) == 0 {
+				atomic.AddInt32(&successCount, 1)
+			}
+		}(i + 1)
+	}
+
+	wg.Wait()
+
+	if atomic.LoadInt32(&handlerInvocations) != 1 {
+		t.Fatalf("Single-flight failed! Expected 1 handler invocation, got %d", atomic.LoadInt32(&handlerInvocations))
+	}
+	if atomic.LoadInt32(&successCount) != int32(concurrency) {
+		t.Fatalf("Expected %d successful responses, got %d", concurrency, atomic.LoadInt32(&successCount))
 	}
 }

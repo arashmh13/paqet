@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +27,9 @@ const (
 
 	// MaxCachedRepliesPerSession bounds memory for idempotent reply recovery.
 	MaxCachedRepliesPerSession = 32
+
+	// MaxReplyCacheBytesPerSession bounds total bytes stored in replyCache per session (32 KB).
+	MaxReplyCacheBytesPerSession = 32 * 1024
 
 	// MaxEmergencyPayloadBytes limits application payload to prevent amplification and abuse.
 	MaxEmergencyPayloadBytes = 512
@@ -93,11 +98,46 @@ type EmergencyDNSServerConfig struct {
 	Handler      func(msg *EmergencyMessage) (*EmergencyResponse, error)
 }
 
+type cachedReplyEntry struct {
+	reqSeq             uint32
+	requestFingerprint [32]byte // SHA-256 digest of complete authenticated request frame
+	requestID          string
+	respSeq            uint32
+	replyFrame         []byte
+	createdAt          time.Time
+}
+
 type serverSessionEntry struct {
+	mu         sync.Mutex // Serializes session replay state and reply cache
 	conn       *AsymmetricConn
 	lastActive time.Time
-	replyCache map[uint32][]byte // seq -> sealed response frame
-	seqs       []uint32          // FIFO order for eviction
+	activeOps  int32                    // Ref count of active goroutines; prevents idle eviction during in-flight processing
+	inFlight   map[uint32]chan struct{} // Sequence -> channel for in-flight request single-flighting
+	replyCache map[uint32]*cachedReplyEntry
+	seqOrder   []uint32 // FIFO order for eviction
+	cacheBytes int      // Current total bytes in replyCache
+}
+
+func (e *serverSessionEntry) addReplyCacheLocked(seq uint32, digest [32]byte, reqID string, respSeq uint32, replyFrame []byte) {
+	entryLen := len(replyFrame)
+	for len(e.replyCache) >= MaxCachedRepliesPerSession || (e.cacheBytes+entryLen > MaxReplyCacheBytesPerSession && len(e.seqOrder) > 0) {
+		oldestSeq := e.seqOrder[0]
+		e.seqOrder = e.seqOrder[1:]
+		if old, ok := e.replyCache[oldestSeq]; ok {
+			e.cacheBytes -= len(old.replyFrame)
+			delete(e.replyCache, oldestSeq)
+		}
+	}
+	e.replyCache[seq] = &cachedReplyEntry{
+		reqSeq:             seq,
+		requestFingerprint: digest,
+		requestID:          reqID,
+		respSeq:            respSeq,
+		replyFrame:         append([]byte(nil), replyFrame...),
+		createdAt:          time.Now(),
+	}
+	e.seqOrder = append(e.seqOrder, seq)
+	e.cacheBytes += entryLen
 }
 
 // EmergencyDNSServer hosts the authoritative DNS endpoint, receiving recursive DNS queries,
@@ -206,7 +246,7 @@ func (s *EmergencyDNSServer) cleanerLoop() {
 
 func (s *EmergencyDNSServer) evictIdleSessionsLocked(now time.Time) {
 	for id, entry := range s.sessions {
-		if now.Sub(entry.lastActive) > ServerSessionIdleTimeout {
+		if atomic.LoadInt32(&entry.activeOps) == 0 && now.Sub(entry.lastActive) > ServerSessionIdleTimeout {
 			delete(s.sessions, id)
 		}
 	}
@@ -334,85 +374,112 @@ func (s *EmergencyDNSServer) processQuery(reqPacket []byte, normalizedSuffix str
 
 	sessionID := binary.BigEndian.Uint64(fullFrame[4:12])
 	reqSeq := binary.BigEndian.Uint32(fullFrame[12:16])
+	reqDigest := sha256.Sum256(fullFrame)
 
-	// 1. Check if session already exists
+	// Step 1: Check if session already exists
 	s.mu.Lock()
 	entry, exists := s.sessions[sessionID]
-	var sess *AsymmetricConn
 	if exists {
-		sess = entry.conn
-		// Check idempotent reply cache: if this exact sequence was already processed, return cached response
-		if cachedReply, ok := entry.replyCache[reqSeq]; ok {
-			s.mu.Unlock()
-			resp, err := BuildDNSTXTResponse(reqPacket, cachedReply)
-			if err == nil {
-				return resp
-			}
-			return nil
-		}
+		atomic.AddInt32(&entry.activeOps, 1)
 	}
 	s.mu.Unlock()
 
-	var isNewSession bool
-	if sess == nil {
-		// Ephemeral unpersisted session for candidate validation
-		var err error
-		sess, err = NewServerAsymmetricSession(sessionID, s.cfg.PSK)
-		if err != nil {
-			return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
-		}
-		isNewSession = true
+	if exists {
+		defer atomic.AddInt32(&entry.activeOps, -1)
+		return s.processExistingSessionQuery(reqPacket, entry, fullFrame, reqSeq, reqDigest)
 	}
 
-	// 2. Cryptographic authentication: openFrame validates AEAD tag, AAD headers, and anti-replay!
-	seq, _, plaintext, err := sess.openFrame(fullFrame)
+	return s.processNewSessionQuery(reqPacket, sessionID, fullFrame, reqSeq, reqDigest)
+}
+
+func (s *EmergencyDNSServer) processExistingSessionQuery(
+	reqPacket []byte,
+	entry *serverSessionEntry,
+	fullFrame []byte,
+	reqSeq uint32,
+	reqDigest [32]byte,
+) []byte {
+	entry.mu.Lock()
+
+	// Wait if another goroutine is currently processing this exact sequence (single-flight)
+	for {
+		waitCh, inFlight := entry.inFlight[reqSeq]
+		if !inFlight {
+			break
+		}
+		entry.mu.Unlock()
+		select {
+		case <-waitCh:
+		case <-time.After(3 * time.Second):
+			return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+		}
+		entry.mu.Lock()
+	}
+
+	// 1. Check replyCache
+	if cached, ok := entry.replyCache[reqSeq]; ok {
+		// A sequence was found in replyCache.
+		// REQUIREMENT: Must cryptographically verify AEAD authentication and compare fingerprint!
+		_, _, _, err := entry.conn.VerifyFrame(fullFrame)
+		if err != nil {
+			// Unauthenticated attacker or corrupt frame!
+			entry.mu.Unlock()
+			return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
+		}
+
+		if reqDigest != cached.requestFingerprint {
+			// Attacker or client reused seq with different ciphertext/content!
+			// REJECT without invoking handler or leaking cached reply!
+			entry.mu.Unlock()
+			return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
+		}
+
+		// Exact authenticated duplicate! Return cached reply
+		cachedReply := append([]byte(nil), cached.replyFrame...)
+		entry.lastActive = time.Now()
+		entry.mu.Unlock()
+
+		resp, err := BuildDNSTXTResponse(reqPacket, cachedReply)
+		if err == nil {
+			return resp
+		}
+		return nil
+	}
+
+	// 2. New sequence for existing session: verify AEAD and update replay window
+	seq, _, plaintext, err := entry.conn.openFrame(fullFrame)
 	if err != nil {
-		// Cryptographic authentication failed, sequence replayed, or bad magic!
-		// DO NOT persist sess in s.sessions! Attacker gets dropped, consuming zero persistent memory.
+		// Replay violation (e.g. sequence already seen and evicted from cache) or AEAD failure
+		entry.mu.Unlock()
 		return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
 	}
 
-	// 3. Persist session ONLY AFTER successful cryptographic authentication!
-	s.mu.Lock()
-	now := time.Now()
-	if isNewSession {
-		if len(s.sessions) >= MaxActiveServerSessions {
-			s.evictIdleSessionsLocked(now)
-		}
-		if len(s.sessions) >= MaxActiveServerSessions {
-			// Evict oldest session
-			var oldestID uint64
-			var oldestTime time.Time
-			for id, e := range s.sessions {
-				if oldestTime.IsZero() || e.lastActive.Before(oldestTime) {
-					oldestID = id
-					oldestTime = e.lastActive
-				}
-			}
-			delete(s.sessions, oldestID)
-		}
-		entry = &serverSessionEntry{
-			conn:       sess,
-			lastActive: now,
-			replyCache: make(map[uint32][]byte),
-		}
-		s.sessions[sessionID] = entry
-	} else {
-		entry.lastActive = now
+	// Register in-flight operation
+	doneCh := make(chan struct{})
+	if entry.inFlight == nil {
+		entry.inFlight = make(map[uint32]chan struct{})
 	}
-	s.mu.Unlock()
+	entry.inFlight[reqSeq] = doneCh
+	entry.lastActive = time.Now()
+	entry.mu.Unlock()
 
+	defer func() {
+		entry.mu.Lock()
+		delete(entry.inFlight, reqSeq)
+		close(doneCh)
+		entry.mu.Unlock()
+	}()
+
+	// 3. Schema validation outside lock
 	var reqMsg EmergencyMessage
 	if err := json.Unmarshal(plaintext, &reqMsg); err != nil {
 		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
 	}
-
-	// Strict schema validation (type, size, ID)
 	if err := reqMsg.Validate(); err != nil {
 		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
 	}
 
-	// Dynamic handler invocation
+	// 4. Invoke handler outside lock
 	var respMsg *EmergencyResponse
 	if s.cfg.Handler != nil {
 		respMsg, err = s.cfg.Handler(&reqMsg)
@@ -434,26 +501,154 @@ func (s *EmergencyDNSServer) processQuery(reqPacket []byte, normalizedSuffix str
 	}
 
 	respPlaintext, _ := json.Marshal(respMsg)
-	respSeq := sess.NextSendSeq()
 
-	respFrame, err := sess.sealFrame(respSeq, seq, respPlaintext)
+	// 5. Seal response and cache it under session lock
+	entry.mu.Lock()
+	respSeq := entry.conn.NextSendSeq()
+	respFrame, err := entry.conn.sealFrame(respSeq, seq, respPlaintext)
+	if err != nil {
+		entry.mu.Unlock()
+		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+	}
+
+	entry.addReplyCacheLocked(reqSeq, reqDigest, reqMsg.ID, respSeq, respFrame)
+	entry.lastActive = time.Now()
+	entry.mu.Unlock()
+
+	dnsRespPacket, err := BuildDNSTXTResponse(reqPacket, respFrame)
+	if err != nil {
+		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+	}
+	return dnsRespPacket
+}
+
+func (s *EmergencyDNSServer) processNewSessionQuery(
+	reqPacket []byte,
+	sessionID uint64,
+	fullFrame []byte,
+	reqSeq uint32,
+	reqDigest [32]byte,
+) []byte {
+	// 1. Ephemeral unpersisted session for candidate validation
+	candidateConn, err := NewServerAsymmetricSession(sessionID, s.cfg.PSK)
 	if err != nil {
 		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
 	}
 
-	// Cache response frame for idempotent duplicate retransmission recovery
-	s.mu.Lock()
-	if entry != nil {
-		if len(entry.replyCache) >= MaxCachedRepliesPerSession {
-			oldestSeq := entry.seqs[0]
-			entry.seqs = entry.seqs[1:]
-			delete(entry.replyCache, oldestSeq)
-		}
-		entry.replyCache[seq] = respFrame
-		entry.seqs = append(entry.seqs, seq)
-		entry.lastActive = time.Now()
+	// 2. Cryptographic authentication: openFrame validates AEAD tag, AAD headers, and anti-replay
+	seq, _, plaintext, err := candidateConn.openFrame(fullFrame)
+	if err != nil {
+		// Authentication failed or bad magic. Drop immediately with REFUSED. Zero state persisted!
+		return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
 	}
+
+	// 3. Validate JSON schema before committing to persistent session state
+	var reqMsg EmergencyMessage
+	if err := json.Unmarshal(plaintext, &reqMsg); err != nil {
+		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
+	}
+	if err := reqMsg.Validate(); err != nil {
+		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
+	}
+
+	// 4. Atomically commit or detect existing session
+	doneCh := make(chan struct{})
+	var entry *serverSessionEntry
+
+	s.mu.Lock()
+	existingEntry, alreadyCreated := s.sessions[sessionID]
+	if alreadyCreated {
+		// Another concurrent goroutine already committed this session while we were authenticating!
+		entry = existingEntry
+		atomic.AddInt32(&entry.activeOps, 1)
+		s.mu.Unlock()
+
+		// Discard candidateConn and route request through existing established session!
+		defer atomic.AddInt32(&entry.activeOps, -1)
+		return s.processExistingSessionQuery(reqPacket, entry, fullFrame, reqSeq, reqDigest)
+	}
+
+	// Session is genuinely new. Enforce session table bounds.
+	now := time.Now()
+	if len(s.sessions) >= MaxActiveServerSessions {
+		s.evictIdleSessionsLocked(now)
+	}
+	if len(s.sessions) >= MaxActiveServerSessions {
+		// Evict oldest session that has activeOps == 0
+		var oldestID uint64
+		var oldestTime time.Time
+		found := false
+		for id, e := range s.sessions {
+			if atomic.LoadInt32(&e.activeOps) == 0 {
+				if oldestTime.IsZero() || e.lastActive.Before(oldestTime) {
+					oldestID = id
+					oldestTime = e.lastActive
+					found = true
+				}
+			}
+		}
+		if found {
+			delete(s.sessions, oldestID)
+		} else {
+			// All 1024 sessions have active operations! Reject to prevent OOM
+			s.mu.Unlock()
+			return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+		}
+	}
+
+	entry = &serverSessionEntry{
+		conn:       candidateConn,
+		lastActive: now,
+		activeOps:  1,
+		inFlight:   map[uint32]chan struct{}{reqSeq: doneCh},
+		replyCache: make(map[uint32]*cachedReplyEntry),
+	}
+	s.sessions[sessionID] = entry
 	s.mu.Unlock()
+
+	defer func() {
+		entry.mu.Lock()
+		delete(entry.inFlight, reqSeq)
+		close(doneCh)
+		entry.mu.Unlock()
+		atomic.AddInt32(&entry.activeOps, -1)
+	}()
+
+	// 5. Invoke handler outside lock
+	var respMsg *EmergencyResponse
+	if s.cfg.Handler != nil {
+		respMsg, err = s.cfg.Handler(&reqMsg)
+		if err != nil {
+			respMsg = &EmergencyResponse{
+				ID:        reqMsg.ID,
+				Status:    "ERROR",
+				Reply:     []byte(err.Error()),
+				Timestamp: time.Now().Unix(),
+			}
+		}
+	} else {
+		respMsg = &EmergencyResponse{
+			ID:        reqMsg.ID,
+			Status:    "OK",
+			Reply:     append([]byte("ACK_ECHO:"), reqMsg.Payload...),
+			Timestamp: time.Now().Unix(),
+		}
+	}
+
+	respPlaintext, _ := json.Marshal(respMsg)
+
+	// 6. Seal response and cache it
+	entry.mu.Lock()
+	respSeq := entry.conn.NextSendSeq()
+	respFrame, err := entry.conn.sealFrame(respSeq, seq, respPlaintext)
+	if err != nil {
+		entry.mu.Unlock()
+		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+	}
+
+	entry.addReplyCacheLocked(reqSeq, reqDigest, reqMsg.ID, respSeq, respFrame)
+	entry.lastActive = time.Now()
+	entry.mu.Unlock()
 
 	dnsRespPacket, err := BuildDNSTXTResponse(reqPacket, respFrame)
 	if err != nil {

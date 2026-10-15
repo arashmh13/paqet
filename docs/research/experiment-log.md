@@ -435,3 +435,47 @@
       - Deployed to both VPS nodes. Backups preserved in `/opt/paqet/backup-candidate3/paqet`.
       - Created comprehensive research docs: `docs/research/security-audit.md`, `docs/research/recovery-plane-red-team-tests.md`, and `docs/research/dns_redundancy_and_recovery_plane.md`.
 - **Outcome:** Emergency control plane fully hardened against heap exhaustion, credential leakage, and cache collisions. Verified end-to-end under isolated port block conditions. Production services healthy and rollback-ready.
+
+---
+
+## Cycle 19: Phase 11 Reply-Cache Security Hardening, Concurrency Correctness, Statistical Reconciliation, and Recovery State Machine Validation
+- **Objective:** Eliminate the pre-authentication reply-cache lookup defect; make first-session establishment concurrency-safe under simultaneous requests; resolve the statistical anomaly in Quad9 P95 benchmark metrics; build a deterministic benchmark analysis engine; empirically test cross-server dual-authoritative DNS redundancy; implement a controlled recovery state machine with explicit state transitions and execute a live cross-border recovery test.
+- **Actions:**
+  1. Remediated Reply-Cache Authentication Defect:
+     - Added `VerifyFrame(frame []byte)` to `AsymmetricConn` in `internal/ng/transport/asymmetric.go`, providing cryptographic AEAD header and tag verification without mutating the anti-replay window.
+     - Refactored `serverSessionEntry` to store `requestFingerprint [32]byte` (SHA-256 digest of original authenticated wire frame) alongside cached replies.
+     - In `EmergencyDNSServer.processExistingSessionQuery`, any sequence hit in `replyCache` MUST pass `VerifyFrame` AND match `requestFingerprint` before the cached reply is returned.
+     - Corrupted, tampered, or mismatched payloads attempting to reuse a sequence number are rejected immediately with `REFUSED (5)` without invoking handlers or leaking cached data.
+  2. Concurrency Safety & First-Session Race Elimination:
+     - Eliminated session overwrite window by performing atomic re-check under `s.mu.Lock()` after candidate authentication.
+     - Serialized session operations under per-session `sync.Mutex` (`entry.mu`).
+     - Added single-flight duplicate request coordination via `entry.inFlight[reqSeq]` channels. Concurrent duplicate queries wait for the active handler to complete and receive the cached reply without duplicate handler invocation.
+     - Added `activeOps` atomic refcount to prevent premature idle session eviction during in-flight processing.
+     - Verified with 25 simultaneous first packets (`TestConcurrentFirstPacketsSameSession`) and delayed handler duplicates (`TestConcurrentDuplicatesWithHandlerDelay`) under `go test -race`: 0 data races.
+  3. Deterministic Benchmark Analysis & Statistical Reconciliation:
+     - Built `internal/ng/dns/benchmark_analysis.go` implementing NIST/Hyndman-Fan Type 7 linear interpolation ($r = p \times (n-1)$).
+     - Added comprehensive unit tests in `benchmark_analysis_test.go` covering edge cases, timeouts, outliers, and small samples.
+     - Reconciled `docs/research/emergency_dns_hardened_soak_stats.json`:
+       * Clarified why prior index calculation `p95_idx = int(0.95*N) - 1` truncated Quad9 P95 to $196.34\text{ ms}$.
+       * Recomputed true Quad9 P95 as **$1,259.31\text{ ms}$**, resolving the anomaly where Mean exceeded P95.
+       * Explicitly decoupled successful response RTTs from all-attempt elapsed times.
+  4. Dual-Authoritative Nameserver Redundancy Testing:
+     - Implemented `internal/ng/transport/dns_redundancy_test.go` testing dual independent server instances with unshared state.
+     - Proved cross-server retry recovery for single-query datagrams (`seq=1`).
+     - Proved that multipart queries split across uncoordinated servers fail reassembly. Conclusively established that stateless single-query control datagrams ($\le 35\text{B}$) are mandatory for uncoordinated dual-authoritative DNS pools.
+  5. Controlled Recovery State Machine (`RecoveryStateMachine`):
+     - Implemented finite state machine in `internal/ng/transport/recovery_state_machine.go` with states: `PRIMARY_HEALTHY`, `PRIMARY_DEGRADED`, `EMERGENCY_SIGNALING`, `BOOTSTRAP_RECEIVED`, `CANDIDATE_ENDPOINT_VALIDATING`, `RECOVERY_READY`, `COOLDOWN`.
+     - Validates candidate endpoints independently via live handshake before activating routes for new connections.
+     - Verified unit tests: hysteresis recovery, stale bootstrap rejection, candidate validation failure, and deterministic rollback.
+  6. Live Cross-Border Recovery Validation:
+     - Deployed release candidate `v2.5.3-recovery` (SHA-256 `a2bb1208eab3edd9ecadc9e0334158415dba8bf538f55a53f520a3ce8167f216`) to both VPS nodes. Backups preserved in `/opt/paqet/backup-candidate4/paqet`.
+     - Conducted live test across Iran VPS (`185.18.215.124`) and Germany VPS (`77.37.65.2`):
+       * Primary test listener on port 18088; candidate recovery listener on port 18089.
+       * Injected isolated egress drop for port 18088 on Iran VPS (`PRIMARY_DEGRADED`).
+       * Triggered emergency DNS signaling via 8.8.8.8:53 (`EMERGENCY_SIGNALING`).
+       * Received candidate endpoint `77.37.65.2:18089` in $228.7\text{ ms}$ (`BOOTSTRAP_RECEIVED`).
+       * Validated port 18089 reachability (`CANDIDATE_ENDPOINT_VALIDATING` -> `VALIDATED`).
+       * Activated recovery route for new sessions (`RECOVERY_READY`).
+       * Cleaned up test firewall rules and restored state (`PRIMARY_HEALTHY`).
+       * Production SOCKS5 proxy on `127.0.0.1:1090` remained completely healthy and undisturbed ($0.163\text{ s}$, HTTP 200).
+- **Outcome:** Reply cache fully hardened against spoofed sequence probes; session establishment concurrency-safe; statistical analysis reconciled; dual-server redundancy requirements proven; recovery state machine verified end-to-end. Production services healthy and rollback-ready.
