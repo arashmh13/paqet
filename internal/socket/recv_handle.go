@@ -79,6 +79,10 @@ func (h *RecvHandle) Read(data []byte) (int, net.Addr, error) {
 		return 0, nil, err
 	}
 
+	return h.decode(zdata, data)
+}
+
+func (h *RecvHandle) decode(zdata, data []byte) (int, *net.UDPAddr, error) {
 	d := h.dPool.Get().(*decoder)
 	defer h.dPool.Put(d)
 
@@ -128,6 +132,12 @@ func (h *RecvHandle) Read(data []byte) (int, net.Addr, error) {
 	}
 
 	if addr.IP == nil || len(payload) == 0 {
+		return 0, nil, errNoPayload
+	}
+
+	// Filter out decoy TLS ClientHello packets (starting with Handshake record 0x16 0x03)
+	// so raw packet decoders don't treat synthetic DPI bypass frames as data.
+	if len(payload) >= 5 && payload[0] == 0x16 && payload[1] == 0x03 {
 		return 0, nil, errNoPayload
 	}
 

@@ -12,6 +12,7 @@ import (
 	"github.com/gopacket/gopacket/pcap"
 
 	"paqet/internal/conf"
+	"paqet/internal/ng/transport"
 )
 
 type PacketConn struct {
@@ -97,6 +98,16 @@ func (c *PacketConn) Handshake(dst *net.UDPAddr) error {
 				_ = c.sendHandle.WriteControl(dst, conf.TCPF{ACK: true}, hs.Ack, hs.Seq+1, false)
 				c.sendHandle.curSeq.Store(hs.Ack)
 				c.sendHandle.peerAck.Store(hs.Seq + 1)
+
+				// If SNI decoy injection is enabled, emit out-of-window raw TCP packet (wrong_seq)
+				// As established in reference projects (patterniha/SNI-Spoofing, aleskxyz),
+				// out-of-window sequence number (seq = hs.Ack - len(payload)) tricks DPI into
+				// whitelisting the flow while destination OS kernel silently discards the segment.
+				if c.cfg.SNI != nil && c.cfg.SNI.Decoy != "" {
+					decoy := transport.BuildDecoyClientHello(c.cfg.SNI.Decoy, c.cfg.SNI.Preset)
+					outOfWindowSeq := hs.Ack - uint32(len(decoy))
+					_ = c.sendHandle.WriteRawDecoy(dst, decoy, outOfWindowSeq, hs.Seq+1)
+				}
 				return nil
 			}
 		case <-time.After(500 * time.Millisecond):

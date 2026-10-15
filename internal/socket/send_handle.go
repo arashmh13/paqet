@@ -328,6 +328,69 @@ func (h *SendHandle) WriteControl(addr *net.UDPAddr, f conf.TCPF, seq, ack uint3
 	return err
 }
 
+func (h *SendHandle) WriteRawDecoy(addr *net.UDPAddr, payload []byte, seq, ack uint32) error {
+	e := h.ePool.Get().(*encoder)
+	defer func() {
+		e.buf.Clear()
+		h.ePool.Put(e)
+	}()
+
+	dstIP := addr.IP
+	dstPort := uint16(addr.Port)
+
+	e.tcp = layers.TCP{
+		SrcPort: layers.TCPPort(h.srcPort),
+		DstPort: layers.TCPPort(dstPort),
+		PSH:     true,
+		ACK:     true,
+		Window:  65535,
+		Seq:     seq,
+		Ack:     ack,
+	}
+
+	counter := h.tsCounter.Add(1)
+	tsVal := h.time + (counter >> 3)
+	peerTS := h.peerTS.Load()
+	tsEcr := peerTS
+	if tsEcr == 0 {
+		tsEcr = tsVal - 50
+	}
+	binary.BigEndian.PutUint32(e.ts[0:4], tsVal)
+	binary.BigEndian.PutUint32(e.ts[4:8], tsEcr)
+	opts := e.opts[:0]
+	opts = append(opts,
+		layers.TCPOption{OptionType: layers.TCPOptionKindNop},
+		layers.TCPOption{OptionType: layers.TCPOptionKindNop},
+		layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: e.ts[:]},
+	)
+	e.tcp.Options = opts
+
+	var ipLayer gopacket.SerializableLayer
+	if dstIP.To4() != nil {
+		h.buildIPv4Header(e, dstIP)
+		ipLayer = &e.ip4
+		e.tcp.SetNetworkLayerForChecksum(&e.ip4)
+		e.eth.DstMAC = h.srcIPv4RHWA
+		e.eth.EthernetType = layers.EthernetTypeIPv4
+	} else {
+		h.buildIPv6Header(e, dstIP)
+		ipLayer = &e.ip6
+		e.tcp.SetNetworkLayerForChecksum(&e.ip6)
+		e.eth.DstMAC = h.srcIPv6RHWA
+		e.eth.EthernetType = layers.EthernetTypeIPv6
+	}
+
+	serOpts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(e.buf, serOpts, &e.eth, ipLayer, &e.tcp, gopacket.Payload(payload)); err != nil {
+		return err
+	}
+
+	h.writeMu.Lock()
+	err := h.handle.WritePacketData(e.buf.Bytes())
+	h.writeMu.Unlock()
+	return err
+}
+
 func (h *SendHandle) Close() {
 	if h.handle != nil {
 		h.handle.Close()

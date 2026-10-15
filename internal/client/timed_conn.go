@@ -66,7 +66,9 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 			return conn, nil
 		}
 		if tc.cfg.Transport.KCP != nil {
-			kcpConn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
+			netCfg := tc.cfg.Network
+			netCfg.SNI = tc.cfg.Transport.SNI
+			kcpConn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, netCfg)
 			if err == nil {
 				_ = tc.sendTCPF(kcpConn)
 				return kcpConn, nil
@@ -74,7 +76,9 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 		}
 		return nil, err
 	default:
-		conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
+		netCfg := tc.cfg.Network
+		netCfg.SNI = tc.cfg.Transport.SNI
+		conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, netCfg)
 		if err != nil {
 			return nil, err
 		}

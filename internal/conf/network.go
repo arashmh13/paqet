@@ -20,6 +20,7 @@ type Network struct {
 	IPv6       Addr           `yaml:"ipv6"`
 	PCAP       PCAP           `yaml:"pcap"`
 	TCP        TCP            `yaml:"tcp"`
+	SNI        *SNI           `yaml:"sni"`
 	Interface  *net.Interface `yaml:"-"`
 	Port       int            `yaml:"-"`
 }

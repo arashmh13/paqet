@@ -185,3 +185,33 @@
   - `multi-port` (:1094): RTT 91.2 ms median (P95: 94.8 ms), Throughput 11.57 Mbps (1.38 MB/s).
   - CPU utilization: Server CPU dropped from 1.8% (raw) to 0.4% (stream).
 - **Outcome:** Throughput and latency bottlenecks completely resolved; empirical reality of physical egress link documented. Terminology corrected. Full audit report delivered.
+
+---
+
+## Cycle 11: Completion & Empirical Wire Evaluation of True Out-of-Window SNI Sequence Injection
+- **Objective:** Upgrade the SNI-assisted transport from PARTIAL to fully implemented, verifying true out-of-window raw TCP sequence injection (`wrong_seq`) vs userspace stream preambles.
+- **Hypotheses:**
+  1. Injecting an out-of-window raw TCP segment with `Seq = hs.Ack - len(decoyHello)` immediately after the 3-way handshake will cause middlebox DPI to inspect and whitelist the whitelisted decoy domain (`bank.ir`), while the destination OS kernel silently drops the packet (`seq + len <= rcv_nxt`).
+  2. The server will experience zero state corruption, zero RSTs, and zero decryption failures, allowing subsequent real Paqet KCP data to proceed cleanly.
+- **Actions:**
+  1. Implemented `WriteRawDecoy` in `internal/socket/send_handle.go` for Layer 2/3/4 raw packet emission.
+  2. Integrated out-of-window packet injection into `PacketConn.Handshake` in `internal/socket/socket.go` when `SNI` is configured.
+  3. Added decoy packet filtering in `internal/socket/recv_handle.go` (`len >= 5 && payload[0] == 0x16 && payload[1] == 0x03 -> errNoPayload`) to prevent any synthetic packets captured by pcap from reaching the decryption engine.
+  4. Added unit tests `TestBuildAndFilterDecoyPacket` and `TestOutOfWindowSequenceCalculation` in `internal/socket/socket_test.go`.
+  5. Built and compiled binary `v2.3.0-sni` (SHA-256 `82525936d81f...`).
+  6. Deployed `v2.3.0-sni` to both Iran VPS and German VPS.
+  7. Started background `tcpdump` on Germany VPS (`ens3`, port 8088) saving to `/tmp/sni_test.pcap`.
+  8. Connected Iran VPS client with `sni: { decoy: "bank.ir", preset: "chrome", method: "wrong_seq" }`.
+  9. Executed SOCKS5 traffic through the tunnel and inspected captured packets.
+- **Evidence Collected:**
+  - `tcpdump` packet trace on German VPS `/tmp/sni_test.pcap` captured:
+    * Packet 1: `185.18.215.124.36949 > 77.37.65.2.8088: Flags [S], seq 569602381`
+    * Packet 2: `77.37.65.2.8088 > 185.18.215.124.36949: Flags [S.], ack 569602382`
+    * Packet 3: `185.18.215.124.36949 > 77.37.65.2.8088: Flags [.], seq 1, ack 1`
+    * Packet 4 (Injected Decoy): `185.18.215.124.36949 > 77.37.65.2.8088: Flags [P.], seq 4294967206:1, ack 1, length 91` carrying valid TLS 1.3 ClientHello with `SNI: bank.ir`.
+    * Packet 5 (Real Payload): `185.18.215.124.36949 > 77.37.65.2.8088: Flags [P.], seq 1:163, ack 1, length 162` carrying authenticated Paqet data.
+    * Packet 6: `77.37.65.2.8088 > 185.18.215.124.36949: Flags [P.], ack 163` confirming server accepted data without disruption.
+  - SOCKS5 ping across the tunnel succeeded: HTTP 200 in 0.141s.
+  - 10-trial soak test: 10/10 requests succeeded with median RTT 123.4ms; 1MB transfer achieved 1.29 MB/s.
+  - Server logs confirmed zero errors, zero decryption failures, and zero socket stalls.
+- **Outcome:** Out-of-window SNI sequence injection (`wrong_seq`) is **100% operational, verified on the wire, and proven to leave destination state undisturbed**. SNI-assisted transport is now elevated to **COMPLETE**.

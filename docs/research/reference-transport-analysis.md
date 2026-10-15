@@ -50,20 +50,31 @@ This document provides a rigorous, code-level architectural and empirical compar
 
 - **Mechanism:** Exploit an architectural asymmetry between DPI middleboxes and destination TCP stacks:
   1. Client establishes a standard TCP 3-way handshake with the target server.
-  2. Before sending the genuine TLS ClientHello, the client injects a synthetic raw TCP packet carrying a decoy TLS ClientHello with a whitelisted domain (e.g. `hcaptcha.com`, `ebanking.ir`).
+  2. Before sending the genuine TLS ClientHello, the client injects a synthetic raw TCP packet carrying a decoy TLS ClientHello with a whitelisted domain (e.g. `bank.ir`, `hcaptcha.com`).
   3. The synthetic packet uses an *out-of-window sequence number* (`seq_num = syn_seq + 1 - len(payload)`).
   4. The DPI middlebox reassembles the flow optimistically, reads the decoy SNI, marks the 4-tuple flow as benign/whitelisted, and ceases deep inspection.
-  5. The destination server's TCP stack receives the packet, detects that the sequence number is outside the receive window, and silently drops it (or issues an ACK for the expected sequence).
-  6. The client immediately sends the real TLS ClientHello with valid sequence numbers. The server processes it normally; the DPI ignores it because the flow was already cleared.
-- **Source Code Verification (`aleskxyz/SNI-Spoofing-Go`):**
-  - Uses raw sockets on Linux (`AF_PACKET` / raw IP) or `WinDivert` on Windows.
-  - Implements `-fake-sni`, `-utls` presets (`chrome`, `firefox`, `safari`), `-fake-repeat`, and `-fake-delay`.
-- **Field Findings from XTLS/Xray-core Discussion #5969:**
-  - Classic TCP fragmentation (`tlshello` fragmenting into small 50–100 byte chunks) is now reassembled by Iranian DPI middleboxes (MCI, Irancell, Shatel, MKH) and no longer circumvents filtering.
-  - TCP sequence injection (`wrong_seq`) remains highly effective against Iranian SNI filters because stateful DPI middleboxes prioritize parsing early application data over strict TCP sequence validation, whereas destination OS kernels strictly adhere to RFC 793/RFC 9293 sequence bounds.
-- **Placement & Limitations for Paqet-NG:**
-  - If Paqet connects directly to a German VPS (`77.37.65.2:8088`), the DPI sees a flow to an unknown VPS IP. Injecting `hcaptcha.com` into that flow only works if the DPI does not enforce IP-SNI consistency checks.
-  - When combined with a TLS camouflage wrapper (e.g. running the Paqet server on port 443 with a valid TLS certificate or REALITY decoy), SNI-assisted sequence injection successfully shields the handshake from active SNI blocking.
+  5. The destination server's TCP stack receives the packet, detects that `seq + len <= rcv_nxt`, and silently drops it without corrupting the socket buffer.
+  6. The client immediately sends the real payload on the correct sequence number. The server processes it normally; the DPI ignores it because the flow was already cleared.
+
+- **Dual Implementation Architecture in Paqet-NG:**
+  1. **Mechanism A: Out-of-Window Raw TCP Injection (`wrong_seq` in `internal/socket`):**
+     - Emitted immediately after `PacketConn.Handshake` sends the TCP `ACK`.
+     - Injects raw Layer 2/3/4 packet: `Seq = hs.Ack - len(decoy)`, `Ack = hs.Seq + 1`, `Flags = PSH | ACK`.
+     - **Live Packet Capture Evidence (Captured on Germany VPS `/tmp/sni_test.pcap`):**
+       ```text
+       15:39:34.364695 IP 185.18.215.124.36949 > 77.37.65.2.8088: Flags [S], seq 569602381, length 0
+       15:39:34.365032 IP 77.37.65.2.8088 > 185.18.215.124.36949: Flags [S.], seq 3397631416, ack 569602382, length 0
+       15:39:34.447092 IP 185.18.215.124.36949 > 77.37.65.2.8088: Flags [.], seq 1, ack 1, length 0
+       15:39:34.447164 IP 185.18.215.124.36949 > 77.37.65.2.8088: Flags [P.], seq 4294967206:1, ack 1, length 91
+                      [Payload: TLS 1.3 ClientHello, SNI: bank.ir]
+       15:39:34.625278 IP 185.18.215.124.36949 > 77.37.65.2.8088: Flags [P.], seq 1:163, ack 1, length 162
+                      [Payload: Real Authenticated Paqet KCP Data]
+       ```
+       Notice that Packet 4 ends at relative sequence `1` (`rcv_nxt`), carrying zero forward bytes. The Linux kernel silently discards it, and Packet 5 seamlessly delivers the real Paqet data starting at `seq 1`.
+  2. **Mechanism B: Userspace Stream Preamble Injection (in `internal/tnet/stream`):**
+     - For non-root environments where raw sequence manipulation is impossible (standard kernel TCP sockets).
+     - Emits the decoy ClientHello in-window as a stream preamble; the server stream listener peeks the first 3 bytes (`0x16 0x03`), consumes the record, and discards it before the AEAD salt.
+     - *Limitation of Mechanism B:* Because it is sent in-window, a DPI middlebox tracking bidirectional state will expect a TLS ServerHello response from the destination server. If no ServerHello is returned, strict DPI middleboxes can flag the connection. Mechanism A completely avoids this by dropping the packet at the kernel layer.
 
 ---
 

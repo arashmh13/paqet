@@ -3,10 +3,11 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.2.0-chameleon`
-- **Latest Commit Checkpoint:** `5d03bc959...` (Binary SHA-256: `5d03bc959400cb01e519856ae56e3d13a413904ad39e54493ac11820cdf8369c`)
+- **Current Version:** `v2.3.0-sni`
+- **Latest Commit Checkpoint:** (Binary SHA-256: `82525936d81f6c015258cc66edda95f8a921d19e63df73bc117ceb1a720d5e77`)
+- **SNI-Assisted Transport Status:** **COMPLETE** (Mechanism A: out-of-window raw TCP injection verified via live pcap; Mechanism B: userspace stream preamble verified).
 - **Active Endpoints:**
-  - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (repaired `raw-kcp`), Multi-Port client on `127.0.0.1:1094` (pooling `:8089` and `:8443`).
+  - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (repaired `raw-kcp` with live out-of-window SNI injection), Multi-Port client on `127.0.0.1:1094` (pooling `:8089` and `:8443`).
   - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), multi-port listener on `:8089` + `:8443`.
   - In-Host Benchmark Daemon: `127.0.0.1:8999` (`/ping`, `/bytes/<N>`, `/echo`).
 
