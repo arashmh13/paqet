@@ -14,11 +14,12 @@ type timedConn struct {
 	cfg    *conf.Conf
 	conn   tnet.Conn
 	expire time.Time
+	index  int
 }
 
-func newTimedConn(cfg *conf.Conf) (*timedConn, error) {
+func newTimedConn(cfg *conf.Conf, index int) (*timedConn, error) {
 	var err error
-	tc := timedConn{cfg: cfg}
+	tc := timedConn{cfg: cfg, index: index}
 	tc.conn, err = tc.createConn()
 	if err != nil {
 		return nil, err
@@ -27,27 +28,40 @@ func newTimedConn(cfg *conf.Conf) (*timedConn, error) {
 	return &tc, nil
 }
 
+func (tc *timedConn) getTargetAddr() string {
+	if len(tc.cfg.Server.Endpoints) > 0 {
+		ep := tc.cfg.Server.Endpoints[tc.index%len(tc.cfg.Server.Endpoints)]
+		return ep.String()
+	}
+	if tc.cfg.Server.Addr != nil {
+		return tc.cfg.Server.Addr.String()
+	}
+	return ""
+}
+
 func (tc *timedConn) createConn() (tnet.Conn, error) {
+	target := tc.getTargetAddr()
+
 	switch tc.cfg.Transport.Protocol {
 	case "stream", "aead-stream":
-		conn, err := stream.Dial(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs)
+		conn, err := stream.Dial(target, tc.cfg.Transport.Obfs)
 		if err != nil {
 			return nil, err
 		}
 		return conn, nil
 	case "sni-assisted":
-		conn, err := stream.DialSNIAssisted(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)
+		conn, err := stream.DialSNIAssisted(target, tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)
 		if err != nil {
 			return nil, err
 		}
 		return conn, nil
 	case "auto":
 		// Auto selector: try sni-assisted, then aead-stream, then kcp
-		conn, err := stream.DialSNIAssisted(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)
+		conn, err := stream.DialSNIAssisted(target, tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)
 		if err == nil {
 			return conn, nil
 		}
-		conn, err = stream.Dial(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs)
+		conn, err = stream.Dial(target, tc.cfg.Transport.Obfs)
 		if err == nil {
 			return conn, nil
 		}

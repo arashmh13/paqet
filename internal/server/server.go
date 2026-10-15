@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"paqet/internal/conf"
 	"paqet/internal/flog"
@@ -12,8 +13,8 @@ import (
 )
 
 type Server struct {
-	cfg      *conf.Conf
-	listener tnet.Listener
+	cfg       *conf.Conf
+	listeners []tnet.Listener
 }
 
 func New(cfg *conf.Conf) (*Server, error) {
@@ -22,28 +23,39 @@ func New(cfg *conf.Conf) (*Server, error) {
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	var listener tnet.Listener
-	var err error
-
-	switch s.cfg.Transport.Protocol {
-	case "stream", "aead-stream", "sni-assisted", "auto":
-		listener, err = stream.Listen(s.cfg.Listen.Addr.String(), s.cfg.Transport.Obfs)
-		if err != nil {
-			return fmt.Errorf("could not start stream listener: %w", err)
-		}
-		flog.Infof("server listening for stream connections on %s", s.cfg.Listen.Addr.String())
-	default:
-		listener, err = kcp.Listen(s.cfg.Transport.KCP, s.cfg.Transport.Obfs, s.cfg.Network)
-		if err != nil {
-			return fmt.Errorf("could not start KCP listener: %w", err)
-		}
-		flog.Infof("server listening for packets on :%d", s.cfg.Listen.Addr.Port)
+	endpoints := s.cfg.Listen.Endpoints
+	if len(endpoints) == 0 && s.cfg.Listen.Addr != nil {
+		endpoints = []*net.UDPAddr{s.cfg.Listen.Addr}
 	}
 
-	s.listener = listener
+	for _, ep := range endpoints {
+		var listener tnet.Listener
+		var err error
 
-	go s.listen(ctx, listener)
-	context.AfterFunc(ctx, func() { listener.Close() })
+		switch s.cfg.Transport.Protocol {
+		case "stream", "aead-stream", "sni-assisted", "auto":
+			listener, err = stream.Listen(ep.String(), s.cfg.Transport.Obfs)
+			if err != nil {
+				return fmt.Errorf("could not start stream listener on %s: %w", ep.String(), err)
+			}
+			flog.Infof("server listening for stream connections on %s", ep.String())
+		default:
+			listener, err = kcp.Listen(s.cfg.Transport.KCP, s.cfg.Transport.Obfs, s.cfg.Network)
+			if err != nil {
+				return fmt.Errorf("could not start KCP listener on :%d: %w", ep.Port, err)
+			}
+			flog.Infof("server listening for packets on :%d", ep.Port)
+		}
+
+		s.listeners = append(s.listeners, listener)
+		go s.listen(ctx, listener)
+	}
+
+	context.AfterFunc(ctx, func() {
+		for _, l := range s.listeners {
+			l.Close()
+		}
+	})
 
 	return nil
 }
@@ -63,7 +75,7 @@ func (s *Server) listen(ctx context.Context, listener tnet.Listener) {
 
 		go func() {
 			defer conn.Close()
-			defer s.listener.DeleteClientTCPF(conn.RemoteAddr())
+			defer listener.DeleteClientTCPF(conn.RemoteAddr())
 			s.handleConn(ctx, conn)
 		}()
 	}

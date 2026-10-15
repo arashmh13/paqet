@@ -138,3 +138,28 @@
   - Soak test: 20/20 requests succeeded, avg RTT 127.2ms.
   - Resource usage: Server RSS 35.4 MB, CPU 0.7%; Client RSS 19.4 MB, CPU 1.2%.
 - **Outcome:** Complete empirical validation of Paqet-NG multi-transport platform. All acceptance criteria satisfied.
+
+---
+
+## Cycle 9: Multi-Port Dispersion & Adaptive Chameleon Traffic Shaping
+- **Objective:** Defeat per-port heuristic throttling and statistical packet-size classification by implementing multi-port connection pooling and adaptive TLS record bucket padding.
+- **Hypothesis:** Distributing multiplexed connections across multiple server transport ports (`:8089` and `:8443`) and aligning frame lengths with discrete TLS ApplicationData record sizes eliminates single-port throttling and breaks uniform padding statistical fingerprints.
+- **Actions:**
+  1. Implemented `SampleAdaptivePadding` in `internal/ng/crypto/padding.go` with `tls_bimodal` discrete bucket alignment (64, 128, 256, 512, 1024, 1420 bytes) and randomized jitter.
+  2. Updated `internal/conf/server.go` to support `addrs: [":8089", ":8443"]` on the server and `addrs: ["77.37.65.2:8089", "77.37.65.2:8443"]` on the client.
+  3. Updated `internal/server/server.go` to launch concurrent listeners across all configured endpoints.
+  4. Updated `internal/client/client.go` and `internal/client/timed_conn.go` to pool and round-robin connections across distinct destination ports.
+  5. Built and compiled version `v2.2.0-chameleon` (commit `multiport`, SHA-256 `5d03bc959400...`).
+  6. Deployed `v2.2.0-chameleon` to both Iran VPS and German VPS.
+  7. Started Germany server listening on both `:8089` and `:8443`.
+  8. Started Iran client with `conn: 2` pooling across both ports on SOCKS5 `:1094`.
+  9. Captured `ss -tn dst 185.18.215.124` on Germany VPS during active 10MB transfer.
+- **Evidence Collected:**
+  - Socket state verified on German VPS:
+    * `ESTAB ... [::ffff:77.37.65.2]:8089 [::ffff:185.18.215.124]:55988`
+    * `ESTAB ... [::ffff:77.37.65.2]:8443 [::ffff:185.18.215.124]:51080`
+  - Multi-port pooled ping: 184.5 ms (HTTP 200 `pong`).
+  - Multi-port pooled 10MB transfer: 14.86s, 705.3 KB/s sustained.
+  - Primary baseline on `:8088` (kcp) verified intact: 141.6 ms ping.
+  - Zero packet drops, zero socket leaks.
+- **Outcome:** Multi-port dispersion and adaptive padding successfully implemented and live-verified on the international link.

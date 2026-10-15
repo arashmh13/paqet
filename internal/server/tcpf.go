@@ -6,9 +6,11 @@ import (
 )
 
 func (s *Server) handleTCPF(strm tnet.Strm, p *protocol.Proto) {
-	if len(p.TCPF) == 0 {
-		s.listener.DeleteClientTCPF(strm.RemoteAddr())
-		return
+	for _, l := range s.listeners {
+		if len(p.TCPF) == 0 {
+			l.DeleteClientTCPF(strm.RemoteAddr())
+		} else {
+			l.SetClientTCPF(strm.RemoteAddr(), p.TCPF)
+		}
 	}
-	s.listener.SetClientTCPF(strm.RemoteAddr(), p.TCPF)
 }
