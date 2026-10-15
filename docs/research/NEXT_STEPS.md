@@ -3,19 +3,19 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.5.0-platform`
-- **Active Binary SHA-256:** `bcf3a2abf25893c1d549c8c0bf4c493d4465d63bbef776d39acecbf0fdd6891c`
+- **Current Version:** `v2.5.1-emergency`
+- **Active Binary SHA-256:** `6ea2bb87d2164311af1d6aaa0c535add2c69513afb37d798a4577b0b2a6a5a8e`
 - **Architectural Validation Status:**
   - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 11.60 Mbps line rate, CA certificate validation verified).
   - Candidate 2 (Raw TCP Decoy Sequence Injection): **COMPLETE & WIRE-VERIFIED** (`wrong_seq` out-of-window packet injection, silent kernel drop on Germany VPS, 123.4 ms RTT).
   - Asymmetric Directional Decoupling (`AsymmetricConn`): **COMPLETE & HARDENED** (independent `UpstreamSender` and `DownstreamReceiver` channels, AAD header authentication, sequence exhaustion protection, RTO retransmission queue, and memory bounds).
-  - DNS-Asymmetric Transport: **OPERATIONAL & PUBLICLY VERIFIED** (Live public recursive DNS TXT traversal across Iranian border via Google Public DNS `8.8.8.8` to Germany authoritative daemon `77.37.65.2:53` in $140.98\text{ ms}$).
-  - Clean-Room Resolver Scanner (`internal/ng/dns`): **COMPLETE & TESTED** (Multi-factor evaluation: reachability, EDNS0 payload capacity up to 1400B, dynamic label realism, and ISP NXDOMAIN hijacking detection).
+  - DNS-Asymmetric Transport: **OPERATIONAL & PUBLICLY VERIFIED** (Live public recursive DNS TXT traversal across Iranian border via Google `8.8.8.8`, Cloudflare `1.1.1.1`, and Quad9 `9.9.9.9` to Germany authoritative daemon `77.37.65.2:53` in $136.9 - 242.4\text{ ms}$; verified arbitrary multi-payload exchange and conventional port-blockade survival).
+  - Clean-Room Resolver Scanner (`internal/ng/dns`): **COMPLETE & LIVE-TESTED** (Tested live from Tehran across 8 candidate resolvers; identified domestic resolver label censorship; verified 100% clean profile on public recursors).
   - BCP 38 / uRPF Spoofing Feasibility: **CONCLUDED & INFEASIBLE** (probes conclusively dropped by Panel01 and Hetzner egress routers).
   - Controlled Failure Laboratory: **OPERATIONAL & EXPANDED** (`failure_lab_test.go` passing across all formal failure models: Conditions A through I).
 - **Active Endpoints:**
   - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (`raw-kcp` with out-of-window SNI sequence injection), Genuine TLS on `127.0.0.1:1095` (`tls` on `:8443`).
-  - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), Genuine TLS server on `:8443`.
+  - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), Genuine TLS server on `:8443`, Emergency Authoritative DNS daemon on UDP `:53` (`paqet-emergency.service`).
   - In-Host Benchmark Daemon: `127.0.0.1:8999` (`/ping`, `/bytes/<N>`, `/echo`).
 
 ---

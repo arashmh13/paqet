@@ -128,3 +128,76 @@ End-to-End Elapsed RTT: 140.98 ms
 Authenticated Payload: "AUTHENTICATED_PAQET_DNS_RECURSIVE_TRAVERSAL_OK"
 ```
 **Conclusion:** Recursive DNS-asymmetric transport (Candidate B) is **100% operational, wire-verified across international borders, and capable of surviving complete TCP blockades**.
+
+---
+
+## 6. Phase 3: Multi-Payload Application Message Exchange Acceptance Results
+
+To prove that the channel carries arbitrary authenticated application data (rather than static markers), 5 distinct payloads spanning single-part and multipart frames were exchanged live from Iran VPS to Germany VPS via Google Public DNS (`8.8.8.8`):
+
+| Test Identifier | Payload Description | Payload Size | Multipart Parts | Measured RTT | Client Verification | Server Decryption Verified |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **TEST-01-TINY** | Diagnostic Ping Text | $16\text{ bytes}$ | 1 | $142.64\text{ ms}$ | `ACK_ECHO:PING_16_BYTES_OK` | `msg-60389` decrypted |
+| **TEST-02-BOOTSTRAP** | Target IP/Port & Obfs Key | $63\text{ bytes}$ | 2 | $198.88\text{ ms}$ | `ACK_ECHO:BOOTSTRAP_ENDPOINT:...` | `msg-499251` decrypted |
+| **TEST-03-ALERT** | Port 8088 Down Failover Notice | $69\text{ bytes}$ | 2 | $211.20\text{ ms}$ | `ACK_ECHO:ALERT_FIREWALL_BLOCK...` | `msg-10845` decrypted |
+| **TEST-04-MULTIPART-100B** | Cryptographic Random Hex String | $100\text{ bytes}$ | 4 | $202.76\text{ ms}$ | Exact byte echo matching | `msg-485065` decrypted |
+| **TEST-05-MULTIPART-140B** | Cryptographic Random Hex String | $140\text{ bytes}$ | 5 | $206.47\text{ ms}$ | Exact byte echo matching | `msg-333343` decrypted |
+
+*Artifact Preserved:* `docs/research/emergency_dns_test_records.json`
+
+---
+
+## 7. Phase 6: Controlled Conventional-Transport Failure & Recovery Experiment
+
+To definitively establish survivability when conventional proxy transports are severed:
+
+1. **Baseline Verification:** SOCKS5 proxy on `:1090` verified active ($146.5\text{ ms}$, HTTP 200).
+2. **Controlled Failure Injection:** On Germany VPS, dropped all incoming TCP traffic from Iran VPS targeting conventional Paqet ports (`:8088`, `:8089`, `:8443`):
+   ```bash
+   iptables -A INPUT -p tcp -s 185.18.215.124 --dport 8088 -j DROP
+   iptables -A INPUT -p tcp -s 185.18.215.124 --dport 8089 -j DROP
+   iptables -A INPUT -p tcp -s 185.18.215.124 --dport 8443 -j DROP
+   ```
+3. **Conventional Failure Confirmed:** Client curl on `:1090` timed out and failed completely (`CONVENTIONAL_TRANSPORT_FAILED_AS_EXPECTED`).
+4. **Emergency DNS Exchange Executed:**
+   - Message: `ALERT_CONVENTIONAL_PORT_8088_DOWN_EMERGENCY_CHANNEL_ACTIVE`
+   - Client dispatched via Google Public DNS (`8.8.8.8:53`).
+   - German server received and decrypted payload (`msg-781467`), logged it in systemd journal, and generated authenticated echo response.
+   - Client verified authentic reply in $1.11\text{s}$ (including initial resolver cache-miss traversal).
+5. **Restoration:** Firewall rules removed. Conventional SOCKS5 immediately restored ($143.7\text{ ms}$, HTTP 200).
+
+---
+
+## 8. Resolver Diversity & Capability Evaluation (Phase 8 Live Results)
+
+Executed live from Iran VPS across 8 candidate resolvers using `paqet emergency scan`:
+
+```text
+RESOLVER           STATUS   PROFILE            SCORE  LATENCY    EDNS0    NXDOMAIN TUNNEL  
+-----------------------------------------------------------------------------------------------
+8.8.8.8            WORKING  TUNNEL_COMPATIBLE  6/6    80.2ms     1400B    CLEAN    PASS    
+9.9.9.9            WORKING  TUNNEL_COMPATIBLE  6/6    85.3ms     1400B    CLEAN    PASS    
+4.2.2.4            WORKING  TUNNEL_COMPATIBLE  6/6    89.5ms     1400B    CLEAN    PASS    
+8.8.4.4            WORKING  TUNNEL_COMPATIBLE  6/6    90.1ms     1400B    CLEAN    PASS    
+1.1.1.1            WORKING  TUNNEL_COMPATIBLE  6/6    105.5ms    1400B    CLEAN    PASS    
+1.0.0.1            WORKING  TUNNEL_COMPATIBLE  6/6    121.1ms    1400B    CLEAN    PASS    
+45.9.252.80        WORKING  TUNNEL_COMPATIBLE  5/6    0.9ms      1400B    CLEAN    FAIL    
+10.10.34.34        TIMEOUT  DISCOVERED         0/6    0.0ms      NONE     HIJACKED FAIL    
+```
+
+### Empirical Discovery on Domestic Resolvers:
+- Iranian domestic datacenter resolver `45.9.252.80` answered with $< 1\text{ ms}$ latency, but **FAILED the tunnel realism check** (dropping long Base32 labels).
+- Public resolvers (`8.8.8.8`, `1.1.1.1`, `9.9.9.9`) passed 100% of tunnel capability checks, including EDNS0 1400B buffers and clean unhijacked NXDOMAIN preservation.
+- Live test confirmed successful emergency messaging over all 3 major public resolvers:
+  * Google (`8.8.8.8`): $142.6\text{ ms}$
+  * Cloudflare (`1.1.1.1`): $136.9\text{ ms}$
+  * Quad9 (`9.9.9.9`): $299.4\text{ ms}$
+
+---
+
+## 9. Single Point of Failure (SPOF) Disclaimer
+
+The current public DNS delegation relies on a single authoritative nameserver IP (`77.37.65.2`).
+- **Limitation:** If German VPS IP `77.37.65.2` is blocked at the IP level, public recursive resolvers cannot reach the authoritative server, disabling the DNS emergency channel.
+- **Future Roadmap:** To eliminate this SPOF, configure secondary authoritative nameservers on independent IP addresses across multiple cloud providers.
+

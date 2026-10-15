@@ -91,3 +91,19 @@ Tested via `dns_asymmetric_test.go` and verified on real network sockets:
 | **Round-Trip Latency** | $150\text{ ms} - 450\text{ ms}$ | High latency due to recursive resolution |
 | **Operational Classification** | **Emergency Signaling / Bootstrap** | Unsuitable for general SOCKS5 browsing |
 
+### 5.1 Live Iran-to-Germany Emergency DNS Empirical Soak Benchmark (October 15, 2026)
+
+Conducted across 10 sequential 64-byte authenticated application payloads transmitted through Google Public DNS (`8.8.8.8:53`) targeting the delegated child zone `tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir`:
+
+| Measured Metric | Empirical Value |
+| :--- | :--- |
+| **Success Rate** | **10/10 (100.0%)** |
+| **Minimum RTT** | **$164.34\text{ ms}$** |
+| **Median RTT** | **$242.40\text{ ms}$** |
+| **Mean RTT** | **$377.81\text{ ms}$** |
+| **P95 RTT** | **$1,163.77\text{ ms}$** |
+| **Useful Payload Throughput (Stop-and-Wait)** | **$2.11\text{ kbps}$ ($264.03\text{ B/s}$)** |
+| **Resolver Diversity Confirmed** | Google (`8.8.8.8`, $142\text{ms}$), Cloudflare (`1.1.1.1`, $136.9\text{ms}$), Quad9 (`9.9.9.9`, $299.3\text{ms}$) |
+| **Conventional TCP Blackhole Survival** | **Verified:** Message succeeded while ports 8088, 8089, 8443 were blocked. |
+
+

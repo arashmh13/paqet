@@ -1,0 +1,42 @@
+[
+  {
+    "test_id": "TEST-01-TINY",
+    "payload_len": 16,
+    "duration_sec": 0.197,
+    "success": true,
+    "client_output": "[CLIENT] Sending emergency message ID=msg-60389 to 8.8.8.8:53 via *.tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir...\n[CLIENT] SUCCESS! RTT: 142.642422ms\n - Response ID: msg-60389\n - Status:      OK\n - Reply:       ACK_ECHO:PING_16_BYTES_OK",
+    "server_log": "Oct 15 21:17:04 e.pharash paqet[40412]: 2026/10/15 21:17:04 [EMERGENCY-SERVER] Listening on [::]:53 for domain *.tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir\nOct 15 21:17:45 e.pharash paqet[40412]: 2026/10/15 21:17:45 [EMERGENCY-SERVER] Received authenticated msg ID=msg-524658 Type=alert Payload=\"ALERT_TEST_MSG_001\"\nOct 15 21:18:59 e.pharash paqet[40412]: 2026/10/15 21:18:59 [EMERGENCY-SERVER] Received authenticated msg ID=msg-60389 Type=alert Payload=\"PING_16_BYTES_OK\""
+  },
+  {
+    "test_id": "TEST-02-BOOTSTRAP",
+    "payload_len": 63,
+    "duration_sec": 0.267,
+    "success": true,
+    "client_output": "[CLIENT] Sending emergency message ID=msg-499251 to 8.8.8.8:53 via *.tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir...\n[CLIENT] SUCCESS! RTT: 198.878662ms\n - Response ID: msg-499251\n - Status:      OK\n - Reply:       ACK_ECHO:BOOTSTRAP_ENDPOINT:77.37.65.2:8443_KEY:yP9v/8x+n3Lp+ZqW4s1RjT5o",
+    "server_log": "Oct 15 21:17:45 e.pharash paqet[40412]: 2026/10/15 21:17:45 [EMERGENCY-SERVER] Received authenticated msg ID=msg-524658 Type=alert Payload=\"ALERT_TEST_MSG_001\"\nOct 15 21:18:59 e.pharash paqet[40412]: 2026/10/15 21:18:59 [EMERGENCY-SERVER] Received authenticated msg ID=msg-60389 Type=alert Payload=\"PING_16_BYTES_OK\"\nOct 15 21:19:00 e.pharash paqet[40412]: 2026/10/15 21:19:00 [EMERGENCY-SERVER] Received authenticated msg ID=msg-499251 Type=alert Payload=\"BOOTSTRAP_ENDPOINT:77.37.65.2:8443_KEY:yP9v/8x+n3Lp+ZqW4s1RjT5o\""
+  },
+  {
+    "test_id": "TEST-03-ALERT",
+    "payload_len": 69,
+    "duration_sec": 0.281,
+    "success": true,
+    "client_output": "[CLIENT] Sending emergency message ID=msg-10845 to 8.8.8.8:53 via *.tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir...\n[CLIENT] SUCCESS! RTT: 211.20203ms\n - Response ID: msg-10845\n - Status:      OK\n - Reply:       ACK_ECHO:ALERT_FIREWALL_BLOCK_PORT_8088_INITIATE_FAILOVER_TO_ALTERNATIVE_TRANS",
+    "server_log": "Oct 15 21:18:59 e.pharash paqet[40412]: 2026/10/15 21:18:59 [EMERGENCY-SERVER] Received authenticated msg ID=msg-60389 Type=alert Payload=\"PING_16_BYTES_OK\"\nOct 15 21:19:00 e.pharash paqet[40412]: 2026/10/15 21:19:00 [EMERGENCY-SERVER] Received authenticated msg ID=msg-499251 Type=alert Payload=\"BOOTSTRAP_ENDPOINT:77.37.65.2:8443_KEY:yP9v/8x+n3Lp+ZqW4s1RjT5o\"\nOct 15 21:19:01 e.pharash paqet[40412]: 2026/10/15 21:19:01 [EMERGENCY-SERVER] Received authenticated msg ID=msg-10845 Type=alert Payload=\"ALERT_FIREWALL_BLOCK_PORT_8088_INITIATE_FAILOVER_TO_ALTERNATIVE_TRANS\""
+  },
+  {
+    "test_id": "TEST-04-MULTIPART-100B",
+    "payload_len": 100,
+    "duration_sec": 0.268,
+    "success": true,
+    "client_output": "[CLIENT] Sending emergency message ID=msg-485065 to 8.8.8.8:53 via *.tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir...\n[CLIENT] SUCCESS! RTT: 202.755092ms\n - Response ID: msg-485065\n - Status:      OK\n - Reply:       ACK_ECHO:40c16797016aeb229dd686bf464882f87249dff936502b28a510931542f59bf2e8c9f97857911b36fd7b800a6d7b55fa1c34",
+    "server_log": "Oct 15 21:19:00 e.pharash paqet[40412]: 2026/10/15 21:19:00 [EMERGENCY-SERVER] Received authenticated msg ID=msg-499251 Type=alert Payload=\"BOOTSTRAP_ENDPOINT:77.37.65.2:8443_KEY:yP9v/8x+n3Lp+ZqW4s1RjT5o\"\nOct 15 21:19:01 e.pharash paqet[40412]: 2026/10/15 21:19:01 [EMERGENCY-SERVER] Received authenticated msg ID=msg-10845 Type=alert Payload=\"ALERT_FIREWALL_BLOCK_PORT_8088_INITIATE_FAILOVER_TO_ALTERNATIVE_TRANS\"\nOct 15 21:19:02 e.pharash paqet[40412]: 2026/10/15 21:19:02 [EMERGENCY-SERVER] Received authenticated msg ID=msg-485065 Type=alert Payload=\"40c16797016aeb229dd686bf464882f87249dff936502b28a510931542f59bf2e8c9f97857911b36fd7b800a6d7b55fa1c34\""
+  },
+  {
+    "test_id": "TEST-05-MULTIPART-140B",
+    "payload_len": 140,
+    "duration_sec": 0.275,
+    "success": true,
+    "client_output": "[CLIENT] Sending emergency message ID=msg-333343 to 8.8.8.8:53 via *.tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir...\n[CLIENT] SUCCESS! RTT: 206.471753ms\n - Response ID: msg-333343\n - Status:      OK\n - Reply:       ACK_ECHO:2b5dd4b394e56ae5de0e188ac48d515162db71ed94b4e26a9bcf9bee4cdc059727e8bdc12e0286bb241deaaaa6f287dcdc541fc4052892ff087af38e52c79215dbfb4bfdcae9",
+    "server_log": "Oct 15 21:19:01 e.pharash paqet[40412]: 2026/10/15 21:19:01 [EMERGENCY-SERVER] Received authenticated msg ID=msg-10845 Type=alert Payload=\"ALERT_FIREWALL_BLOCK_PORT_8088_INITIATE_FAILOVER_TO_ALTERNATIVE_TRANS\"\nOct 15 21:19:02 e.pharash paqet[40412]: 2026/10/15 21:19:02 [EMERGENCY-SERVER] Received authenticated msg ID=msg-485065 Type=alert Payload=\"40c16797016aeb229dd686bf464882f87249dff936502b28a510931542f59bf2e8c9f97857911b36fd7b800a6d7b55fa1c34\"\nOct 15 21:19:03 e.pharash paqet[40412]: 2026/10/15 21:19:03 [EMERGENCY-SERVER] Received authenticated msg ID=msg-333343 Type=alert Payload=\"2b5dd4b394e56ae5de0e188ac48d515162db71ed94b4e26a9bcf9bee4cdc059727e8bdc12e0286bb241deaaaa6f287dcdc541fc4052892ff087af38e52c79215dbfb4bfdcae9\""
+  }
+]

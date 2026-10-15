@@ -352,3 +352,41 @@
   7. Formally updated failure models (Conditions A through I) in `docs/research/hard-mode-capability-matrix.md`.
   8. Compiled release binary `v2.5.0-platform` (SHA-256 `bcf3a2abf25893c1d549c8c0bf4c493d4465d63bbef776d39acecbf0fdd6891c`).
 - **Outcome:** All quality gates passed with zero data races. All required deliverables completed and committed. Production service on `:1090` verified healthy.
+
+---
+
+## Cycle 17: Public DNS Emergency Messaging Engine, Multi-Payload Acceptance, Controlled Port-Failure Resilience, and Capacity Soak
+- **Objective:** Reconcile production release state across nodes, audit the live DNS mechanism to verify real application payload support, implement and verify arbitrary multi-payload exchanges over public recursive DNS, validate DNS wire correctness (RFC 1035 multi-string TXT framing, open-resolver protection), test controlled conventional-transport failure and recovery, benchmark capacity and latency across diverse resolvers, and evaluate live resolver discovery from Iran.
+- **Actions:**
+  1. Reconciled release and deployment state:
+     - Preserved previous running binaries in `/opt/paqet/backup-candidate2/paqet` (`ce0783cd...`) alongside `backup-baseline` (`b359a713...`) and `backup-candidate1` (`60348b11...`).
+     - Upgraded both VPS nodes to `v2.5.1-emergency` (SHA-256 `6ea2bb87d2164311af1d6aaa0c535add2c69513afb37d798a4577b0b2a6a5a8e`).
+     - Verified production SOCKS5 proxy on `185.18.215.124:1090` returned HTTP 200 `pong`.
+     - Deployed persistent authoritative systemd unit `paqet-emergency.service` on German VPS UDP `:53`.
+  2. Verified live DNS mechanism limitations:
+     - Determined that Cycle 16's initial probe proved recursive resolver reachability and domain delegation, but used a fixed test label (`test3`) and a hardcoded marker response.
+     - Addressed this by implementing a full end-to-end authenticated emergency messaging engine in Go (`internal/ng/transport/dns_emergency.go`, `cmd/emergency/emergency.go`).
+  3. Audited and hardened wire formatting and security:
+     - Upgraded `BuildDNSTXTResponse` to segment payloads exceeding 255 bytes into multiple RFC 1035 `<character-string>` entries.
+     - Upgraded `ParseDNSTXTResponse` to reassemble multi-string TXT records.
+     - Enforced open-resolver protection: queries outside the delegated child zone are rejected with `REFUSED` (`RCODE = 5`), ensuring the authoritative daemon cannot be exploited for DNS amplification.
+     - Configured response flags: `QR=1`, `AA=1`, `RA=0` (Authoritative only, recursion disabled).
+  4. Executed live multi-payload acceptance testing (Iran VPS -> 8.8.8.8 -> Germany VPS):
+     - `TEST-01-TINY` (16B): $142.6\text{ ms}$ RTT, verified on both endpoints.
+     - `TEST-02-BOOTSTRAP` (63B): $198.9\text{ ms}$ RTT, verified on both endpoints.
+     - `TEST-03-ALERT` (69B): $211.2\text{ ms}$ RTT, verified on both endpoints.
+     - `TEST-04-MULTIPART-100B` (100B random hex, 4 parts): $202.8\text{ ms}$ RTT, 100% byte-exact echo.
+     - `TEST-05-MULTIPART-140B` (140B random hex, 5 parts): $206.5\text{ ms}$ RTT, 100% byte-exact echo.
+     - Preserved test record in `docs/research/emergency_dns_test_records.json`.
+  5. Executed Phase 6 controlled conventional transport failure test:
+     - Applied isolated firewall drop on Germany VPS for ports 8088, 8089, 8443 targeting Iran VPS IP.
+     - Verified conventional SOCKS5 failed with connection timeout.
+     - Dispatched emergency alert message through Google Public DNS (`8.8.8.8:53`); message was delivered, decrypted on German VPS, and response returned to Tehran in $1.11\text{s}$.
+     - Removed firewall drop; verified conventional SOCKS5 automatically resumed ($143.7\text{ ms}$, HTTP 200).
+  6. Verified resolver diversity and capacity soak:
+     - 10-trial sequential soak test: **10/10 success (100.0%)**, median RTT **$242.40\text{ ms}$**, min RTT **$164.34\text{ ms}$**, P95 **$1,163.77\text{ ms}$**, stop-and-wait payload throughput **$2.11\text{ kbps}$ ($264.03\text{ B/s}$)**.
+     - Verified live emergency messaging across Cloudflare (`1.1.1.1`, $136.9\text{ ms}$) and Quad9 (`9.9.9.9`, $299.4\text{ ms}$).
+  7. Executed live resolver scan from Tehran VPS (`paqet emergency scan`):
+     - Discovered that Iranian domestic resolver `45.9.252.80` answers basic queries ($< 1\text{ ms}$) but fails long Base32 labels (censorship filtering).
+     - Public resolvers (`8.8.8.8`, `1.1.1.1`, `9.9.9.9`) scored 6/6 with clean NXDOMAIN and 1400B EDNS0 support.
+- **Outcome:** Operational emergency communication channel verified end-to-end under real conventional-transport failure conditions. Documented in `docs/research/dns-asymmetric-end-to-end-validation.md` and `docs/research/asymmetric-protocol-security-audit.md`. Production services healthy and rollback-ready.

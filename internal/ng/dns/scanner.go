@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -360,6 +362,74 @@ func ScanResolverPool(ctx context.Context, hosts []string, port int, testDomain 
 	})
 
 	return results
+}
+
+// DefaultPublicResolvers returns a curated set of resilient public recursive DNS resolvers.
+func DefaultPublicResolvers() []string {
+	return []string{
+		"8.8.8.8", // Google Primary
+		"1.1.1.1", // Cloudflare Primary
+		"9.9.9.9", // Quad9 Primary
+		"8.8.4.4", // Google Secondary
+		"1.0.0.1", // Cloudflare Secondary
+		"4.2.2.4", // Level3 / CenturyLink
+	}
+}
+
+// GetSystemResolvers parses /etc/resolv.conf on Linux/Unix environments to discover local resolvers.
+func GetSystemResolvers() []string {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return nil
+	}
+	var resolvers []string
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "nameserver") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				ip := net.ParseIP(parts[1])
+				// Include valid IPv4 resolvers (and IPv6 if desired)
+				if ip != nil && ip.To4() != nil {
+					resolvers = append(resolvers, parts[1])
+				}
+			}
+		}
+	}
+	return resolvers
+}
+
+// SaveResolverCache persists scanned resolver capabilities to a JSON file.
+func SaveResolverCache(path string, results []ResolverCapabilities) error {
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+// LoadResolverCache loads previously cached resolver profiles if they are newer than maxAge.
+func LoadResolverCache(path string, maxAge time.Duration) ([]ResolverCapabilities, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var results []ResolverCapabilities
+	if err := json.Unmarshal(data, &results); err != nil {
+		return nil, err
+	}
+	if maxAge > 0 {
+		var fresh []ResolverCapabilities
+		now := time.Now()
+		for _, r := range results {
+			if now.Sub(r.LastTested) <= maxAge {
+				fresh = append(fresh, r)
+			}
+		}
+		return fresh, nil
+	}
+	return results, nil
 }
 
 func randomLabel(n int) string {

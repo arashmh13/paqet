@@ -1,0 +1,22 @@
+{
+  "trials": 10,
+  "successful": 10,
+  "payload_size_bytes": 64,
+  "min_rtt_ms": 164.34,
+  "median_rtt_ms": 242.4,
+  "mean_rtt_ms": 377.81,
+  "p95_rtt_ms": 1163.77,
+  "useful_payload_kbps": 2.11,
+  "raw_rtts": [
+    854.46,
+    210.26,
+    258.17,
+    1163.77,
+    226.9,
+    209.96,
+    169.65,
+    164.34,
+    262.64,
+    257.89
+  ]
+}
