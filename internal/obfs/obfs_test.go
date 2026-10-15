@@ -204,6 +204,46 @@ func TestTruncatedFrameIsDropped(t *testing.T) {
 	}
 }
 
+func TestReplayedDatagramIsDropped(t *testing.T) {
+	client, server := newMemPair()
+	key := []byte("shared-secret")
+	ca := mustConn(t, client, key, 32)
+	sb := mustConn(t, server, key, 32)
+
+	if _, err := ca.WriteTo([]byte("authenticated payload"), server.local); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+
+	// Capture the valid frame
+	frame := <-server.in
+	// Duplicate the frame into server.in twice
+	duplicateFrame := datagram{
+		data: append([]byte(nil), frame.data...),
+		addr: frame.addr,
+	}
+	server.in <- frame
+	server.in <- duplicateFrame
+
+	// First read must succeed
+	buf := make([]byte, 2048)
+	n, _, err := sb.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("first ReadFrom failed: %v", err)
+	}
+	if string(buf[:n]) != "authenticated payload" {
+		t.Fatalf("unexpected content: %s", string(buf[:n]))
+	}
+
+	// Second read (replay of identical frame) must be dropped silently
+	if err := sb.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	_, _, err = sb.ReadFrom(buf)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded on replayed frame, got: %v", err)
+	}
+}
+
 // captureFrames writes n identical payloads through the obfuscation layer
 // and returns the raw frames that reached the wire.
 func captureFrames(t *testing.T, n int, payload, key []byte, maxPad int) [][]byte {

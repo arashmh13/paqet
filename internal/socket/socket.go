@@ -52,6 +52,8 @@ func New(cfg *conf.Network) (*PacketConn, error) {
 			// Server received SYN: auto reply with SYN-ACK
 			serverISN := rand.Uint32()
 			_ = sendHandle.WriteControl(p.Addr, conf.TCPF{SYN: true, ACK: true}, serverISN, p.Seq+1, true)
+			sendHandle.curSeq.Store(serverISN + 1)
+			sendHandle.peerAck.Store(p.Seq + 1)
 		} else if p.SYN && p.ACK {
 			// Client received SYN-ACK: notify handshake waiter
 			select {
@@ -59,6 +61,10 @@ func New(cfg *conf.Network) (*PacketConn, error) {
 			default:
 			}
 		}
+	}
+
+	recvHandle.onPeerInfo = func(ack uint32, ts uint32) {
+		sendHandle.SetPeerInfo(ack, ts)
 	}
 
 	return conn, nil
@@ -89,6 +95,8 @@ func (c *PacketConn) Handshake(dst *net.UDPAddr) error {
 		case hs := <-c.handshakeCh:
 			if hs.Addr.IP.Equal(dst.IP) && hs.Addr.Port == dst.Port {
 				_ = c.sendHandle.WriteControl(dst, conf.TCPF{ACK: true}, hs.Ack, hs.Seq+1, false)
+				c.sendHandle.curSeq.Store(hs.Ack)
+				c.sendHandle.peerAck.Store(hs.Seq + 1)
 				return nil
 			}
 		case <-time.After(500 * time.Millisecond):

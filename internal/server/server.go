@@ -8,6 +8,7 @@ import (
 	"paqet/internal/flog"
 	"paqet/internal/tnet"
 	"paqet/internal/tnet/kcp"
+	"paqet/internal/tnet/stream"
 )
 
 type Server struct {
@@ -21,12 +22,24 @@ func New(cfg *conf.Conf) (*Server, error) {
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	listener, err := kcp.Listen(s.cfg.Transport.KCP, s.cfg.Transport.Obfs, s.cfg.Network)
-	if err != nil {
-		return fmt.Errorf("could not start KCP listener: %w", err)
+	var listener tnet.Listener
+	var err error
+
+	if s.cfg.Transport.Protocol == "stream" {
+		listener, err = stream.Listen(s.cfg.Listen.Addr.String(), s.cfg.Transport.Obfs)
+		if err != nil {
+			return fmt.Errorf("could not start stream listener: %w", err)
+		}
+		flog.Infof("server listening for stream connections on %s", s.cfg.Listen.Addr.String())
+	} else {
+		listener, err = kcp.Listen(s.cfg.Transport.KCP, s.cfg.Transport.Obfs, s.cfg.Network)
+		if err != nil {
+			return fmt.Errorf("could not start KCP listener: %w", err)
+		}
+		flog.Infof("server listening for packets on :%d", s.cfg.Listen.Addr.Port)
 	}
+
 	s.listener = listener
-	flog.Infof("server listening for packets on :%d", s.cfg.Listen.Addr.Port)
 
 	go s.listen(ctx, listener)
 	context.AfterFunc(ctx, func() { listener.Close() })

@@ -1,6 +1,7 @@
 package socket
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"runtime"
@@ -37,6 +38,7 @@ type RecvHandle struct {
 	dPool       sync.Pool
 	mu          sync.Mutex
 	onHandshake func(*HandshakePacket)
+	onPeerInfo  func(ack uint32, ts uint32)
 }
 
 func NewRecvHandle(cfg *conf.Network) (*RecvHandle, error) {
@@ -102,6 +104,16 @@ func (h *RecvHandle) Read(data []byte) (int, net.Addr, error) {
 			isACK = d.tcp.ACK
 			tcpSeq = d.tcp.Seq
 			tcpAck = d.tcp.Ack
+			if h.onPeerInfo != nil && len(payload) > 0 {
+				var peerTS uint32
+				for _, opt := range d.tcp.Options {
+					if opt.OptionType == layers.TCPOptionKindTimestamps && len(opt.OptionData) >= 4 {
+						peerTS = binary.BigEndian.Uint32(opt.OptionData[:4])
+						break
+					}
+				}
+				h.onPeerInfo(tcpSeq+uint32(len(payload)), peerTS)
+			}
 		}
 	}
 

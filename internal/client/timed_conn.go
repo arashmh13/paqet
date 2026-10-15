@@ -7,6 +7,7 @@ import (
 	"paqet/internal/protocol"
 	"paqet/internal/tnet"
 	"paqet/internal/tnet/kcp"
+	"paqet/internal/tnet/stream"
 )
 
 type timedConn struct {
@@ -27,6 +28,14 @@ func newTimedConn(cfg *conf.Conf) (*timedConn, error) {
 }
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
+	if tc.cfg.Transport.Protocol == "stream" {
+		conn, err := stream.Dial(tc.cfg.Server.Addr.String(), tc.cfg.Transport.Obfs)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+
 	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, tc.cfg.Network)
 	if err != nil {
 		return nil, err

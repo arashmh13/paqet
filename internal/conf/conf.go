@@ -81,23 +81,27 @@ func (c *Conf) validate() error {
 		}
 	}
 
-	allErrors = append(allErrors, c.Network.validate()...)
+	if c.Transport.Protocol != "stream" {
+		allErrors = append(allErrors, c.Network.validate()...)
+	}
 	allErrors = append(allErrors, c.Transport.validate()...)
 	if c.Role == "server" {
 		allErrors = append(allErrors, c.Listen.validate()...)
 	} else {
 		allErrors = append(allErrors, c.Server.validate()...)
-		if c.Server.Addr != nil {
-			family, local := "IPv6", c.Network.IPv6.Addr
-			if c.Server.Addr.IP.To4() != nil {
-				family, local = "IPv4", c.Network.IPv4.Addr
+		if c.Transport.Protocol != "stream" {
+			if c.Server.Addr != nil {
+				family, local := "IPv6", c.Network.IPv6.Addr
+				if c.Server.Addr.IP.To4() != nil {
+					family, local = "IPv4", c.Network.IPv4.Addr
+				}
+				if local == nil {
+					allErrors = append(allErrors, fmt.Errorf("server address is %s, but the %s interface is not configured", family, family))
+				}
 			}
-			if local == nil {
-				allErrors = append(allErrors, fmt.Errorf("server address is %s, but the %s interface is not configured", family, family))
+			if c.Transport.Conn > 1 && c.Network.Port != 0 {
+				allErrors = append(allErrors, fmt.Errorf("only one connection is allowed when a client port is explicitly set"))
 			}
-		}
-		if c.Transport.Conn > 1 && c.Network.Port != 0 {
-			allErrors = append(allErrors, fmt.Errorf("only one connection is allowed when a client port is explicitly set"))
 		}
 	}
 	return writeErr(allErrors)

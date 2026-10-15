@@ -48,6 +48,9 @@ type SendHandle struct {
 	srcPort     uint16
 	time        uint32
 	tsCounter   atomic.Uint32
+	curSeq      atomic.Uint32
+	peerAck     atomic.Uint32
+	peerTS      atomic.Uint32
 	tcpF        tcpF
 	ePool       sync.Pool
 }
@@ -93,7 +96,17 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 		sh.srcIPv6 = cfg.IPv6.Addr.IP
 		sh.srcIPv6RHWA = cfg.IPv6.Router
 	}
+	sh.curSeq.Store(sh.time)
 	return sh, nil
+}
+
+func (h *SendHandle) SetPeerInfo(ack uint32, ts uint32) {
+	if ack > 0 {
+		h.peerAck.Store(ack)
+	}
+	if ts > 0 {
+		h.peerTS.Store(ts)
+	}
 }
 
 func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
@@ -120,7 +133,7 @@ func (h *SendHandle) buildIPv6Header(e *encoder, dstIP net.IP) {
 	}
 }
 
-func (h *SendHandle) buildTCPHeader(e *encoder, dstPort uint16, f conf.TCPF) {
+func (h *SendHandle) buildTCPHeader(e *encoder, dstPort uint16, f conf.TCPF, payloadLen int) {
 	e.tcp = layers.TCP{
 		SrcPort: layers.TCPPort(h.srcPort),
 		DstPort: layers.TCPPort(dstPort),
@@ -147,7 +160,11 @@ func (h *SendHandle) buildTCPHeader(e *encoder, dstPort uint16, f conf.TCPF) {
 			e.tcp.Ack = e.tcp.Seq + 1
 		}
 	} else {
-		tsEcr := tsVal - (counter%200 + 50)
+		peerTS := h.peerTS.Load()
+		tsEcr := peerTS
+		if tsEcr == 0 {
+			tsEcr = tsVal - 50
+		}
 		binary.BigEndian.PutUint32(e.ts[0:4], tsVal)
 		binary.BigEndian.PutUint32(e.ts[4:8], tsEcr)
 		opts = append(opts,
@@ -155,9 +172,20 @@ func (h *SendHandle) buildTCPHeader(e *encoder, dstPort uint16, f conf.TCPF) {
 			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
 			layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: e.ts[:]},
 		)
-		seq := h.time + (counter << 7)
+
+		pLen := uint32(payloadLen)
+		if pLen == 0 {
+			pLen = 1
+		}
+		seq := h.curSeq.Add(pLen) - pLen
 		e.tcp.Seq = seq
-		e.tcp.Ack = seq - (counter & 0x3FF) + 1400
+
+		peerAck := h.peerAck.Load()
+		if peerAck > 0 {
+			e.tcp.Ack = peerAck
+		} else {
+			e.tcp.Ack = seq + 1400
+		}
 	}
 	e.tcp.Options = opts
 }
@@ -172,7 +200,7 @@ func (h *SendHandle) Write(payload []byte, addr *net.UDPAddr) error {
 	dstIP := addr.IP
 	dstPort := uint16(addr.Port)
 
-	h.buildTCPHeader(e, dstPort, h.getClientTCPF(dstIP, dstPort))
+	h.buildTCPHeader(e, dstPort, h.getClientTCPF(dstIP, dstPort), len(payload))
 
 	var ipLayer gopacket.SerializableLayer
 	if dstIP.To4() != nil {
@@ -244,9 +272,9 @@ func (h *SendHandle) WriteControl(addr *net.UDPAddr, f conf.TCPF, seq, ack uint3
 		SrcPort: layers.TCPPort(h.srcPort),
 		DstPort: layers.TCPPort(dstPort),
 		FIN:     f.FIN, SYN: f.SYN, RST: f.RST, PSH: f.PSH, ACK: f.ACK, URG: f.URG, ECE: f.ECE, CWR: f.CWR, NS: f.NS,
-		Window:  65535,
-		Seq:     seq,
-		Ack:     ack,
+		Window: 65535,
+		Seq:    seq,
+		Ack:    ack,
 	}
 
 	counter := h.tsCounter.Add(1)

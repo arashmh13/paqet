@@ -35,13 +35,13 @@ func (t *Transport) setDefaults(role string) {
 func (t *Transport) validate() []error {
 	var errors []error
 
-	validProtocols := []string{"kcp"}
+	validProtocols := []string{"kcp", "stream"}
 	if !slices.Contains(validProtocols, t.Protocol) {
 		errors = append(errors, fmt.Errorf("transport protocol must be one of: %v", validProtocols))
 	}
 
 	if t.Conn < 1 || t.Conn > 256 {
-		errors = append(errors, fmt.Errorf("KCP conn must be between 1-256 connections"))
+		errors = append(errors, fmt.Errorf("transport conn must be between 1-256 connections"))
 	}
 
 	switch t.Protocol {
@@ -50,6 +50,10 @@ func (t *Transport) validate() []error {
 			errors = append(errors, fmt.Errorf("transport.kcp configuration is required"))
 		} else {
 			errors = append(errors, t.KCP.validate()...)
+		}
+	case "stream":
+		if t.Obfs == nil || len(t.Obfs.Key) == 0 {
+			errors = append(errors, fmt.Errorf("transport.obfs.key is required for stream protocol"))
 		}
 	}
 

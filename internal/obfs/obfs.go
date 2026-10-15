@@ -78,6 +78,11 @@ type Conn struct {
 	maxPad int
 
 	recvPool sync.Pool
+
+	replayMu sync.Mutex
+	recent   map[[nonceSize]byte]struct{}
+	ring     [][nonceSize]byte
+	ringIdx  int
 }
 
 // New wraps conn with the obfuscation layer. key is the shared secret that
@@ -111,6 +116,8 @@ func New(conn net.PacketConn, key []byte, maxPad int) (*Conn, error) {
 		PacketConn: conn,
 		aead:       aead,
 		maxPad:     maxPad,
+		recent:     make(map[[nonceSize]byte]struct{}, 16384),
+		ring:       make([][nonceSize]byte, 16384),
 	}
 	c.recvPool.New = func() any {
 		return make([]byte, MaxFrame)
@@ -169,6 +176,15 @@ func (c *Conn) ReadFrom(buf []byte) (int, net.Addr, error) {
 		nonce := tmp[:nonceSize]
 		ciphertext := tmp[nonceSize:n]
 
+		var nonceArr [nonceSize]byte
+		copy(nonceArr[:], nonce)
+		c.replayMu.Lock()
+		if _, seen := c.recent[nonceArr]; seen {
+			c.replayMu.Unlock()
+			continue // Drop replayed packet silently!
+		}
+		c.replayMu.Unlock()
+
 		plain, err := c.aead.Open(ciphertext[:0], nonce, ciphertext, nil)
 		if err != nil {
 			continue
@@ -176,6 +192,16 @@ func (c *Conn) ReadFrom(buf []byte) (int, net.Addr, error) {
 		if len(plain) < lenSize {
 			continue
 		}
+
+		c.replayMu.Lock()
+		if len(c.recent) >= len(c.ring) {
+			oldest := c.ring[c.ringIdx]
+			delete(c.recent, oldest)
+		}
+		c.recent[nonceArr] = struct{}{}
+		c.ring[c.ringIdx] = nonceArr
+		c.ringIdx = (c.ringIdx + 1) % len(c.ring)
+		c.replayMu.Unlock()
 
 		size := int(binary.BigEndian.Uint16(plain[:lenSize]))
 		if size > len(plain)-lenSize || size > len(buf) {
