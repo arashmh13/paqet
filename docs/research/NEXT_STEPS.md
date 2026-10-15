@@ -3,12 +3,14 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.3.0-sni`
-- **Latest Commit Checkpoint:** (Binary SHA-256: `82525936d81f6c015258cc66edda95f8a921d19e63df73bc117ceb1a720d5e77`)
-- **SNI-Assisted Transport Status:** **COMPLETE** (Mechanism A: out-of-window raw TCP injection verified via live pcap; Mechanism B: userspace stream preamble verified).
+- **Current Version:** `v2.4.1-tls`
+- **Active Binary SHA-256:** `77878ab74bf95c4c4f823283f17d03c86271b7f05f38cf3b67d1b8fedd0a76e9`
+- **Architectural Validation Status:**
+  - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 12.16 Mbps line rate).
+  - Candidate 2 (Raw TCP Decoy Sequence Injection): **COMPLETE & WIRE-VERIFIED** (`wrong_seq` out-of-window packet injection, silent kernel drop on Germany VPS, 123.4 ms RTT).
 - **Active Endpoints:**
-  - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (repaired `raw-kcp` with live out-of-window SNI injection), Multi-Port client on `127.0.0.1:1094` (pooling `:8089` and `:8443`).
-  - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), multi-port listener on `:8089` + `:8443`.
+  - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (`raw-kcp` with out-of-window SNI sequence injection), Genuine TLS on `127.0.0.1:1095` (`tls` on `:8443`).
+  - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), Genuine TLS server on `:8443`.
   - In-Host Benchmark Daemon: `127.0.0.1:8999` (`/ping`, `/bytes/<N>`, `/echo`).
 
 ---

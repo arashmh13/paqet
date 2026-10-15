@@ -28,12 +28,24 @@ type Selector struct {
 	HysteresisRatio float64  `yaml:"hysteresis_ratio"`
 }
 
+type TLS struct {
+	Enabled            bool     `yaml:"enabled"`
+	ServerName         string   `yaml:"server_name"`
+	InsecureSkipVerify bool     `yaml:"insecure_skip_verify"`
+	CertFile           string   `yaml:"cert_file"`
+	KeyFile            string   `yaml:"key_file"`
+	CAFile             string   `yaml:"ca_file"`
+	MinVersion         string   `yaml:"min_version"` // "1.2", "1.3"
+	ALPN               []string `yaml:"alpn"`
+}
+
 type Transport struct {
 	Protocol string    `yaml:"protocol"`
 	Conn     int       `yaml:"conn"`
 	KCP      *KCP      `yaml:"kcp"`
 	Obfs     *Obfs     `yaml:"obfs"`
 	SNI      *SNI      `yaml:"sni"`
+	TLS      *TLS      `yaml:"tls"`
 	DNS      *DNS      `yaml:"dns"`
 	Spoof    *Spoof    `yaml:"spoof"`
 	Selector *Selector `yaml:"selector"`
@@ -58,11 +70,26 @@ func (t *Transport) setDefaults(role string) {
 	}
 	t.Obfs.setDefaults(kcpKey)
 
+	if t.Protocol == "tls" || t.Protocol == "tls-stream" {
+		if t.Obfs != nil && len(t.Obfs.Key) == 0 {
+			t.Obfs.Enabled = false
+		}
+	}
+
 	if t.SNI == nil {
 		t.SNI = &SNI{
 			Decoy:  "hcaptcha.com",
 			Preset: "chrome",
 			Method: "wrong_seq",
+		}
+	}
+
+	if t.TLS == nil {
+		t.TLS = &TLS{
+			Enabled:            false,
+			InsecureSkipVerify: true,
+			MinVersion:         "1.3",
+			ALPN:               []string{"h2", "http/1.1"},
 		}
 	}
 }
@@ -74,6 +101,7 @@ func (t *Transport) validate() []error {
 		"kcp", "raw-kcp",
 		"stream", "aead-stream",
 		"sni-assisted",
+		"tls", "tls-stream",
 		"asymmetric-spoof",
 		"dns-asymmetric",
 		"auto",

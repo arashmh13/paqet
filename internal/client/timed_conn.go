@@ -55,6 +55,12 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 			return nil, err
 		}
 		return conn, nil
+	case "tls", "tls-stream":
+		conn, err := stream.DialTLS(target, tc.cfg.Transport.Obfs, tc.cfg.Transport.TLS)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
 	case "auto":
 		// Auto selector: try sni-assisted, then aead-stream, then kcp
 		conn, err := stream.DialSNIAssisted(target, tc.cfg.Transport.Obfs, tc.cfg.Transport.SNI)

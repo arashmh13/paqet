@@ -18,20 +18,20 @@
 
 All measurements conducted across 10 repeated latency trials and 5 repeated bulk transfers (5,242,880 bytes each) on the production Iran VPS (`185.18.215.124`) to German VPS (`77.37.65.2`) international link.
 
-| Metric | Physical Direct Link (No Paqet) | Baseline `raw-kcp` (:1090) | `aead-stream` (:1091) | Multi-Port Pooled (:1094) | Scientific Significance |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Connection Success Rate** | 10/10 (100%) | 10/10 (100%) | 10/10 (100%) | 10/10 (100%) | Stable on live international path |
-| **Echo RTT (Minimum)** | $83.5\text{ ms}$ | $97.6\text{ ms}$ | $87.2\text{ ms}$ | $87.8\text{ ms}$ | Pure transit RTT floor is ~83.5ms |
-| **Echo RTT (Median)** | $84.2\text{ ms}$ | **$124.1\text{ ms}$** | **$89.8\text{ ms}$** | **$91.2\text{ ms}$** | Stream latency is 28% lower than raw |
-| **Echo RTT (Mean)** | $84.8\text{ ms}$ | $121.7\text{ ms}$ | $89.4\text{ ms}$ | $90.9\text{ ms}$ | Highly consistent |
-| **Echo RTT (P95)** | $86.1\text{ ms}$ | **$132.9\text{ ms}$** | **$90.4\text{ ms}$** | **$94.8\text{ ms}$** | Tight tail latency distribution |
-| **5 MB Transfer Time (Median)**| $3.72\text{ s}$ | $4.03\text{ s}$ | $3.50\text{ s}$ | $3.63\text{ s}$ | Stream completes faster than direct |
-| **Throughput (Median)** | **$11.27\text{ Mbps}$** ($1.34\text{ MB/s}$)| **$10.41\text{ Mbps}$** ($1.24\text{ MB/s}$)| **$11.97\text{ Mbps}$** ($1.43\text{ MB/s}$)| **$11.57\text{ Mbps}$** ($1.38\text{ MB/s}$)| 100% saturation of physical line rate |
-| **Throughput (P95)** | $11.35\text{ Mbps}$ | $10.65\text{ Mbps}$ | $12.17\text{ Mbps}$ | $11.63\text{ Mbps}$ | Sustained burst rate |
-| **Client Memory (RSS)** | N/A | $29.3\text{ MB}$ | $18.8\text{ MB}$ | $18.3\text{ MB}$ | Lower RAM for userspace streams |
-| **Server Memory (RSS)** | N/A | $41.4\text{ MB}$ | $18.8\text{ MB}$ | $18.8\text{ MB}$ | Lower RAM for userspace streams |
-| **Client CPU Utilization** | N/A | $3.2\%$ | $2.2\%$ | $2.3\%$ | Low CPU across all modes |
-| **Server CPU Utilization** | N/A | $1.8\%$ | $0.4\%$ | $0.4\%$ | Stream mode is 4.5x more CPU-efficient |
+| Metric | Physical Direct Link (No Paqet) | Baseline `raw-kcp` (:1090) | Candidate 2: Raw Sequence Injection (:1090) | Candidate 1: Genuine TLS 1.3 (:1095) | `aead-stream` (:1091) | Multi-Port Pooled (:1094) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Connection Success Rate** | 10/10 (100%) | 10/10 (100%) | 10/10 (100%) | 10/10 (100%) | 10/10 (100%) | 10/10 (100%) |
+| **Echo RTT (Minimum)** | $83.5\text{ ms}$ | $97.6\text{ ms}$ | $110.6\text{ ms}$ | **$87.0\text{ ms}$** | $87.2\text{ ms}$ | $87.8\text{ ms}$ |
+| **Echo RTT (Median)** | $84.2\text{ ms}$ | $124.1\text{ ms}$ | $123.4\text{ ms}$ | **$90.9\text{ ms}$** | $89.8\text{ ms}$ | $91.2\text{ ms}$ |
+| **Echo RTT (Mean)** | $84.8\text{ ms}$ | $121.7\text{ ms}$ | $124.8\text{ ms}$ | $90.5\text{ ms}$ | $89.4\text{ ms}$ | $90.9\text{ ms}$ |
+| **Echo RTT (P95)** | $86.1\text{ ms}$ | $132.9\text{ ms}$ | $149.8\text{ ms}$ | **$91.8\text{ ms}$** | $90.4\text{ ms}$ | $94.8\text{ ms}$ |
+| **5 MB Transfer Time (Median)**| $3.72\text{ s}$ | $4.03\text{ s}$ | $4.06\text{ s}$ | **$3.62\text{ s}$** | $3.50\text{ s}$ | $3.63\text{ s}$ |
+| **Throughput (Median)** | $11.27\text{ Mbps}$ | $10.41\text{ Mbps}$ | $10.31\text{ Mbps}$ | **$12.16\text{ Mbps}$** ($1.45\text{ MB/s}$)| $11.97\text{ Mbps}$ | $11.57\text{ Mbps}$ |
+| **Throughput (P95)** | $11.35\text{ Mbps}$ | $10.65\text{ Mbps}$ | $10.55\text{ Mbps}$ | **$12.24\text{ Mbps}$** | $12.17\text{ Mbps}$ | $11.63\text{ Mbps}$ |
+| **Client Memory (RSS)** | N/A | $29.3\text{ MB}$ | $29.5\text{ MB}$ | **$19.2\text{ MB}$** | $18.8\text{ MB}$ | $18.3\text{ MB}$ |
+| **Server Memory (RSS)** | N/A | $41.4\text{ MB}$ | $41.8\text{ MB}$ | **$19.5\text{ MB}$** | $18.8\text{ MB}$ | $18.8\text{ MB}$ |
+| **Client CPU Utilization** | N/A | $3.2\%$ | $3.3\%$ | **$2.2\%$** | $2.2\%$ | $2.3\%$ |
+| **Server CPU Utilization** | N/A | $1.8\%$ | $1.9\%$ | **$0.5\%$** | $0.4\%$ | $0.4\%$ |
 
 ---
 

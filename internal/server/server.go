@@ -33,6 +33,12 @@ func (s *Server) Start(ctx context.Context) error {
 		var err error
 
 		switch s.cfg.Transport.Protocol {
+		case "tls", "tls-stream":
+			listener, err = stream.ListenTLS(ep.String(), s.cfg.Transport.Obfs, s.cfg.Transport.TLS)
+			if err != nil {
+				return fmt.Errorf("could not start TLS listener on %s: %w", ep.String(), err)
+			}
+			flog.Infof("server listening for genuine TLS connections on %s", ep.String())
 		case "stream", "aead-stream", "sni-assisted", "auto":
 			listener, err = stream.Listen(ep.String(), s.cfg.Transport.Obfs)
 			if err != nil {

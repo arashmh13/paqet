@@ -16,6 +16,7 @@ const (
 	ModeRawKCP          TransportMode = "raw-kcp"
 	ModeAEADStream      TransportMode = "aead-stream"
 	ModeSNIAssisted     TransportMode = "sni-assisted"
+	ModeTLSStream       TransportMode = "tls-stream"
 	ModeAsymmetricSpoof TransportMode = "asymmetric-spoof"
 	ModeDNSAsymmetric   TransportMode = "dns-asymmetric"
 	ModeAuto            TransportMode = "auto"
