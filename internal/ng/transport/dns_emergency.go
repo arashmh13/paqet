@@ -54,6 +54,69 @@ type BootstrapEndpointData struct {
 	ValidUntil    int64  `json:"valid_until"`
 }
 
+// Validate validates that BootstrapEndpointData meets all cryptographic, network, and validity constraints.
+func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.Duration, allowLoopback bool) error {
+	if b == nil {
+		return errors.New("nil bootstrap endpoint data")
+	}
+
+	// 1. IP validation
+	if b.ServerIP == "" {
+		return errors.New("bootstrap: missing server IP")
+	}
+	ip := net.ParseIP(b.ServerIP)
+	if ip == nil {
+		return fmt.Errorf("bootstrap: invalid server IP format: %q", b.ServerIP)
+	}
+	if ip.IsUnspecified() || ip.IsMulticast() {
+		return fmt.Errorf("bootstrap: disallowed IP address class: %s", b.ServerIP)
+	}
+	if ip.IsLoopback() && !allowLoopback {
+		return fmt.Errorf("bootstrap: loopback IP rejected by production security policy: %s", b.ServerIP)
+	}
+
+	// 2. Port validation
+	if b.TransportPort <= 0 || b.TransportPort > 65535 {
+		return fmt.Errorf("bootstrap: invalid port: %d (must be 1-65535)", b.TransportPort)
+	}
+
+	// 3. Transport mode validation (strict whitelist)
+	switch b.TransportMode {
+	case "raw-kcp", "aead-stream", "tls-outer":
+		// Allowed modes
+	default:
+		return fmt.Errorf("bootstrap: unsupported transport mode: %q (fail-closed rejection)", b.TransportMode)
+	}
+
+	// 4. Timestamp & Validity Window (strictly nonzero and within bounds)
+	if b.ValidUntil <= 0 {
+		return errors.New("bootstrap: missing or zero expiry timestamp (nonzero ValidUntil required for fail-closed recovery)")
+	}
+	nowUnix := now.Unix()
+	if b.ValidUntil < nowUnix {
+		return fmt.Errorf("bootstrap: endpoint coordinates expired at %d (current time %d)", b.ValidUntil, nowUnix)
+	}
+	if maxValidityWindow > 0 {
+		maxFutureUnix := now.Add(maxValidityWindow).Unix()
+		if b.ValidUntil > maxFutureUnix {
+			return fmt.Errorf("bootstrap: expiry timestamp %d exceeds maximum validity window %v (max allowed: %d)",
+				b.ValidUntil, maxValidityWindow, maxFutureUnix)
+		}
+	}
+
+	// 5. Cryptographic Identity Binding
+	if b.TransportMode == "tls-outer" || b.TransportMode == "aead-stream" {
+		if b.ServerPubKey == "" {
+			return fmt.Errorf("bootstrap: missing server public key/certificate identity fingerprint for mode %s", b.TransportMode)
+		}
+		if len(b.ServerPubKey) < 8 {
+			return fmt.Errorf("bootstrap: server public key identity too short: %q", b.ServerPubKey)
+		}
+	}
+
+	return nil
+}
+
 // EmergencyMessage represents an authenticated application datagram exchanged over DNS.
 type EmergencyMessage struct {
 	ID        string `json:"id"`
@@ -107,12 +170,29 @@ type cachedReplyEntry struct {
 	createdAt          time.Time
 }
 
+const (
+	// MaxConcurrentDNSHandlers caps simultaneously running UDP worker goroutines
+	MaxConcurrentDNSHandlers = 128
+	// MaxConcurrentTCPConns caps simultaneously accepted TCP connections
+	MaxConcurrentTCPConns = 32
+	// MaxInFlightWaitersPerSequence limits duplicate callers waiting on the same in-flight sequence
+	MaxInFlightWaitersPerSequence = 16
+)
+
+type inFlightEntry struct {
+	reqSeq             uint32
+	requestFingerprint [32]byte
+	requestID          string
+	doneCh             chan struct{}
+	waitersCount       int32
+}
+
 type serverSessionEntry struct {
 	mu         sync.Mutex // Serializes session replay state and reply cache
 	conn       *AsymmetricConn
 	lastActive time.Time
-	activeOps  int32                    // Ref count of active goroutines; prevents idle eviction during in-flight processing
-	inFlight   map[uint32]chan struct{} // Sequence -> channel for in-flight request single-flighting
+	activeOps  int32                     // Ref count of active goroutines; prevents idle eviction during in-flight processing
+	inFlight   map[uint32]*inFlightEntry // Sequence -> in-flight request tracking
 	replyCache map[uint32]*cachedReplyEntry
 	seqOrder   []uint32 // FIFO order for eviction
 	cacheBytes int      // Current total bytes in replyCache
@@ -148,6 +228,8 @@ type EmergencyDNSServer struct {
 	tcpListener net.Listener
 	reassembler *DNSReassembler
 	sessions    map[uint64]*serverSessionEntry
+	udpSem      chan struct{} // Bounded semaphore for simultaneous UDP packet handlers
+	tcpSem      chan struct{} // Bounded semaphore for simultaneous TCP connections
 	mu          sync.Mutex
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
@@ -193,6 +275,8 @@ func NewEmergencyDNSServer(cfg EmergencyDNSServerConfig) (*EmergencyDNSServer, e
 		tcpListener: tcpListener,
 		reassembler: NewDNSReassembler(30 * time.Second),
 		sessions:    make(map[uint64]*serverSessionEntry),
+		udpSem:      make(chan struct{}, MaxConcurrentDNSHandlers),
+		tcpSem:      make(chan struct{}, MaxConcurrentTCPConns),
 		stopChan:    make(chan struct{}),
 	}
 
@@ -273,13 +357,20 @@ func (s *EmergencyDNSServer) serveUDP() {
 			continue
 		}
 
-		reqPacket := append([]byte(nil), buf[:n]...)
-		go func(pkt []byte, addr net.Addr) {
-			resp := s.processQuery(pkt, normalizedSuffix)
-			if resp != nil {
-				_, _ = s.udpConn.WriteTo(resp, addr)
-			}
-		}(reqPacket, remoteAddr)
+		select {
+		case s.udpSem <- struct{}{}:
+			reqPacket := append([]byte(nil), buf[:n]...)
+			go func(pkt []byte, addr net.Addr) {
+				defer func() { <-s.udpSem }()
+				resp := s.processQuery(pkt, normalizedSuffix)
+				if resp != nil {
+					_, _ = s.udpConn.WriteTo(resp, addr)
+				}
+			}(reqPacket, remoteAddr)
+		default:
+			// Bounded worker pool load shedding: drop packet under flood
+			continue
+		}
 	}
 }
 
@@ -298,33 +389,42 @@ func (s *EmergencyDNSServer) serveTCP() {
 			}
 		}
 
-		go func(c net.Conn) {
-			defer c.Close()
-			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		select {
+		case s.tcpSem <- struct{}{}:
+			go func(c net.Conn) {
+				defer func() {
+					_ = c.Close()
+					<-s.tcpSem
+				}()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 
-			// RFC 7766 TCP DNS: 2-byte prefix length
-			var lenBuf [2]byte
-			if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
-				return
-			}
-			msgLen := binary.BigEndian.Uint16(lenBuf[:])
-			if msgLen < 12 || msgLen > 4096 {
-				return
-			}
+				// RFC 7766 TCP DNS: 2-byte prefix length
+				var lenBuf [2]byte
+				if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+					return
+				}
+				msgLen := binary.BigEndian.Uint16(lenBuf[:])
+				if msgLen < 12 || msgLen > 4096 {
+					return
+				}
 
-			reqBuf := make([]byte, msgLen)
-			if _, err := io.ReadFull(c, reqBuf); err != nil {
-				return
-			}
+				reqBuf := make([]byte, msgLen)
+				if _, err := io.ReadFull(c, reqBuf); err != nil {
+					return
+				}
 
-			resp := s.processQuery(reqBuf, normalizedSuffix)
-			if resp != nil && len(resp) <= 65535 {
-				var outLen [2]byte
-				binary.BigEndian.PutUint16(outLen[:], uint16(len(resp)))
-				_, _ = c.Write(outLen[:])
-				_, _ = c.Write(resp)
-			}
-		}(conn)
+				resp := s.processQuery(reqBuf, normalizedSuffix)
+				if resp != nil && len(resp) <= 65535 {
+					var outLen [2]byte
+					binary.BigEndian.PutUint16(outLen[:], uint16(len(resp)))
+					_, _ = c.Write(outLen[:])
+					_, _ = c.Write(resp)
+				}
+			}(conn)
+		default:
+			_ = conn.Close()
+			continue
+		}
 	}
 }
 
@@ -401,32 +501,61 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 ) []byte {
 	entry.mu.Lock()
 
-	// Wait if another goroutine is currently processing this exact sequence (single-flight)
-	for {
-		waitCh, inFlight := entry.inFlight[reqSeq]
-		if !inFlight {
-			break
-		}
+	// P0 SECURITY REQUIREMENT: Authenticate frame and validate session/seq BEFORE touching in-flight or reply cache!
+	seq, _, plaintext, err := entry.conn.VerifyFrame(fullFrame)
+	if err != nil {
+		// Unauthenticated attacker or corrupt frame! Reject immediately without waiting or leaking!
 		entry.mu.Unlock()
-		select {
-		case <-waitCh:
-		case <-time.After(3 * time.Second):
-			return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
-		}
-		entry.mu.Lock()
+		return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
 	}
 
-	// 1. Check replyCache
-	if cached, ok := entry.replyCache[reqSeq]; ok {
-		// A sequence was found in replyCache.
-		// REQUIREMENT: Must cryptographically verify AEAD authentication and compare fingerprint!
-		_, _, _, err := entry.conn.VerifyFrame(fullFrame)
-		if err != nil {
-			// Unauthenticated attacker or corrupt frame!
+	// 1. Check if this exact sequence is currently in-flight
+	if inflight, inFlight := entry.inFlight[reqSeq]; inFlight {
+		// Unauthenticated packets already rejected above!
+		// Verify fingerprint matches the active in-flight request:
+		if reqDigest != inflight.requestFingerprint {
+			// Sequence reused with different ciphertext or payload! Reject!
 			entry.mu.Unlock()
 			return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
 		}
 
+		// Exact authenticated duplicate of active in-flight request!
+		// Bound simultaneous duplicate waiters
+		if atomic.LoadInt32(&inflight.waitersCount) >= MaxInFlightWaitersPerSequence {
+			entry.mu.Unlock()
+			return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
+		}
+
+		atomic.AddInt32(&inflight.waitersCount, 1)
+		doneCh := inflight.doneCh
+		entry.mu.Unlock()
+
+		select {
+		case <-doneCh:
+		case <-time.After(3 * time.Second):
+			atomic.AddInt32(&inflight.waitersCount, -1)
+			return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+		}
+		atomic.AddInt32(&inflight.waitersCount, -1)
+
+		// Handler has finished! Retrieve sealed response from replyCache
+		entry.mu.Lock()
+		if cached, ok := entry.replyCache[reqSeq]; ok {
+			cachedReply := append([]byte(nil), cached.replyFrame...)
+			entry.lastActive = time.Now()
+			entry.mu.Unlock()
+			resp, err := BuildDNSTXTResponse(reqPacket, cachedReply)
+			if err == nil {
+				return resp
+			}
+			return nil
+		}
+		entry.mu.Unlock()
+		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+	}
+
+	// 2. Check replyCache
+	if cached, ok := entry.replyCache[reqSeq]; ok {
 		if reqDigest != cached.requestFingerprint {
 			// Attacker or client reused seq with different ciphertext/content!
 			// REJECT without invoking handler or leaking cached reply!
@@ -446,20 +575,26 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 		return nil
 	}
 
-	// 2. New sequence for existing session: verify AEAD and update replay window
-	seq, _, plaintext, err := entry.conn.openFrame(fullFrame)
-	if err != nil {
-		// Replay violation (e.g. sequence already seen and evicted from cache) or AEAD failure
-		entry.mu.Unlock()
-		return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
+	// 3. New sequence for existing session: advance anti-replay window
+	if entry.conn.replay != nil {
+		if err := entry.conn.replay.Validate(uint64(seq)); err != nil {
+			// Replay violation (e.g. sequence already seen and evicted from cache)
+			entry.mu.Unlock()
+			return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
+		}
 	}
 
 	// Register in-flight operation
 	doneCh := make(chan struct{})
 	if entry.inFlight == nil {
-		entry.inFlight = make(map[uint32]chan struct{})
+		entry.inFlight = make(map[uint32]*inFlightEntry)
 	}
-	entry.inFlight[reqSeq] = doneCh
+	inflight := &inFlightEntry{
+		reqSeq:             reqSeq,
+		requestFingerprint: reqDigest,
+		doneCh:             doneCh,
+	}
+	entry.inFlight[reqSeq] = inflight
 	entry.lastActive = time.Now()
 	entry.mu.Unlock()
 
@@ -470,7 +605,7 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 		entry.mu.Unlock()
 	}()
 
-	// 3. Schema validation outside lock
+	// 4. Schema validation outside lock
 	var reqMsg EmergencyMessage
 	if err := json.Unmarshal(plaintext, &reqMsg); err != nil {
 		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
@@ -479,7 +614,7 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
 	}
 
-	// 4. Invoke handler outside lock
+	// 5. Invoke handler outside lock
 	var respMsg *EmergencyResponse
 	if s.cfg.Handler != nil {
 		respMsg, err = s.cfg.Handler(&reqMsg)
@@ -502,7 +637,7 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 
 	respPlaintext, _ := json.Marshal(respMsg)
 
-	// 5. Seal response and cache it under session lock
+	// 6. Seal response and cache it under session lock
 	entry.mu.Lock()
 	respSeq := entry.conn.NextSendSeq()
 	respFrame, err := entry.conn.sealFrame(respSeq, seq, respPlaintext)
@@ -596,11 +731,17 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 		}
 	}
 
+	inflight := &inFlightEntry{
+		reqSeq:             reqSeq,
+		requestFingerprint: reqDigest,
+		doneCh:             doneCh,
+	}
+
 	entry = &serverSessionEntry{
 		conn:       candidateConn,
 		lastActive: now,
 		activeOps:  1,
-		inFlight:   map[uint32]chan struct{}{reqSeq: doneCh},
+		inFlight:   map[uint32]*inFlightEntry{reqSeq: inflight},
 		replyCache: make(map[uint32]*cachedReplyEntry),
 	}
 	s.sessions[sessionID] = entry

@@ -19,7 +19,8 @@ type SelectorConfig struct {
 	HealthCheckInterval time.Duration
 	CircuitFailureLimit int
 	CircuitCooldown     time.Duration
-	HysteresisRatio     float64 // Required performance margin to switch (e.g. 0.25 = 25%)
+	HysteresisRatio     float64               // Required performance margin to switch (e.g. 0.25 = 25%)
+	RecoveryEngine      *RecoveryStateMachine // Optional integrated recovery state machine
 }
 
 // StrategySelector dynamically chooses and monitors the most resilient transport strategy.
@@ -96,21 +97,74 @@ func (s *StrategySelector) Mode() TransportMode {
 	return ModeAuto
 }
 
+// SetRecoveryEngine attaches or updates an integrated recovery controller.
+func (s *StrategySelector) SetRecoveryEngine(re *RecoveryStateMachine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.RecoveryEngine = re
+}
+
+// RecoveryEngine returns the attached recovery controller.
+func (s *StrategySelector) RecoveryEngine() *RecoveryStateMachine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.RecoveryEngine
+}
+
 // Dial establishes a session using the best available strategy with automatic resilient fallback.
 func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, error) {
+	s.mu.RLock()
+	re := s.cfg.RecoveryEngine
+	s.mu.RUnlock()
+
+	// 1. If recovery state machine is active and in RECOVERY_READY, use active recovery endpoint for new connections
+	if re != nil && re.CurrentState() == StateRecoveryReady {
+		recovAddr := re.ActiveEndpoint()
+		if recovAddr != "" {
+			s.mu.RLock()
+			cur := s.current
+			candidates := make([]Strategy, len(s.cfg.Candidates))
+			copy(candidates, s.cfg.Candidates)
+			s.mu.RUnlock()
+
+			// Try current strategy with the verified recovery endpoint address
+			if cur != nil {
+				sess, err := cur.Dial(ctx, recovAddr)
+				if err == nil {
+					return sess, nil
+				}
+			}
+			// Try other candidates with the recovery address
+			for _, strat := range candidates {
+				if strat != cur {
+					sess, err := strat.Dial(ctx, recovAddr)
+					if err == nil {
+						s.mu.Lock()
+						s.current = strat
+						s.mu.Unlock()
+						return sess, nil
+					}
+				}
+			}
+		}
+	}
+
 	s.mu.Lock()
 	candidates := make([]Strategy, len(s.cfg.Candidates))
 	copy(candidates, s.cfg.Candidates)
 	cur := s.current
 	s.mu.Unlock()
 
-	// 1. Try current best strategy first
+	// 2. Try current best strategy first
 	if cur != nil && s.isEligible(cur) {
 		sess, err := cur.Dial(ctx, addr)
 		if err == nil {
 			s.mu.Lock()
 			s.lastSuccessMode = cur.Mode()
 			s.mu.Unlock()
+			if re != nil {
+				re.ReportPrimarySuccess()
+			}
 			return sess, nil
 		}
 		s.recordFailure(cur, err)
@@ -119,7 +173,7 @@ func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, erro
 		s.mu.Unlock()
 	}
 
-	// 2. Fall back to other eligible strategies in order of resilience
+	// 3. Fall back to other eligible strategies in order of resilience
 	for _, strat := range candidates {
 		if cur != nil && strat == cur {
 			continue // Already tried this candidate
@@ -135,6 +189,9 @@ func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, erro
 			s.lastSwitch = time.Now()
 			s.lastSuccessMode = strat.Mode()
 			s.mu.Unlock()
+			if re != nil {
+				re.ReportPrimarySuccess()
+			}
 			return sess, nil
 		}
 		s.recordFailure(strat, err)
@@ -143,7 +200,21 @@ func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, erro
 		s.mu.Unlock()
 	}
 
+	// All primary strategies failed! Report failure to recovery state machine
+	if re != nil {
+		re.ReportPrimaryFailure(ErrNoEligibleStrategy)
+		// Trigger an evaluation step of the recovery lifecycle
+		_, _ = re.Step(ctx)
+	}
+
 	return nil, ErrNoEligibleStrategy
+}
+
+// ResetCooldowns clears active circuit cooldowns across all candidate strategies.
+func (s *StrategySelector) ResetCooldowns() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cooldowns = make(map[string]time.Time)
 }
 
 func (s *StrategySelector) isEligible(strat Strategy) bool {

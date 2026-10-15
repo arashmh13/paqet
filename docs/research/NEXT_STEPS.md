@@ -3,13 +3,14 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.5.3-recovery`
-- **Active Binary SHA-256:** `a2bb1208eab3edd9ecadc9e0334158415dba8bf538f55a53f520a3ce8167f216`
+- **Current Version:** `v2.5.4-failclosed`
+- **Active Binary SHA-256:** `8845f43d9b813ff383bbf8e1ca457df797ea6ad52ced417ea2bfed80e143cc8e`
 - **Architectural Validation Status:**
   - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 11.60 Mbps line rate, CA certificate validation verified).
   - Candidate 2 (Raw TCP Decoy Sequence Injection): **COMPLETE & WIRE-VERIFIED** (`wrong_seq` out-of-window packet injection, silent kernel drop on Germany VPS, 123.4 ms RTT).
   - Asymmetric Directional Decoupling (`AsymmetricConn`): **COMPLETE & HARDENED** (independent `UpstreamSender` and `DownstreamReceiver` channels, AAD header authentication, sequence exhaustion protection, RTO retransmission queue, and memory bounds).
   - DNS-Asymmetric Transport: **OPERATIONAL & PUBLICLY VERIFIED** (Live public recursive DNS TXT traversal across Iranian border via Google `8.8.8.8`, Cloudflare `1.1.1.1`, and Quad9 `9.9.9.9` to Germany authoritative daemon `77.37.65.2:53` in $136.9 - 242.4\text{ ms}$; verified arbitrary multi-payload exchange and conventional port-blockade survival).
+  - Phase 12 Fail-Closed Recovery & Resource-Exhaustion Defense: **COMPLETE & LIVE-VERIFIED** (Fail-closed candidate validation requiring valid cryptographic identity and strict future validity window; generation tokens preventing stale asynchronous callbacks from overriding newer primary health or rollback states; authoritative DNS bounded worker semaphores capping concurrent handlers to 128 UDP / 32 TCP; pre-authentication gating preventing unauthenticated packets from occupying in-flight duplicate capacity; real `StrategySelector` integration for new connections; live cross-border application HTTP recovery test verified with byte-exact payload delivery).
   - Phase 11 Reply-Cache Security & Concurrency Safety: **COMPLETE & ADVERSARIALLY VERIFIED** (Eradicated unauthenticated reply-cache lookup defect; enforced `VerifyFrame` AEAD validation + 32-byte SHA-256 request fingerprint matching on cached replies; eliminated first-session race conditions via atomic candidate commit; serialized session replay/cache operations under per-session mutex; implemented single-flight duplicate request coordination; protected in-flight sessions from idle eviction with `activeOps` refcount; tested under Go race detector with zero data races).
   - Deterministic Benchmark Analysis & Statistical Reconciliation: **COMPLETE & DOCUMENTED** (`internal/ng/dns/benchmark_analysis.go` implemented and tested; Hyndman-Fan Type 7 linear interpolation reconciled Quad9 P95 metric anomaly at $1259.31\text{ ms}$; decoupled successful RTT from timeout elapsed times).
   - Dual-Authoritative Nameserver Redundancy Testing: **VERIFIED LOCALLY** (`dns_redundancy_test.go` tested cross-server retries, replays, and proved why multipart queries fail across uncoordinated server pools; single-query datagrams $\le 35\text{B}$ established as stateless protocol requirement).

@@ -823,3 +823,116 @@ func TestConcurrentDuplicatesWithHandlerDelay(t *testing.T) {
 		t.Fatalf("Expected %d successful responses, got %d", concurrency, atomic.LoadInt32(&successCount))
 	}
 }
+
+func TestUnauthenticatedPacketCannotJoinInFlightWaiters(t *testing.T) {
+	domainSuffix := "tunnel.emergency.local"
+	psk := []byte("emergency-psk-32-bytes-super-key")
+
+	handlerEntered := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	var handlerInvocations int32
+
+	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          psk,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			atomic.AddInt32(&handlerInvocations, 1)
+			close(handlerEntered)
+			<-handlerRelease // Pause inside handler so sequence is actively in-flight
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				Reply:     []byte("SLOW_AUTHENTICATED_REPLY"),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
+	}
+	defer server.Stop()
+
+	sessionID := uint64(0x778899AABBCCDDEE)
+	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	if err != nil {
+		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
+	}
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", server.Addr().String())
+	clientUDP, _ := net.ListenUDP("udp", nil)
+	defer clientUDP.Close()
+
+	// 1. Send legitimate initial request (seq=1)
+	msg := &EmergencyMessage{
+		ID:        "msg-inflight-001",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("Legit In Flight Payload"),
+		Timestamp: time.Now().Unix(),
+	}
+	rawMsg, _ := json.Marshal(msg)
+	legitFrame, _ := clientConn.sealFrame(1, 0, rawMsg)
+
+	qnameLegit := EncodeDNSQName(domainSuffix, "c01", 5001, 0, 1, legitFrame)
+	pktLegit := BuildDNSQuery(qnameLegit, 0x0010, 0x1001)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = clientUDP.WriteToUDP(pktLegit, udpAddr)
+	}()
+
+	// Wait until handler is actively running and seq=1 is in-flight
+	<-handlerEntered
+
+	// 2. Attack: Send unauthenticated / tampered packet targeting seq=1 while it is in flight
+	attackerUDP, _ := net.ListenUDP("udp", nil)
+	defer attackerUDP.Close()
+
+	tamperedFrame := append([]byte(nil), legitFrame...)
+	tamperedFrame[len(tamperedFrame)-3] ^= 0xEE // Corrupt AEAD tag
+
+	qnameTampered := EncodeDNSQName(domainSuffix, "c01", 5002, 0, 1, tamperedFrame)
+	pktTampered := BuildDNSQuery(qnameTampered, 0x0010, 0x6666)
+
+	t0 := time.Now()
+	_, _ = attackerUDP.WriteToUDP(pktTampered, udpAddr)
+
+	bufAttacker := make([]byte, 2048)
+	_ = attackerUDP.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	nAttacker, _, err := attackerUDP.ReadFrom(bufAttacker)
+	elapsedAttacker := time.Since(t0)
+
+	if err != nil {
+		t.Fatalf("Attacker read failed: %v", err)
+	}
+	// Attacker must be rejected with REFUSED (5) IMMEDIATELY! Must NOT wait for handlerRelease!
+	if elapsedAttacker > 200*time.Millisecond {
+		t.Fatalf("Security failure: unauthenticated packet was blocked waiting on in-flight channel (%v)!", elapsedAttacker)
+	}
+	if bufAttacker[3]&0x0F != 5 {
+		t.Fatalf("Expected REFUSED (5) for unauthenticated frame targeting in-flight sequence, got RCODE %d", bufAttacker[3]&0x0F)
+	}
+	_ = nAttacker
+
+	// 3. Release handler
+	close(handlerRelease)
+	wg.Wait()
+
+	// Read legitimate client reply
+	bufClient := make([]byte, 2048)
+	_ = clientUDP.SetReadDeadline(time.Now().Add(2 * time.Second))
+	nClient, _, err := clientUDP.ReadFrom(bufClient)
+	if err != nil {
+		t.Fatalf("Legitimate client read failed: %v", err)
+	}
+	if bufClient[3]&0x0F != 0 {
+		t.Fatalf("Expected NOERROR for legitimate query, got %d", bufClient[3]&0x0F)
+	}
+	_ = nClient
+
+	if atomic.LoadInt32(&handlerInvocations) != 1 {
+		t.Fatalf("Expected 1 handler invocation, got %d", atomic.LoadInt32(&handlerInvocations))
+	}
+}

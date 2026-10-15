@@ -124,3 +124,45 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   5. Implemented single-flight request coordination: `entry.inFlight[reqSeq]` blocks concurrent duplicate requests until the active handler completes, ensuring the handler is invoked strictly once.
   6. Added `activeOps` atomic refcount: sessions actively handling in-flight requests are protected from premature eviction by `evictIdleSessionsLocked`.
   7. Regression-tested under `go test -race` with 25 simultaneous first packets (`TestConcurrentFirstPacketsSameSession`) and delayed handler duplicates (`TestConcurrentDuplicatesWithHandlerDelay`). Zero data races detected.
+
+---
+
+## 8. Fail-Closed Endpoint Recovery, DNS Resource Defense & Selector Integration (Phase 12)
+
+### 8.1 Fail-Closed Endpoint Recovery Verification
+- **Vulnerability Remediated:** Previously, if `CandidateValidator` was nil in `RecoveryStateMachineConfig`, `Step()` bypassed validation and promoted unverified candidate endpoints to `RECOVERY_READY`. In addition, zero-value `ValidUntil` timestamps were tolerated.
+- **Fail-Closed Policy Implemented:**
+  1. `CandidateValidator` is strictly required. If absent, the state machine fails closed immediately with `ErrMissingCandidateValidator` and enters `COOLDOWN`.
+  2. `BootstrapEndpointData.Validate(...)` enforces:
+     * Nonzero, positive `ValidUntil` timestamp strictly greater than current time.
+     * Maximum future validity bound (`MaxBootstrapValidityWindow`, default 24 hours).
+     * Strict whitelist of transport modes (`"raw-kcp"`, `"aead-stream"`, `"tls-outer"`).
+     * Cryptographic identity binding: `"tls-outer"` and `"aead-stream"` require non-empty `ServerPubKey` (pinned public key or certificate fingerprint).
+     * Disallowed IP address classes (unspecified `0.0.0.0`, multicast, and loopback in production).
+  3. Tested via `TestRecoveryStateMachine_MissingValidatorFailClosed`, `TestRecoveryStateMachine_ZeroOrMissingExpiryFailClosed`, `TestRecoveryStateMachine_DistantExpiryRejected`, `TestRecoveryStateMachine_UnsupportedTransportModeRejected`, and `TestRecoveryStateMachine_MissingCryptographicIdentityRejected`.
+
+### 8.2 Asynchronous Operation Invalidation via Generation Tokens
+- **Vulnerability Remediated:** If `EmergencyDialer` or `CandidateValidator` ran asynchronously and paused on a network socket, a concurrent `ReportPrimarySuccess()` or `ResetRollback()` could revert the state to `PRIMARY_HEALTHY`. Upon returning, the stale callback would overwrite the healthy state and activate the candidate endpoint!
+- **Remediation:**
+  1. Added `currentGeneration uint64` revision counter to `RecoveryStateMachine`.
+  2. `currentGeneration` is monotonically incremented on every state transition, rollback, or primary health recovery.
+  3. Before launching unlocked external network calls, `startGen := sm.currentGeneration` is recorded.
+  4. Upon re-acquiring the mutex, if `sm.currentGeneration != startGen`, the result is discarded with `ErrStaleRecoveryOperation` without activating endpoints.
+  5. Tested via `TestRecoveryStateMachine_StaleAsyncDialerDiscardedOnPrimaryRecovery` and `TestRecoveryStateMachine_StaleCandidateValidatorDiscardedOnRollback`.
+
+### 8.3 DNS Server Resource-Exhaustion Defense
+- **Bounded Worker Semaphores:**
+  * Replaced unbounded goroutine creation in `serveUDP()` with a buffered semaphore channel `udpSem chan struct{}` (capacity `MaxConcurrentDNSHandlers = 128`). Packets arriving when workers are saturated are dropped gracefully without memory expansion.
+  * Bounded simultaneous TCP connections with `tcpSem chan struct{}` (capacity `MaxConcurrentTCPConns = 32`). Excess connections are closed immediately.
+- **Pre-Authentication Gating on In-Flight Waiters:**
+  * In `processExistingSessionQuery`, `entry.conn.VerifyFrame(fullFrame)` is executed **before** checking `inFlight` maps.
+  * Forged or corrupted packets targeting an active sequence are rejected immediately with `REFUSED (5)` in $< 1\text{ ms}$ without waiting or occupying worker channels.
+  * Simultaneous duplicate waiters capped at `MaxInFlightWaitersPerSequence = 16`.
+  * Verified via `TestUnauthenticatedPacketCannotJoinInFlightWaiters`.
+
+### 8.4 StrategySelector Integration
+- Connected `RecoveryStateMachine` to `StrategySelector` (`internal/ng/transport/selector.go`):
+  * When healthy, dials update `re.ReportPrimarySuccess()`.
+  * When primary dials fail, `re.ReportPrimaryFailure(err)` and `re.Step(ctx)` are triggered.
+  * When `re.CurrentState() == StateRecoveryReady`, new connections use `re.ActiveEndpoint()`.
+  * Verified via `TestRecoverySelectorIntegration_EndToEndFailover`.

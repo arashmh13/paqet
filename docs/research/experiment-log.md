@@ -479,3 +479,36 @@
        * Cleaned up test firewall rules and restored state (`PRIMARY_HEALTHY`).
        * Production SOCKS5 proxy on `127.0.0.1:1090` remained completely healthy and undisturbed ($0.163\text{ s}$, HTTP 200).
 - **Outcome:** Reply cache fully hardened against spoofed sequence probes; session establishment concurrency-safe; statistical analysis reconciled; dual-server redundancy requirements proven; recovery state machine verified end-to-end. Production services healthy and rollback-ready.
+
+---
+
+## Cycle 20: Phase 12 Fail-Closed Recovery, Inbound DNS Resource Defense, StrategySelector Integration, and Live Application HTTP Recovery
+- **Objective:** Eliminate fail-open candidate activation; require valid nonzero expiry and cryptographic identity binding; protect asynchronous recovery callbacks with generation tokens; bound DNS inbound workers (UDP/TCP); gate in-flight duplicate waiting behind cryptographic authentication; integrate `RecoveryStateMachine` with `StrategySelector` for new connections; validate end-to-end recovery live with byte-exact application HTTP delivery while primary test path is blocked.
+- **Actions:**
+  1. Enforced Fail-Closed Endpoint Recovery:
+     - In `internal/ng/transport/recovery_state_machine.go`, made `CandidateValidator` strictly mandatory. If nil, `Step()` fails closed with `ErrMissingCandidateValidator` and enters `COOLDOWN`.
+     - In `BootstrapEndpointData.Validate(...)`, enforced nonzero `ValidUntil > now.Unix()`, bounded future validity (`MaxBootstrapValidityWindow <= 24h`), whitelisted transport modes (`"raw-kcp"`, `"aead-stream"`, `"tls-outer"`), and required cryptographic identity `ServerPubKey` for secure modes.
+     - Added adverse-condition unit tests covering missing validator, zero expiry, distant expiry, unsupported modes, and missing identity.
+  2. Implemented Generation-Token Asynchronous Invalidation:
+     - Added `currentGeneration uint64` to `RecoveryStateMachine`, incremented monotonically on every state transition, rollback, or primary recovery.
+     - Captured generation before unlocked network calls (`EmergencyDialer`, `CandidateValidator`). Re-verified generation upon re-locking mutex.
+     - Confirmed that concurrent `ReportPrimarySuccess()` or `ResetRollback()` supersedes pending async callbacks (`ErrStaleRecoveryOperation`), discarding stale candidates.
+     - Added single-operation concurrency gating (`operationActive bool`) rejecting concurrent `Step()` calls (`ErrRecoveryOperationActive`).
+  3. Bounded Authoritative DNS Workers & Gated In-Flight Waiters:
+     - In `internal/ng/transport/dns_emergency.go`, added buffered semaphore channels `udpSem chan struct{}` (128 capacity) and `tcpSem chan struct{}` (32 capacity). Dropped excess UDP packets under flood without memory growth.
+     - In `processExistingSessionQuery`, reordered checks so `entry.conn.VerifyFrame(fullFrame)` runs **before** touching `inFlight` or `replyCache`.
+     - Forged or tampered packets targeting an active sequence are rejected immediately with `REFUSED (5)` in $< 1\text{ ms}$ without occupying waiter slots. Capped simultaneous duplicate waiters at 16. Verified via `TestUnauthenticatedPacketCannotJoinInFlightWaiters`.
+  4. Integrated Recovery with `StrategySelector`:
+     - Added `RecoveryEngine *RecoveryStateMachine` to `SelectorConfig` and methods `SetRecoveryEngine`/`RecoveryEngine`.
+     - Connected `Dial()`: successful primary dials report success; failure crosses threshold and steps recovery engine; when in `RECOVERY_READY`, new connections use `re.ActiveEndpoint()`.
+     - Verified via `TestRecoverySelectorIntegration_EndToEndFailover`.
+  5. Built and Deployed Release `v2.5.4-failclosed`:
+     - WSL build: SHA-256 `8845f43d9b813ff383bbf8e1ca457df797ea6ad52ced417ea2bfed80e143cc8e`.
+     - Deployed to both VPS nodes. Backups preserved in `/opt/paqet/backup-candidate5/paqet`.
+  6. Live Cross-Border Application HTTP Recovery Validation:
+     - Primary test HTTP service on Germany port 18088 (`PRIMARY_TEST_HTTP_200`); recovery HTTP service on port 18089 (`{"status":"RECOVERY_CANDIDATE_HTTP_VERIFIED","token":"8ca6632a150dfa9f"}`).
+     - Blocked egress port 18088 on Iran VPS (`TIMEOUT_BLOCKED`).
+     - Dispatched emergency DNS request to Google `8.8.8.8:53` (ACK in $207.6\text{ ms}$).
+     - Executed candidate HTTP request on recovery port 18089: retrieved byte-exact payload `{"status":"RECOVERY_CANDIDATE_HTTP_VERIFIED","token":"8ca6632a150dfa9f"}`!
+     - Rolled back test rules. Production SOCKS5 proxy on `127.0.0.1:1090` remained completely unaffected throughout test ($0.145\text{ s}$, HTTP 200).
+- **Outcome:** Fail-closed endpoint recovery, generation token invalidation, DNS resource bounds, and real `StrategySelector` integration verified end-to-end. Production services healthy and rollback-ready.

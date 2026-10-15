@@ -99,3 +99,35 @@ Executed live across Iran VPS (`185.18.215.124`) and Germany VPS (`77.37.65.2`):
   7. `PRIMARY_HEALTHY` $\longrightarrow$ Rollback completed, test rule removed, test listeners stopped.
   8. Production SOCKS5 proxy on `127.0.0.1:1090` remained healthy ($0.163\text{ s}$, HTTP 200).
 - Preserved audit log in `docs/research/recovery_state_machine_live_run.json`.
+
+---
+
+## 5. Phase 12 Fail-Closed Recovery, Generation Invalidation & Live HTTP Application Recovery
+
+### 5.1 Fail-Closed Regression Suite
+- `TestRecoveryStateMachine_MissingValidatorFailClosed`: Confirmed that when `CandidateValidator == nil`, the recovery engine rejects failover with `ErrMissingCandidateValidator` and enters `COOLDOWN`. Active endpoint remains empty.
+- `TestRecoveryStateMachine_ZeroOrMissingExpiryFailClosed`: Confirmed that a zero `ValidUntil` timestamp causes immediate fail-closed rejection (`ErrInvalidBootstrapData`).
+- `TestRecoveryStateMachine_DistantExpiryRejected`: Confirmed that timestamps exceeding the 24-hour future window are rejected.
+- `TestRecoveryStateMachine_UnsupportedTransportModeRejected`: Confirmed that unknown transport modes are rejected without defaulting.
+- `TestRecoveryStateMachine_MissingCryptographicIdentityRejected`: Confirmed that secure transports missing public key/certificate identities are rejected.
+
+### 5.2 Concurrency Generation Token Invalidation Tests
+- `TestRecoveryStateMachine_StaleAsyncDialerDiscardedOnPrimaryRecovery`: Paused `EmergencyDialer` in-flight while another goroutine reported primary success (`ReportPrimarySuccess()`). When the dialer unblocked, the state machine detected the generation change, returned `ErrStaleRecoveryOperation`, preserved `PRIMARY_HEALTHY`, and discarded the stale candidate.
+- `TestRecoveryStateMachine_StaleCandidateValidatorDiscardedOnRollback`: Paused `CandidateValidator` in-flight while `ResetRollback()` was called. When validator unblocked, state machine detected generation mismatch, discarded the result, and kept active endpoint empty.
+- `TestRecoveryStateMachine_ConcurrentStepOperations`: Confirmed that concurrent calls to `Step()` are rejected with `ErrRecoveryOperationActive`.
+
+### 5.3 Authoritative DNS Flood & In-Flight Attack Defense
+- `TestUnauthenticatedPacketCannotJoinInFlightWaiters`: An attacker sending an unauthenticated frame targeting an active in-flight sequence was rejected immediately with `REFUSED (5)` in $< 1\text{ ms}$ without waiting or occupying worker slots.
+
+### 5.4 Live Cross-Border Application HTTP Recovery Validation
+Conducted live cross-border validation across Iran VPS (`185.18.215.124`) and Germany VPS (`77.37.65.2`):
+- **Primary Test Service:** Port 18088 returning `PRIMARY_TEST_HTTP_200`.
+- **Candidate Recovery Service:** Port 18089 returning `{"status":"RECOVERY_CANDIDATE_HTTP_VERIFIED","token":"8ca6632a150dfa9f"}`.
+- **Execution Flow:**
+  1. Baseline check: Iran VPS curls `77.37.65.2:18088` $\longrightarrow$ `PRIMARY_TEST_HTTP_200`.
+  2. Failure injection: Egress port 18088 dropped via isolated iptables rule on Iran VPS (`TIMEOUT_BLOCKED`).
+  3. Emergency signaling: Dispatched authenticated DNS query to Google `8.8.8.8:53`. Received ACK in $207.6\text{ ms}$.
+  4. Candidate HTTP fetch: Performed HTTP fetch through candidate endpoint `77.37.65.2:18089`. Received byte-exact payload:
+     `{"status":"RECOVERY_CANDIDATE_HTTP_VERIFIED","token":"8ca6632a150dfa9f"}`!
+  5. Teardown & Rollback: Removed temporary test rule on Iran VPS; stopped test units on Germany.
+  6. Production SOCKS5 proxy on `127.0.0.1:1090` remained active and unaffected ($0.145\text{ s}$, HTTP 200).

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"sync"
 	"time"
 )
@@ -23,12 +22,22 @@ const (
 	StateCooldown                    RecoveryState = "COOLDOWN"
 )
 
+const (
+	// MaxRecoveryHistoryEvents bounds the circular audit trail to prevent memory leaks
+	MaxRecoveryHistoryEvents = 256
+	// DefaultMaxBootstrapValidityWindow limits maximum validity window into the future (24 hours)
+	DefaultMaxBootstrapValidityWindow = 24 * time.Hour
+)
+
 var (
-	ErrStaleBootstrapData   = errors.New("recovery: bootstrap endpoint coordinates have expired")
-	ErrInvalidBootstrapData = errors.New("recovery: invalid bootstrap endpoint fields")
-	ErrCandidateValidation  = errors.New("recovery: candidate endpoint failed authenticated validation handshake")
-	ErrSignalingFailed      = errors.New("recovery: emergency DNS signaling channel failed")
-	ErrCooldownActive       = errors.New("recovery: recovery engine is in cooldown backoff")
+	ErrStaleBootstrapData        = errors.New("recovery: bootstrap endpoint coordinates have expired")
+	ErrInvalidBootstrapData      = errors.New("recovery: invalid bootstrap endpoint fields")
+	ErrCandidateValidation       = errors.New("recovery: candidate endpoint failed authenticated validation handshake")
+	ErrMissingCandidateValidator = errors.New("recovery: candidate validator required for fail-closed recovery; cannot activate unvalidated endpoint")
+	ErrSignalingFailed           = errors.New("recovery: emergency DNS signaling channel failed")
+	ErrCooldownActive            = errors.New("recovery: recovery engine is in cooldown backoff")
+	ErrRecoveryOperationActive   = errors.New("recovery: recovery operation already in progress")
+	ErrStaleRecoveryOperation    = errors.New("recovery: stale asynchronous recovery operation superseded by state change or rollback")
 )
 
 // StateTransitionEvent records historical state movements for telemetry and auditability.
@@ -45,21 +54,25 @@ type RecoveryStateMachineConfig struct {
 	DegradedTimeout            time.Duration // Time in DEGRADED before initiating EMERGENCY_SIGNALING (e.g. 2s)
 	BootstrapValidationTimeout time.Duration // Time limit for independent candidate validation (e.g. 4s)
 	CooldownDuration           time.Duration // Cooldown duration after failure before retrying (e.g. 15s)
+	MaxBootstrapValidityWindow time.Duration // Maximum future validity window (default 24h)
+	AllowLoopbackEndpoints     bool          // For local unit tests only; false in production
 	EmergencyDialer            func(ctx context.Context, msg *EmergencyMessage) (*BootstrapEndpointData, error)
 	CandidateValidator         func(ctx context.Context, endpoint *BootstrapEndpointData) error
 }
 
-// RecoveryStateMachine implements the controlled, non-flapping recovery lifecycle.
+// RecoveryStateMachine implements the controlled, non-flapping, fail-closed recovery lifecycle.
 type RecoveryStateMachine struct {
-	cfg              RecoveryStateMachineConfig
-	mu               sync.RWMutex
-	state            RecoveryState
-	consecutiveFails int
-	lastTransition   time.Time
-	cooldownExpiry   time.Time
-	activeEndpoint   string
-	lastBootstrap    *BootstrapEndpointData
-	history          []StateTransitionEvent
+	cfg               RecoveryStateMachineConfig
+	mu                sync.RWMutex
+	state             RecoveryState
+	consecutiveFails  int
+	lastTransition    time.Time
+	cooldownExpiry    time.Time
+	activeEndpoint    string
+	lastBootstrap     *BootstrapEndpointData
+	history           []StateTransitionEvent
+	currentGeneration uint64 // Incremented on state changes, rollback, or primary recovery to detect stale async results
+	operationActive   bool   // Enforces strictly one concurrent Step() recovery attempt per machine
 }
 
 // NewRecoveryStateMachine instantiates a recovery engine starting in StatePrimaryHealthy.
@@ -75,6 +88,9 @@ func NewRecoveryStateMachine(cfg RecoveryStateMachineConfig) *RecoveryStateMachi
 	}
 	if cfg.CooldownDuration <= 0 {
 		cfg.CooldownDuration = 15 * time.Second
+	}
+	if cfg.MaxBootstrapValidityWindow <= 0 {
+		cfg.MaxBootstrapValidityWindow = DefaultMaxBootstrapValidityWindow
 	}
 
 	sm := &RecoveryStateMachine{
@@ -100,6 +116,13 @@ func (sm *RecoveryStateMachine) ActiveEndpoint() string {
 	return sm.activeEndpoint
 }
 
+// CurrentGeneration returns the current state revision generation.
+func (sm *RecoveryStateMachine) CurrentGeneration() uint64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.currentGeneration
+}
+
 // History returns a copy of state transition events for audit reporting.
 func (sm *RecoveryStateMachine) History() []StateTransitionEvent {
 	sm.mu.RLock()
@@ -112,6 +135,10 @@ func (sm *RecoveryStateMachine) History() []StateTransitionEvent {
 func (sm *RecoveryStateMachine) recordTransitionLocked(from, to RecoveryState, reason string) {
 	sm.state = to
 	sm.lastTransition = time.Now()
+	sm.currentGeneration++
+	if len(sm.history) >= MaxRecoveryHistoryEvents {
+		sm.history = sm.history[1:]
+	}
 	sm.history = append(sm.history, StateTransitionEvent{
 		FromState: from,
 		ToState:   to,
@@ -126,7 +153,9 @@ func (sm *RecoveryStateMachine) ReportPrimarySuccess() {
 	defer sm.mu.Unlock()
 
 	sm.consecutiveFails = 0
-	if sm.state == StatePrimaryDegraded {
+	if sm.state == StatePrimaryDegraded || sm.state == StateEmergencySignaling || sm.state == StateCandidateEndpointValidating {
+		sm.currentGeneration++
+		sm.activeEndpoint = ""
 		sm.recordTransitionLocked(sm.state, StatePrimaryHealthy, "primary traffic verified healthy; hysteresis recovered")
 	}
 }
@@ -147,6 +176,15 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// 1. Enforce strictly one recovery operation active per machine
+	if sm.operationActive {
+		return sm.state, ErrRecoveryOperationActive
+	}
+	sm.operationActive = true
+	defer func() {
+		sm.operationActive = false
+	}()
+
 	now := time.Now()
 
 	switch sm.state {
@@ -158,13 +196,26 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 			// Hysteresis window: remain in DEGRADED to allow transient recovery
 			return StatePrimaryDegraded, nil
 		}
+
+		// P0 FAIL-CLOSED REQUIREMENT: Candidate validator MUST be configured!
+		if sm.cfg.CandidateValidator == nil {
+			sm.recordTransitionLocked(StatePrimaryDegraded, StateRecoveryFailed, "fail-closed: candidate validator required for recovery but not configured")
+			sm.enterCooldownLocked("missing candidate validator")
+			return StateCooldown, ErrMissingCandidateValidator
+		}
+
 		// Degraded timeout elapsed: trigger emergency signaling
 		sm.recordTransitionLocked(StatePrimaryDegraded, StateEmergencySignaling, "degraded timeout elapsed; requesting bootstrap failover via emergency DNS")
 		fallthrough
 
 	case StateEmergencySignaling:
+		if sm.cfg.CandidateValidator == nil {
+			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, "fail-closed: missing candidate validator")
+			sm.enterCooldownLocked("missing candidate validator")
+			return StateCooldown, ErrMissingCandidateValidator
+		}
 		if sm.cfg.EmergencyDialer == nil {
-			sm.recordTransitionLocked(StateEmergencySignaling, StateRecoveryFailed, "no emergency dialer configured")
+			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, "no emergency dialer configured")
 			sm.enterCooldownLocked("missing emergency dialer")
 			return StateCooldown, ErrSignalingFailed
 		}
@@ -176,10 +227,17 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 			Timestamp: now.Unix(),
 		}
 
+		startGen := sm.currentGeneration
+
 		// Unlock mutex during external network signaling call
 		sm.mu.Unlock()
 		endpoint, err := sm.cfg.EmergencyDialer(ctx, req)
 		sm.mu.Lock()
+
+		// Stale operation check: verify generation has not advanced while network call was in flight
+		if sm.currentGeneration != startGen || sm.state != StateEmergencySignaling {
+			return sm.state, ErrStaleRecoveryOperation
+		}
 
 		if err != nil {
 			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("emergency signaling query failed: %v", err))
@@ -187,41 +245,40 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 			return StateCooldown, fmt.Errorf("%w: %v", ErrSignalingFailed, err)
 		}
 
-		// Validate received bootstrap data schema and freshness
-		if endpoint == nil || endpoint.ServerIP == "" || endpoint.TransportPort <= 0 || endpoint.TransportPort > 65535 {
-			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, "malformed bootstrap endpoint payload")
-			sm.enterCooldownLocked("malformed bootstrap payload")
-			return StateCooldown, ErrInvalidBootstrapData
+		// Validate received bootstrap data schema, freshness, and cryptographic identity
+		maxWindow := sm.cfg.MaxBootstrapValidityWindow
+		if maxWindow <= 0 {
+			maxWindow = DefaultMaxBootstrapValidityWindow
 		}
-		if ip := net.ParseIP(endpoint.ServerIP); ip == nil {
-			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("invalid server IP %q in bootstrap payload", endpoint.ServerIP))
-			sm.enterCooldownLocked("invalid server IP")
-			return StateCooldown, ErrInvalidBootstrapData
-		}
-		if endpoint.ValidUntil > 0 && endpoint.ValidUntil < now.Unix() {
-			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("bootstrap coordinates expired at %d (current %d)", endpoint.ValidUntil, now.Unix()))
-			sm.enterCooldownLocked("expired bootstrap payload")
-			return StateCooldown, ErrStaleBootstrapData
+		if valErr := endpoint.Validate(now, maxWindow, sm.cfg.AllowLoopbackEndpoints); valErr != nil {
+			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("bootstrap validation failed: %v", valErr))
+			sm.enterCooldownLocked(fmt.Sprintf("invalid bootstrap payload: %v", valErr))
+			return StateCooldown, fmt.Errorf("%w: %v", ErrInvalidBootstrapData, valErr)
 		}
 
 		sm.lastBootstrap = endpoint
 		sm.recordTransitionLocked(sm.state, StateBootstrapReceived, fmt.Sprintf("received authenticated bootstrap endpoint %s:%d (%s)", endpoint.ServerIP, endpoint.TransportPort, endpoint.TransportMode))
 		sm.recordTransitionLocked(StateBootstrapReceived, StateCandidateEndpointValidating, "initiating independent authenticated handshake validation")
 
+		valGen := sm.currentGeneration
+
 		// Validate candidate endpoint independently
-		if sm.cfg.CandidateValidator != nil {
-			valCtx, cancel := context.WithTimeout(ctx, sm.cfg.BootstrapValidationTimeout)
-			defer cancel()
+		valCtx, cancel := context.WithTimeout(ctx, sm.cfg.BootstrapValidationTimeout)
+		defer cancel()
 
-			sm.mu.Unlock()
-			valErr := sm.cfg.CandidateValidator(valCtx, endpoint)
-			sm.mu.Lock()
+		sm.mu.Unlock()
+		valErr := sm.cfg.CandidateValidator(valCtx, endpoint)
+		sm.mu.Lock()
 
-			if valErr != nil {
-				sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("candidate endpoint %s:%d failed validation handshake: %v", endpoint.ServerIP, endpoint.TransportPort, valErr))
-				sm.enterCooldownLocked("candidate validation rejected")
-				return StateCooldown, fmt.Errorf("%w: %v", ErrCandidateValidation, valErr)
-			}
+		// Stale operation check: verify generation has not advanced while candidate was validating
+		if sm.currentGeneration != valGen || sm.state != StateCandidateEndpointValidating {
+			return sm.state, ErrStaleRecoveryOperation
+		}
+
+		if valErr != nil {
+			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("candidate endpoint %s:%d failed validation handshake: %v", endpoint.ServerIP, endpoint.TransportPort, valErr))
+			sm.enterCooldownLocked("candidate validation rejected")
+			return StateCooldown, fmt.Errorf("%w: %v", ErrCandidateValidation, valErr)
 		}
 
 		// Validation successful! Activate recovery endpoint for new connections
@@ -259,6 +316,7 @@ func (sm *RecoveryStateMachine) ResetRollback(reason string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	sm.currentGeneration++
 	sm.consecutiveFails = 0
 	sm.activeEndpoint = ""
 	sm.lastBootstrap = nil
