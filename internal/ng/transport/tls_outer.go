@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 // GenerateSelfSignedCertificate creates a valid ECDSA P-256 certificate for server TLS.
 func GenerateSelfSignedCertificate(commonName string) (tls.Certificate, error) {
 	if commonName == "" {
-		commonName = "cloudflare.com"
+		commonName = "paqet.local"
 	}
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -38,7 +39,7 @@ func GenerateSelfSignedCertificate(commonName string) (tls.Certificate, error) {
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"Cloudflare, Inc."},
+			Organization: []string{"Paqet-NG Secure Network"},
 			CommonName:   commonName,
 		},
 		NotBefore:             time.Now().Add(-1 * time.Hour),
@@ -63,6 +64,68 @@ func GenerateSelfSignedCertificate(commonName string) (tls.Certificate, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: b})
 
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// GenerateCAAndSignedCert creates an in-memory CA and a child certificate signed by that CA.
+func GenerateCAAndSignedCert(commonName string) (caPEM, certPEM, keyPEM []byte, err error) {
+	if commonName == "" {
+		commonName = "paqet.local"
+	}
+
+	// 1. Root CA
+	caPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caSerial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	caTemplate := x509.Certificate{
+		SerialNumber: caSerial,
+		Subject: pkix.Name{
+			Organization: []string{"Paqet-NG Test CA"},
+			CommonName:   "Paqet Root CA",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caPriv.PublicKey, caPriv)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	// 2. Server Cert
+	serverPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sSerial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serverTemplate := x509.Certificate{
+		SerialNumber: sSerial,
+		Subject: pkix.Name{
+			Organization: []string{"Paqet-NG Secure Endpoint"},
+			CommonName:   commonName,
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(30 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost", commonName},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverPriv.PublicKey, caPriv)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverDER})
+
+	b, _ := x509.MarshalECPrivateKey(serverPriv)
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: b})
+
+	return caPEM, certPEM, keyPEM, nil
 }
 
 // TLSOptions configures the genuine TLS outer transport.
@@ -140,9 +203,24 @@ func (d *TLSDialer) dialInternal(ctx context.Context, addr string) (Session, err
 		serverName = host
 	}
 
+	var rootCAs *x509.CertPool
+	if d.opts.CAFile != "" {
+		caData, err := os.ReadFile(d.opts.CAFile)
+		if err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("tls ca file read %s: %w", d.opts.CAFile, err)
+		}
+		rootCAs = x509.NewCertPool()
+		if !rootCAs.AppendCertsFromPEM(caData) {
+			rawConn.Close()
+			return nil, fmt.Errorf("tls ca file parse failed: %s", d.opts.CAFile)
+		}
+	}
+
 	tlsConfig := &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: d.opts.InsecureSkipVerify,
+		RootCAs:            rootCAs,
 		MinVersion:         d.opts.MinVersion,
 		NextProtos:         d.opts.ALPN,
 	}
@@ -183,9 +261,18 @@ func (d *TLSDialer) CheckHealth(ctx context.Context, addr string) (time.Duration
 		serverName = host
 	}
 
+	var rootCAs *x509.CertPool
+	if d.opts.CAFile != "" {
+		if caData, err := os.ReadFile(d.opts.CAFile); err == nil {
+			rootCAs = x509.NewCertPool()
+			rootCAs.AppendCertsFromPEM(caData)
+		}
+	}
+
 	tlsConfig := &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: d.opts.InsecureSkipVerify,
+		RootCAs:            rootCAs,
 		MinVersion:         d.opts.MinVersion,
 	}
 

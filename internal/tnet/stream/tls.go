@@ -2,8 +2,10 @@ package stream
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -27,11 +29,25 @@ func DialTLS(addr string, obfsCfg *conf.Obfs, tlsCfg *conf.TLS) (tnet.Conn, erro
 	serverName := ""
 	insecureSkipVerify := true
 	alpn := []string{"h2", "http/1.1"}
+	var rootCAs *x509.CertPool
+
 	if tlsCfg != nil {
 		serverName = tlsCfg.ServerName
 		insecureSkipVerify = tlsCfg.InsecureSkipVerify
 		if len(tlsCfg.ALPN) > 0 {
 			alpn = tlsCfg.ALPN
+		}
+		if tlsCfg.CAFile != "" {
+			caData, err := os.ReadFile(tlsCfg.CAFile)
+			if err != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("tls stream: read ca file %s: %w", tlsCfg.CAFile, err)
+			}
+			rootCAs = x509.NewCertPool()
+			if !rootCAs.AppendCertsFromPEM(caData) {
+				rawConn.Close()
+				return nil, fmt.Errorf("tls stream: failed to parse ca pem in %s", tlsCfg.CAFile)
+			}
 		}
 	}
 	if serverName == "" {
@@ -42,6 +58,7 @@ func DialTLS(addr string, obfsCfg *conf.Obfs, tlsCfg *conf.TLS) (tnet.Conn, erro
 	config := &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: insecureSkipVerify,
+		RootCAs:            rootCAs,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         alpn,
 	}
@@ -87,7 +104,7 @@ func ListenTLS(addr string, obfsCfg *conf.Obfs, tlsCfg *conf.TLS) (tnet.Listener
 			return nil, fmt.Errorf("tls stream: failed to load keypair: %w", err)
 		}
 	} else {
-		certName := "cloudflare.com"
+		certName := "paqet.local"
 		if tlsCfg != nil && tlsCfg.ServerName != "" {
 			certName = tlsCfg.ServerName
 		}
@@ -127,8 +144,8 @@ func (l *TLSListener) Close() error {
 	return l.listener.Close()
 }
 
-func (l *TLSListener) SetClientTCPF(addr net.Addr, f []conf.TCPF)    {}
-func (l *TLSListener) DeleteClientTCPF(addr net.Addr)               {}
+func (l *TLSListener) SetClientTCPF(addr net.Addr, f []conf.TCPF)       {}
+func (l *TLSListener) DeleteClientTCPF(addr net.Addr)                   {}
 func (l *TLSListener) UpdateConfig(network conf.Network, kcp *conf.KCP) {}
 
 func (l *TLSListener) Accept() (tnet.Conn, error) {

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/tls"
 	"io"
+	"os"
 	"testing"
 
 	"paqet/internal/conf"
+	"paqet/internal/ng/transport"
 )
 
 func TestGenuineTLSOuterTransportEndToEnd(t *testing.T) {
@@ -104,4 +106,84 @@ func TestGenuineTLSOuterTransportEndToEnd(t *testing.T) {
 	if err := <-errCh; err != nil && err != io.EOF {
 		t.Fatalf("Server error: %v", err)
 	}
+}
+
+func TestTLSRejectsUntrustedOrMismatchedCert(t *testing.T) {
+	// 1. Generate custom CA and Server Cert for "paqet.local"
+	caPEM, certPEM, keyPEM, err := transport.GenerateCAAndSignedCert("paqet.local")
+	if err != nil {
+		t.Fatalf("GenerateCAAndSignedCert failed: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	caFile := tmpDir + "/ca.crt"
+	certFile := tmpDir + "/server.crt"
+	keyFile := tmpDir + "/server.key"
+
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatalf("write caFile: %v", err)
+	}
+	if err := os.WriteFile(certFile, certPEM, 0600); err != nil {
+		t.Fatalf("write certFile: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
+		t.Fatalf("write keyFile: %v", err)
+	}
+
+	serverTLSCfg := &conf.TLS{
+		CertFile: certFile,
+		KeyFile:  keyFile,
+	}
+
+	listener, err := ListenTLS("127.0.0.1:0", nil, serverTLSCfg)
+	if err != nil {
+		t.Fatalf("ListenTLS failed: %v", err)
+	}
+	defer listener.Close()
+
+	addr := listener.Addr().String()
+
+	// Server accept loop
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	// Scenario A: Client with InsecureSkipVerify=false and NO CA file -> MUST FAIL (untrusted)
+	untrustedClientCfg := &conf.TLS{
+		ServerName:         "paqet.local",
+		InsecureSkipVerify: false,
+	}
+	_, err = DialTLS(addr, nil, untrustedClientCfg)
+	if err == nil {
+		t.Errorf("Expected DialTLS to fail on untrusted certificate when InsecureSkipVerify=false")
+	}
+
+	// Scenario B: Client with CAFile but wrong ServerName -> MUST FAIL (hostname mismatch)
+	mismatchedClientCfg := &conf.TLS{
+		ServerName:         "wronghost.com",
+		InsecureSkipVerify: false,
+		CAFile:             caFile,
+	}
+	_, err = DialTLS(addr, nil, mismatchedClientCfg)
+	if err == nil {
+		t.Errorf("Expected DialTLS to fail on mismatched hostname")
+	}
+
+	// Scenario C: Client with CAFile and matching ServerName -> MUST SUCCEED (verified)
+	validClientCfg := &conf.TLS{
+		ServerName:         "paqet.local",
+		InsecureSkipVerify: false,
+		CAFile:             caFile,
+	}
+	validConn, err := DialTLS(addr, nil, validClientCfg)
+	if err != nil {
+		t.Fatalf("Expected DialTLS to succeed with matching CA and ServerName: %v", err)
+	}
+	validConn.Close()
 }

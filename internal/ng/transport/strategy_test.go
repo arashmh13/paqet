@@ -278,3 +278,41 @@ func TestStrategySelectorResilienceAndFallback(t *testing.T) {
 		t.Errorf("Expected active mode in report to be aead-stream, got %v", report["active_mode"])
 	}
 }
+
+func TestStrategySelectorCircuitBreakerAndCooldown(t *testing.T) {
+	fail1 := &mockFailingStrategy{mode: ModeRawKCP}
+	fail2 := &mockFailingStrategy{mode: ModeAEADStream}
+
+	selector := NewStrategySelector(SelectorConfig{
+		Candidates:          []Strategy{fail1, fail2},
+		PreferredMode:       ModeRawKCP,
+		CircuitFailureLimit: 1,
+		CircuitCooldown:     200 * time.Millisecond,
+	})
+
+	// 1. First dial should attempt both and fail with ErrNoEligibleStrategy
+	_, err := selector.Dial(context.Background(), "127.0.0.1:9999")
+	if !errors.Is(err, ErrNoEligibleStrategy) {
+		t.Fatalf("Expected ErrNoEligibleStrategy, got %v", err)
+	}
+
+	// 2. Immediate second dial should reject both without dial attempts (both in cooldown)
+	_, err2 := selector.Dial(context.Background(), "127.0.0.1:9999")
+	if !errors.Is(err2, ErrNoEligibleStrategy) {
+		t.Fatalf("Expected ErrNoEligibleStrategy during cooldown, got %v", err2)
+	}
+
+	report := selector.StatusReport()
+	candidates, ok := report["candidates"].([]map[string]interface{})
+	if !ok || len(candidates) != 2 {
+		t.Fatalf("Expected 2 candidates in status report, got %v", report["candidates"])
+	}
+
+	// 3. Wait for cooldown to expire
+	time.Sleep(250 * time.Millisecond)
+
+	// After cooldown, isEligible should become true again
+	if !selector.isEligible(fail1) {
+		t.Errorf("Expected fail1 to become eligible after cooldown")
+	}
+}
