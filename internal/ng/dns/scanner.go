@@ -17,10 +17,10 @@ import (
 
 // DNS Record Types (RFC 1035, RFC 6891)
 const (
-	TypeA    uint16 = 1
-	TypeNS   uint16 = 2
-	TypeTXT  uint16 = 16
-	TypeOPT  uint16 = 41 // EDNS0 pseudo-RR
+	TypeA   uint16 = 1
+	TypeNS  uint16 = 2
+	TypeTXT uint16 = 16
+	TypeOPT uint16 = 41 // EDNS0 pseudo-RR
 )
 
 // ResolverStatus classifications
@@ -37,8 +37,8 @@ const (
 type ResolverProfile string
 
 const (
-	ProfilePreconfigured   ResolverProfile = "PRECONFIGURED"
-	ProfileDiscovered      ResolverProfile = "DISCOVERED"
+	ProfilePreconfigured    ResolverProfile = "PRECONFIGURED"
+	ProfileDiscovered       ResolverProfile = "DISCOVERED"
 	ProfileTunnelCompatible ResolverProfile = "TUNNEL_COMPATIBLE"
 	ProfileBlocked          ResolverProfile = "BLOCKED"
 )
@@ -55,7 +55,7 @@ type ResolverCapabilities struct {
 	SupportsRandomSub  bool
 	SupportsLongLabels bool // Tunnel realism check (Base32 labels up to 57 chars)
 	EDNS0Support       bool
-	EDNS0MaxPayload    int // Measured maximum buffer size (e.g. 512, 1232, 1400)
+	EDNS0MaxPayload    int  // Measured maximum buffer size (e.g. 512, 1232, 1400)
 	NXDOMAINPreserved  bool // True if resolver preserves RFC 1035 RCODE=3; False if hijacked by ISP
 	Score              int  // Composite score: 0 (unusable) to 6 (optimal)
 	LastError          string

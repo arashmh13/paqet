@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"paqet/cmd/dump"
+	"paqet/cmd/emergency"
 	"paqet/cmd/ping"
 	"paqet/cmd/run"
 	"paqet/cmd/secret"
@@ -24,6 +25,7 @@ func main() {
 	rootCmd.AddCommand(ping.Cmd)
 	rootCmd.AddCommand(secret.Cmd)
 	rootCmd.AddCommand(version.Cmd)
+	rootCmd.AddCommand(emergency.Cmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("%v", err)

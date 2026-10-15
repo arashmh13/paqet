@@ -408,9 +408,13 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	// Header (12 bytes)
 	hdr := make([]byte, 12)
 	binary.BigEndian.PutUint16(hdr[0:2], id)
-	binary.BigEndian.PutUint16(hdr[2:4], 0x8180) // QR=1, AA=1, RD=1, RA=1 (Standard response)
-	binary.BigEndian.PutUint16(hdr[4:6], 1)      // QDCOUNT = 1
-	binary.BigEndian.PutUint16(hdr[6:8], 1)      // ANCOUNT = 1
+
+	reqFlags := binary.BigEndian.Uint16(reqPacket[2:4])
+	// Authoritative response flags: QR=1 (0x8000), AA=1 (0x0400), copy RD (0x0100), RA=0 (Not a recursive resolver), RCODE=0
+	respFlags := uint16(0x8400) | (reqFlags & 0x0100)
+	binary.BigEndian.PutUint16(hdr[2:4], respFlags)
+	binary.BigEndian.PutUint16(hdr[4:6], 1) // QDCOUNT = 1
+	binary.BigEndian.PutUint16(hdr[6:8], 1) // ANCOUNT = 1
 	resp = append(resp, hdr...)
 	resp = append(resp, questionSec...)
 
@@ -422,20 +426,78 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint32(ansHdr[6:10], 0)     // TTL 0 (Do not cache)
 	resp = append(resp, ansHdr...)
 
-	// RDATA: Character-string (1 byte length + data)
+	// RDATA: One or more RFC 1035 character-strings (max 255 bytes each)
+	var rdata []byte
+	if len(txtPayload) == 0 {
+		rdata = []byte{0x00} // empty character-string
+	} else {
+		for i := 0; i < len(txtPayload); i += 255 {
+			end := i + 255
+			if end > len(txtPayload) {
+				end = len(txtPayload)
+			}
+			chunk := txtPayload[i:end]
+			rdata = append(rdata, byte(len(chunk)))
+			rdata = append(rdata, chunk...)
+		}
+	}
+
 	rdLen := make([]byte, 2)
-	binary.BigEndian.PutUint16(rdLen, uint16(1+len(txtPayload)))
+	binary.BigEndian.PutUint16(rdLen, uint16(len(rdata)))
 	resp = append(resp, rdLen...)
-	resp = append(resp, byte(len(txtPayload)))
-	resp = append(resp, txtPayload...)
+	resp = append(resp, rdata...)
 
 	return resp, nil
 }
 
-// ParseDNSTXTResponse extracts character-string TXT payload from an RFC 1035 DNS response.
+// BuildDNSErrorResponse constructs an RFC 1035 error response (e.g. RCODE=5 REFUSED or RCODE=3 NXDOMAIN).
+func BuildDNSErrorResponse(reqPacket []byte, rcode uint8) []byte {
+	if len(reqPacket) < 12 {
+		return nil
+	}
+
+	id := binary.BigEndian.Uint16(reqPacket[0:2])
+	reqFlags := binary.BigEndian.Uint16(reqPacket[2:4])
+
+	offset := 12
+	for offset < len(reqPacket) {
+		length := int(reqPacket[offset])
+		offset++
+		if length == 0 {
+			break
+		}
+		offset += length
+	}
+	offset += 4
+	if offset > len(reqPacket) {
+		offset = len(reqPacket)
+	}
+
+	questionSec := reqPacket[12:offset]
+
+	var resp []byte
+	hdr := make([]byte, 12)
+	binary.BigEndian.PutUint16(hdr[0:2], id)
+	// QR=1, AA=1, copy RD, RA=0, RCODE
+	respFlags := uint16(0x8400) | (reqFlags & 0x0100) | uint16(rcode&0x0F)
+	binary.BigEndian.PutUint16(hdr[2:4], respFlags)
+	binary.BigEndian.PutUint16(hdr[4:6], 1) // QDCOUNT = 1
+	binary.BigEndian.PutUint16(hdr[6:8], 0) // ANCOUNT = 0
+	resp = append(resp, hdr...)
+	resp = append(resp, questionSec...)
+
+	return resp
+}
+
+// ParseDNSTXTResponse extracts and concatenates all RFC 1035 character-strings from a DNS TXT response.
 func ParseDNSTXTResponse(respPacket []byte) (txtPayload []byte, err error) {
 	if len(respPacket) < 12 {
 		return nil, ErrDNSInvalidQuery
+	}
+
+	rcode := respPacket[3] & 0x0F
+	if rcode != 0 {
+		return nil, fmt.Errorf("dns response error rcode %d", rcode)
 	}
 
 	ancount := binary.BigEndian.Uint16(respPacket[6:8])
@@ -471,17 +533,23 @@ func ParseDNSTXTResponse(respPacket []byte) (txtPayload []byte, err error) {
 	rdLength := int(binary.BigEndian.Uint16(respPacket[offset : offset+2]))
 	offset += 2
 
-	if offset+rdLength > len(respPacket) || rdLength < 1 {
+	if offset+rdLength > len(respPacket) {
 		return nil, ErrDNSInvalidQuery
 	}
 
-	txtLen := int(respPacket[offset])
-	offset++
-	if offset+txtLen > len(respPacket) {
-		return nil, ErrDNSInvalidQuery
+	endRData := offset + rdLength
+	var fullPayload []byte
+	for offset < endRData {
+		txtLen := int(respPacket[offset])
+		offset++
+		if offset+txtLen > endRData {
+			return nil, ErrDNSInvalidQuery
+		}
+		fullPayload = append(fullPayload, respPacket[offset:offset+txtLen]...)
+		offset += txtLen
 	}
 
-	return append([]byte(nil), respPacket[offset:offset+txtLen]...), nil
+	return fullPayload, nil
 }
 
 // RealSocketDNSUpstreamSender transmits frames by fragmenting into DNS QNAME queries over a real UDP socket.

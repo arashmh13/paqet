@@ -253,6 +253,60 @@ func (c *AsymmetricConn) SetDeadline(t time.Time) error      { return nil }
 func (c *AsymmetricConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *AsymmetricConn) SetWriteDeadline(t time.Time) error { return nil }
 
+// SealFrame provides public access to sealFrame for emergency datagram channels.
+func (c *AsymmetricConn) SealFrame(seq, ack uint32, plaintext []byte) ([]byte, error) {
+	return c.sealFrame(seq, ack, plaintext)
+}
+
+// OpenFrame provides public access to openFrame for emergency datagram channels.
+func (c *AsymmetricConn) OpenFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
+	return c.openFrame(frame)
+}
+
+// SessionID returns the active session ID.
+func (c *AsymmetricConn) SessionID() uint64 {
+	return c.sessionID
+}
+
+// NextSendSeq advances and returns the next sequence number.
+func (c *AsymmetricConn) NextSendSeq() uint32 {
+	return c.sendSeq.Add(1)
+}
+
+// NewServerAsymmetricSession creates an AsymmetricConn configured as RoleServer for a given session.
+func NewServerAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
+	c2s, s2c, err := crypto.DeriveKeys(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)))
+	if err != nil {
+		return nil, fmt.Errorf("derive keys: %w", err)
+	}
+
+	return &AsymmetricConn{
+		sessionID: sessionID,
+		role:      RoleServer,
+		psk:       psk,
+		encKey:    s2c, // server encrypts with s2c
+		decKey:    c2s, // server decrypts with c2s
+		replay:    replay.NewFilter(30 * time.Second),
+	}, nil
+}
+
+// NewClientAsymmetricSession creates an AsymmetricConn configured as RoleClient for a given session.
+func NewClientAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
+	c2s, s2c, err := crypto.DeriveKeys(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)))
+	if err != nil {
+		return nil, fmt.Errorf("derive keys: %w", err)
+	}
+
+	return &AsymmetricConn{
+		sessionID: sessionID,
+		role:      RoleClient,
+		psk:       psk,
+		encKey:    c2s, // client encrypts with c2s
+		decKey:    s2c, // client decrypts with s2c
+		replay:    replay.NewFilter(30 * time.Second),
+	}, nil
+}
+
 // sealFrame packs Magic, SessionID, Seq, Ack, and AEAD-encrypted payload into a wire datagram.
 func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, error) {
 	header := make([]byte, AsymmetricHeaderLen)
