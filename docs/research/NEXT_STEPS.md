@@ -3,11 +3,14 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.4.1-tls`
-- **Active Binary SHA-256:** `77878ab74bf95c4c4f823283f17d03c86271b7f05f38cf3b67d1b8fedd0a76e9`
+- **Current Version:** `v2.4.2-verified`
+- **Active Binary SHA-256:** `0ee0d399a559a9b92ee8348b61473b8413ae62c232320f07c26c763019f6ee93`
 - **Architectural Validation Status:**
-  - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 12.16 Mbps line rate).
+  - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 11.60 Mbps line rate, CA certificate validation verified).
   - Candidate 2 (Raw TCP Decoy Sequence Injection): **COMPLETE & WIRE-VERIFIED** (`wrong_seq` out-of-window packet injection, silent kernel drop on Germany VPS, 123.4 ms RTT).
+  - Asymmetric Directional Decoupling (`AsymmetricConn`): **COMPLETE & TESTED** (independent `UpstreamSender` and `DownstreamReceiver` channels, AEAD framing, reassembly sliding window, and anti-replay DoS protection).
+  - BCP 38 / uRPF Spoofing Feasibility: **CONCLUDED & INFEASIBLE** (probes conclusively dropped by Panel01 and Hetzner egress routers).
+  - Controlled Failure Laboratory: **OPERATIONAL** (`failure_lab_test.go` passing 100% across port drops, idle resumptions, and national curfew simulations).
 - **Active Endpoints:**
   - Iran VPS (`185.18.215.124`): Primary SOCKS5 on `127.0.0.1:1090` (`raw-kcp` with out-of-window SNI sequence injection), Genuine TLS on `127.0.0.1:1095` (`tls` on `:8443`).
   - German VPS (`77.37.65.2`): Primary server listening on `:8088` (kcp), Genuine TLS server on `:8443`.

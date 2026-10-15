@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -27,9 +28,16 @@ type StrategySelector struct {
 	mu         sync.RWMutex
 	current    Strategy
 	lastSwitch time.Time
-	cooldowns  map[TransportMode]time.Time
+	cooldowns  map[string]time.Time
 	stopChan   chan struct{}
 	activeLog  []string
+
+	lastFallbackReason string
+	lastSuccessMode    TransportMode
+}
+
+func stratKey(s Strategy) string {
+	return fmt.Sprintf("%p:%s", s, s.Mode())
 }
 
 func NewStrategySelector(cfg SelectorConfig) *StrategySelector {
@@ -66,7 +74,7 @@ func NewStrategySelector(cfg SelectorConfig) *StrategySelector {
 		cfg:        cfg,
 		current:    initial,
 		lastSwitch: time.Now(),
-		cooldowns:  make(map[TransportMode]time.Time),
+		cooldowns:  make(map[string]time.Time),
 		stopChan:   make(chan struct{}),
 	}
 
@@ -100,15 +108,21 @@ func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, erro
 	if cur != nil && s.isEligible(cur) {
 		sess, err := cur.Dial(ctx, addr)
 		if err == nil {
+			s.mu.Lock()
+			s.lastSuccessMode = cur.Mode()
+			s.mu.Unlock()
 			return sess, nil
 		}
-		s.recordFailure(cur.Mode(), err)
+		s.recordFailure(cur, err)
+		s.mu.Lock()
+		s.lastFallbackReason = fmt.Sprintf("strategy %s dial failed: %v", cur.Mode(), err)
+		s.mu.Unlock()
 	}
 
 	// 2. Fall back to other eligible strategies in order of resilience
 	for _, strat := range candidates {
-		if cur != nil && strat.Mode() == cur.Mode() {
-			continue // Already tried
+		if cur != nil && strat == cur {
+			continue // Already tried this candidate
 		}
 		if !s.isEligible(strat) {
 			continue
@@ -119,10 +133,14 @@ func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, erro
 			s.mu.Lock()
 			s.current = strat
 			s.lastSwitch = time.Now()
+			s.lastSuccessMode = strat.Mode()
 			s.mu.Unlock()
 			return sess, nil
 		}
-		s.recordFailure(strat.Mode(), err)
+		s.recordFailure(strat, err)
+		s.mu.Lock()
+		s.lastFallbackReason = fmt.Sprintf("fallback candidate %s dial failed: %v", strat.Mode(), err)
+		s.mu.Unlock()
 	}
 
 	return nil, ErrNoEligibleStrategy
@@ -135,7 +153,7 @@ func (s *StrategySelector) isEligible(strat Strategy) bool {
 	}
 
 	s.mu.RLock()
-	cooldownUntil, hasCooldown := s.cooldowns[strat.Mode()]
+	cooldownUntil, hasCooldown := s.cooldowns[stratKey(strat)]
 	s.mu.RUnlock()
 
 	if hasCooldown && time.Now().Before(cooldownUntil) {
@@ -150,10 +168,10 @@ func (s *StrategySelector) isEligible(strat Strategy) bool {
 	return true
 }
 
-func (s *StrategySelector) recordFailure(mode TransportMode, err error) {
+func (s *StrategySelector) recordFailure(strat Strategy, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cooldowns[mode] = time.Now().Add(s.cfg.CircuitCooldown)
+	s.cooldowns[stratKey(strat)] = time.Now().Add(s.cfg.CircuitCooldown)
 }
 
 // StatusReport returns a comprehensive diagnostic report of all candidate modes.
@@ -167,9 +185,11 @@ func (s *StrategySelector) StatusReport() map[string]interface{} {
 	}
 
 	report := map[string]interface{}{
-		"active_mode": activeMode,
-		"last_switch": s.lastSwitch.Format(time.RFC3339),
-		"candidates":  make([]map[string]interface{}, 0, len(s.cfg.Candidates)),
+		"active_mode":          activeMode,
+		"last_switch":          s.lastSwitch.Format(time.RFC3339),
+		"last_fallback_reason": s.lastFallbackReason,
+		"last_success_mode":    string(s.lastSuccessMode),
+		"candidates":           make([]map[string]interface{}, 0, len(s.cfg.Candidates)),
 	}
 
 	for _, strat := range s.cfg.Candidates {

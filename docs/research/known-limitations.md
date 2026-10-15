@@ -32,16 +32,29 @@
 ## 4. IP-Spoofing & BCP 38 / uRPF Provider Constraints
 
 1. **Egress Source-Address Filtering (RFC 2827):** Standard cloud VPS providers (including Hetzner, OVH, DigitalOcean, and Iranian datacenter providers) enforce strict BCP 38 ingress/egress filtering at the hypervisor virtual switch. Any packet with a forged source IP is dropped before leaving the physical rack.
-2. **Infrastructure Prerequisite:** The `asymmetric-spoof` mode cannot operate on generic VPS hosting. It strictly requires dedicated bare-metal servers or transit providers that explicitly allow arbitrary source IP announcements via BGP.
-3. **Automated Safety Gating:** To prevent user connection failure, Paqet-NG gates spoofing behind `ProbeSpoofCapability`.
+2. **Empirical Verification (October 15, 2026 Audit):**
+   - Transmitted raw UDP probes from Iran VPS (`185.18.215.124`): Genuine IP succeeded. Adjacent IP (`185.18.215.45`, same subnet) was dropped by switch-port binding. Documentation IP (`198.51.100.1`) was dropped by Panel01 upstream router.
+   - Transmitted raw UDP probes from Germany VPS (`77.37.65.2`): Genuine IP succeeded. Documentation IP (`198.51.100.1`) was dropped by Hetzner vSwitch.
+3. **Infrastructure Prerequisite:** The `asymmetric-spoof` mode cannot operate on generic VPS hosting. It strictly requires dedicated bare-metal servers or transit providers that explicitly allow arbitrary source IP announcements via BGP.
+4. **Automated Safety Gating:** To prevent user connection failure, Paqet-NG gates spoofing behind `ProbeSpoofCapability` and returns `ErrBCP38Enforced`.
 
 ---
 
 ## 5. DNS-Asymmetric Bandwidth & Latency Constraints
 
-1. **Bandwidth Ceiling:** Maximum Base32 payload capacity is capped at 35–45 bytes per DNS query label. Maximum effective upstream throughput is $\le 0.8\text{ Mbps}$.
-2. **Latency Inflation:** Recursive multi-hop DNS resolution inflates round-trip times to 600–1800ms.
-3. **Operational Scope:** `dns-asymmetric` must be deployed strictly as an emergency signaling / recovery channel, not as an interactive browsing transport.
+1. **Bandwidth Ceiling:** Maximum Base32 payload capacity is capped at 35 bytes per DNS query label. Measured wire amplification is **$3.60\times$** (126-byte DNS query to carry 35 bytes of binary data).
+2. **Throughput Bounds:**
+   - Conservative (20 queries/second): **$5.60\text{ kbps}$**.
+   - Aggressive (100 queries/second): **$28.00\text{ kbps}$**.
+3. **Latency Inflation:** Recursive multi-hop DNS resolution inflates round-trip times to 150–600ms.
+4. **Operational Scope:** `dns-asymmetric` must be deployed strictly as an emergency signaling, bootstrap, or text-terminal channel, not as an interactive browsing transport.
+
+---
+
+## 10. Directional Decoupling vs. Symmetric Full-Duplex Transports
+
+1. **Simplex vs Duplex Synchronization:** Directionally decoupled transports (`AsymmetricConn`) utilize independent upstream and downstream paths. While this survives severe asymmetric egress blocks, it introduces reassembly buffering overhead and relies on piggybacked ACKs.
+2. **Interactive Stream Latency:** When upstream is routed over high-latency channels (e.g. recursive DNS queries), interactive TCP handshakes and window scaling take significantly longer to converge compared to direct symmetric transports.
 
 ---
 

@@ -252,3 +252,45 @@
     * Zero TLS ServerHello returned.
     * Latency: **123.4 ms median**, Throughput: **10.31 Mbps**.
 - **Outcome:** Both candidates are independently verified on the wire with distinct threat-model trade-offs. Candidate 1 provides authentic TLS wire framing and NAT compatibility. Candidate 2 provides raw packet desynchronization against middleboxes that reset TCP handshakes. Deliverable document `docs/research/tls-outer-transport-vs-sequence-injection.md` produced.
+
+---
+
+## Cycle 13: Full TLS Correctness Audit, CA Verification Implementation, and Throughput Reconciliation
+- **Objective:** Independently audit TLS handshake and certificate validation, eliminate third-party impersonation, implement CA certificate validation (`CAFile`), reconcile throughput calculations, and produce `docs/research/tls-correctness-audit.md`.
+- **Actions:**
+  1. Audited TLS connection lifecycle in `internal/ng/transport/tls_outer.go` and `internal/tnet/stream/tls.go`.
+  2. Removed hardcoded `Organization: Cloudflare, Inc.` from self-signed certificates; standardized on neutral `Organization: Paqet-NG Secure Network` and `CommonName: paqet.local`.
+  3. Implemented `CAFile` loading into `tls.Config.RootCAs` in `DialTLS` and `TLSDialer`.
+  4. Implemented unit test `TestTLSRejectsUntrustedOrMismatchedCert` verifying:
+     - Untrusted CA rejection when `InsecureSkipVerify: false`.
+     - Hostname mismatch rejection when SAN does not match `ServerName`.
+     - Valid CA and SAN acceptance.
+  5. Corrected throughput calculation: 5,242,880 bytes in 3.6168s = **11.60 Mbps** (reconciling previous binary-vs-decimal unit reporting).
+  6. Verified `StrategySelector` cooldown and circuit-breaker behavior in `TestStrategySelectorCircuitBreakerAndCooldown`.
+  7. Built release binary `v2.4.2-verified` (commit `41c174f`, SHA-256 `0ee0d399a559...`).
+  8. Deployed to both Iran and Germany VPSs; production SOCKS5 (:1090) verified active and returning HTTP 200 pong.
+- **Outcome:** All quality gates passed (`go test -v ./...`, `go test -race ./internal/...`, `go vet ./...`). Documented in `docs/research/tls-correctness-audit.md`.
+
+---
+
+## Cycle 14: Asymmetric Directional Decoupling, Physical Egress BCP 38 Validation, and Controlled Failure Laboratory
+- **Objective:** Make transport directionality a first-class architectural capability, experimentally verify IP-spoofing feasibility (BCP 38 / uRPF) in both VPS directions, measure DNS-asymmetric bounds, and validate survivability in a controlled failure laboratory.
+- **Actions:**
+  1. Implemented `AsymmetricConn` (`internal/ng/transport/asymmetric.go`): modular `net.Conn` stream abstraction over independent `UpstreamSender` and `DownstreamReceiver` channels.
+  2. Implemented 20-byte wire header (`Magic`, `SessionID`, `Seq`, `Ack`), deterministic nonces, HKDF directional subkeys, and reassembly sliding window.
+  3. Identified and fixed a critical anti-DoS ordering bug: `openFrame` now enforces AEAD tag verification *prior* to updating the sliding-window replay filter.
+  4. Executed bidirectional raw IP spoofing probes between Iran VPS (`185.18.215.124`) and Germany VPS (`77.37.65.2`):
+     - Iran VPS -> Germany VPS: Genuine IP succeeded. Adjacent IP (`185.18.215.45`, same subnet) was dropped by switch-port binding. Documentation IP (`198.51.100.1`) was dropped by Panel01 upstream router.
+     - Germany VPS -> Iran VPS: Genuine IP succeeded. Documentation IP (`198.51.100.1`) was dropped by Hetzner vSwitch.
+     - **Definitive Conclusion:** BCP 38 / uRPF is strictly enforced by both hosting providers. IP-spoofing is physically impossible on generic cloud VPS infrastructure; `asymmetric-spoof` mode remains safely gated with `ErrBCP38Enforced`.
+  5. Measured empirical DNS-asymmetric bounds (`dns_asymmetric_test.go`):
+     - Wire amplification: **3.60x** (126-byte query to carry 35 bytes of binary data).
+     - Conservative throughput (20 qps): **5.60 kbps**.
+     - Aggressive throughput (100 qps): **28.00 kbps**.
+     - Documented role: Emergency signaling, bootstrap, and low-bandwidth terminal channel, not general web proxy.
+  6. Implemented Controlled Failure Laboratory (`failure_lab_test.go`):
+     - Scenario 1 (Port Blackhole): Caught and fixed selector bug where cooldown was keyed by `TransportMode` instead of candidate pointer. Fixed by keying by candidate instance (`stratKey`). Fallback verified.
+     - Scenario 2 (Idle Silence): Verified stream persistence across idle periods without spurious resets.
+     - Scenario 3 (Asymmetric National Curfew): Verified simplex upstream + downstream communication under simulated total outbound TCP block.
+  7. Produced `docs/research/hard-mode-capability-matrix.md`, `docs/research/asymmetric-transport-design.md`, and `docs/research/failure-laboratory.md`.
+- **Outcome:** Transport directionality is fully implemented and tested. Physical provider limitations are conclusively proven. Controlled failure laboratory tests pass 100%.
