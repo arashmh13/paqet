@@ -1,6 +1,7 @@
 package client
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"sync"
@@ -132,18 +133,47 @@ func (tc *timedConn) createConn() (tnet.Conn, ConnectionIdentity, error) {
 
 		switch snapshot.TransportMode {
 		case transport.ModeAEADStream:
-			candidateConn, dialErr = stream.Dial(snapshot.Addr(), tc.cfg.Transport.Obfs)
-		case transport.ModeTLSStream:
-			candidateConn, dialErr = stream.DialTLS(snapshot.Addr(), tc.cfg.Transport.Obfs, tc.cfg.Transport.TLS)
-		case transport.ModeRawKCP:
-			netCfg := tc.cfg.Network
-			netCfg.SNI = tc.cfg.Transport.SNI
-			udpAddr, err := net.ResolveUDPAddr("udp", snapshot.Addr())
-			if err != nil {
-				dialErr = err
-			} else {
-				candidateConn, dialErr = kcp.Dial(udpAddr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, netCfg)
+			// P0 Requirement: confirm that configured transport key matches authorized snapshot identity!
+			var keyBytes []byte
+			if tc.cfg.Transport.Obfs != nil {
+				keyBytes = []byte(tc.cfg.Transport.Obfs.Key)
 			}
+			keyDigest := fmt.Sprintf("SHA256:%x", sha256.Sum256(keyBytes))
+			if keyDigest != snapshot.GetIdentityValue() {
+				dialErr = fmt.Errorf("aead-stream candidate key mismatch: local transport key fingerprint %s does not match authorized snapshot %s (fail-closed)",
+					keyDigest, snapshot.GetIdentityValue())
+			} else {
+				candidateConn, dialErr = stream.Dial(snapshot.Addr(), tc.cfg.Transport.Obfs)
+			}
+
+		case transport.ModeTLSStream:
+			// P0 Requirement: enforce certificate or pubkey pin on the live TLS connection!
+			isPubKey := snapshot.IdentityType == transport.IdentityTypePubKeyPin
+			candidateConn, dialErr = stream.DialTLSPinned(snapshot.Addr(), tc.cfg.Transport.Obfs, tc.cfg.Transport.TLS, snapshot.GetIdentityValue(), isPubKey)
+
+		case transport.ModeRawKCP:
+			// P0 Requirement: confirm that configured KCP key matches authorized snapshot identity!
+			var kcpKey []byte
+			if tc.cfg.Transport.KCP != nil && tc.cfg.Transport.KCP.Key != "" {
+				kcpKey = []byte(tc.cfg.Transport.KCP.Key)
+			} else if tc.cfg.Transport.Obfs != nil {
+				kcpKey = []byte(tc.cfg.Transport.Obfs.Key)
+			}
+			keyDigest := fmt.Sprintf("SHA256:%x", sha256.Sum256(kcpKey))
+			if keyDigest != snapshot.GetIdentityValue() {
+				dialErr = fmt.Errorf("raw-kcp candidate key mismatch: local KCP key fingerprint %s does not match authorized snapshot %s (fail-closed)",
+					keyDigest, snapshot.GetIdentityValue())
+			} else {
+				netCfg := tc.cfg.Network
+				netCfg.SNI = tc.cfg.Transport.SNI
+				udpAddr, err := net.ResolveUDPAddr("udp", snapshot.Addr())
+				if err != nil {
+					dialErr = err
+				} else {
+					candidateConn, dialErr = kcp.Dial(udpAddr, tc.cfg.Transport.KCP, tc.cfg.Transport.Obfs, netCfg)
+				}
+			}
+
 		default:
 			dialErr = fmt.Errorf("unsupported recovery transport mode %q (fail-closed)", snapshot.TransportMode)
 		}

@@ -1,0 +1,21 @@
+[Unit]
+Description=Paqet-NG Authoritative Emergency DNS Control Plane
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# Explicit configuration: Fail-closed architecture prohibits implicit IP or credential fallbacks
+ExecStart=/opt/paqet/paqet emergency server \
+    --addr 0.0.0.0:53 \
+    --domain tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir \
+    --key-file /opt/paqet/emergency.key \
+    --bootstrap-config /opt/paqet/bootstrap-candidates.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -233,3 +233,57 @@ Executed live on authorized infrastructure:
   7. **Step G Deterministic Rollback:** `ResetRollback` cleared snapshot in 0.00ms; restored `PRIMARY_HEALTHY`.
   8. **Step H Restoration & Production Health:** Iptables rule deleted in 6.04ms. Production SOCKS5 on `127.0.0.1:1090` returned `pong` (HTTP 200, healthy throughout).
 - **Evidentiary Proof:** Complete JSON audit trail logged to `docs/research/recovery_socks5_live_audit_phase14.json`.
+
+---
+
+## 8. Fail-Closed Configuration, Dial Identity Binding & Monotonic Failover Timeline (Phase 15)
+
+### 8.1 Fail-Closed Configuration Startup Suite
+Executed via `cmd/emergency/emergency_test.go`:
+- `TestEmergencyServerStartup_MissingRecoveryConfigFails`: Verifies that an emergency server without `--bootstrap-config` or `--bootstrap-ip` strictly refuses to start up unless `--disable-bootstrap` is explicitly provided.
+- `TestEmergencyServerStartup_DisableBootstrapMessagingOnlyMode`: Verifies that passing `--disable-bootstrap` initializes a safe messaging-only emergency daemon with 0 registered bootstrap candidate records.
+- `TestEmergencyServerStartup_AEADWithoutKeyOrPinFails`: Verifies that starting `aead-stream` without `--bootstrap-key-file` or `--bootstrap-pin` fails startup immediately, proving complete elimination of the emergency PSK fallback.
+- `TestEmergencyServerStartup_TLSWithoutCertOrPinFails`: Verifies that starting `tls-outer` without `--bootstrap-cert` or `--bootstrap-pin` fails startup immediately.
+- `TestEmergencyServerStartup_DisallowedIPClassesFail`: Verifies rejection of unspecified (`0.0.0.0`), multicast (`224.0.0.1`), link-local (`169.254.1.1`), and malformed IP strings.
+- `TestEmergencyServerStartup_InvalidPortsFail`: Verifies rejection of ports 0, -1, 65536, and 70000.
+- `TestEmergencyServerStartup_ValidKeyFileTracksProvenance`: Verifies that loading a key file correctly computes the `SHA256:<64 hex>` fingerprint and records provenance (`key_file:transport.key`) without leaking raw key bytes.
+- `TestEmergencyServerStartup_JSONConfigFileDeterministicValidation`: Verifies deterministic JSON parsing of multiple candidate records, and rejects conflicting duplicate records for the same transport mode.
+
+### 8.2 End-to-End Identity Continuity (Validation-to-Dial Binding)
+Executed via `internal/client/connection_identity_test.go`:
+- `TestTimedConn_CandidateKeyMismatchFailsClosed`: Configures client with key `0123...`, while candidate snapshot authorizes key `fedc...`. `createConn()` verifies the key fingerprint before dialing, detecting the mismatch and failing closed immediately without opening the network connection.
+- `TestTimedConn_GenerationChangeOrRollbackDuringDialRejectsConnection`: Dials a candidate connection, but before inserting it into the pool, `ResetRollback()` is triggered. `newConn()` re-checks `tc.desiredIdentity()` against the dialed identity, detects the mismatch, immediately closes the socket, and refuses pool insertion.
+
+### 8.3 Conservative EDNS0 Limits & Measured TCP Fallback Suite
+Executed via `internal/ng/transport/dns_edns_truncation_test.go`:
+- `TestEDNS0_ConservativeDefaultAndCustomBufferSize`: Verifies that `BuildDNSQuery()` advertises 1232 bytes by default, custom queries advertise requested buffer sizes (e.g. 1400 bytes), and 0-byte EDNS builds standard RFC 1035 packets (ARCOUNT=0).
+- `TestEDNS0_ParseEDNSBufferSize_MalformedInputs`: Verifies safe fallback to 512 bytes on short or nil wire packets.
+- `TestEDNS0_ResponseTruncationWhenExceedingLimit`: Server receiving a 1500-byte TXT response (> 1400-byte safe limit) sets `TC = 1` (Truncated) with `ANCOUNT = 0`.
+- `TestEDNS0_TCPPort53FallbackOnTruncation`: Client encountering `TC = 1` automatically initiates RFC 7766 TCP port 53 query, receiving and authenticating the full downstream emergency message.
+
+### 8.4 Live Monotonic Failover Timeline (Iran ⇄ Germany via Public Recursive DNS)
+Executed live on authorized infrastructure:
+- **Client Host:** Iran VPS (`185.18.215.124`, Panel01)
+- **Server Host:** Germany VPS (`77.37.65.2`, Hetzner)
+- **DNS Resolver:** Public recursive resolver `8.8.8.8:53`
+- **EDNS Buffer:** Conservative 1232 bytes (`DefaultEDNSUDPPayloadSize`)
+- **Unpredictable Token:** `PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0`
+- **Monotonic Failover Timeline:**
+  * **T0 (Primary Failure Injected):** 0.00 ms (iptables DROP on `:18088`)
+  * **T1 (Failure Threshold Crossed):** 35.40 ms (`PRIMARY_DEGRADED`)
+  * **T2 (Degraded Hysteresis Ended):** 96.02 ms (60.62 ms hysteresis delay)
+  * **T3 (DNS Request Dispatched):** 96.06 ms (Sent to `8.8.8.8:53`)
+  * **T4 (DNS Bootstrap Received):** 4905.79 ms (DNS RTT: **4639.34 ms**)
+  * **T5 / T6 (Candidate Validation):** 4905.79 ms (Validated remote AEAD handshake)
+  * **T7 (Recovery State Activated):** 4905.79 ms (`RECOVERY_READY`, generation revision 6)
+  * **T8 (First App Connection Started):** 4905.85 ms (Issued via SOCKS5 `:11990`)
+  * **T9 (First App Response Verified):** 4993.79 ms (Post-activation request RTT: **87.94 ms**)
+  * **Total Failure-to-First-Response Duration (T9 - T0): 4993.79 ms**
+  * **T10 (Rollback Completed):** 4994.42 ms (`PRIMARY_HEALTHY`)
+  * **T11 (Primary Network Restored):** 5042.75 ms (Iptables DROP rule deleted)
+- **Adversarial Negative Checks:**
+  * Mismatched PSK fingerprint rejected fail-closed in 0.37 ms.
+  * Expired candidate rejected fail-closed in 0.01 ms.
+  * Unknown transport mode rejected fail-closed in 0.00 ms.
+- **Production SOCKS5 Health:** Checked immediately following live run (`127.0.0.1:1090`) -> `pong` (healthy throughout).
+- **Evidentiary Artifact:** Logged to `docs/research/recovery_socks5_live_audit_phase15.json`.

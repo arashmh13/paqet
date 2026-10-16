@@ -42,6 +42,7 @@ var (
 	bootstrapKeyFile    string
 	bootstrapPin        string
 	bootstrapConfigFile string
+	disableBootstrap    bool
 )
 
 func init() {
@@ -53,13 +54,14 @@ func init() {
 	serverCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
-	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (default $PAQET_BOOTSTRAP_IP or 77.37.65.2)")
+	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (required if --bootstrap-config and --disable-bootstrap are not set)")
 	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapCertFile, "bootstrap-cert", "", "Path to certificate file for TLS candidate fingerprint computation")
 	serverCmd.Flags().StringVar(&bootstrapKeyFile, "bootstrap-key-file", "", "Path to key file for AEAD/Raw-KCP candidate fingerprint computation")
 	serverCmd.Flags().StringVar(&bootstrapPin, "bootstrap-pin", "", "Explicit canonical SHA256:<64 hex> identity pin")
-	serverCmd.Flags().StringVar(&bootstrapConfigFile, "bootstrap-config", "", "Path to JSON/YAML file containing candidate endpoint records")
+	serverCmd.Flags().StringVar(&bootstrapConfigFile, "bootstrap-config", "", "Path to JSON file containing candidate endpoint records")
+	serverCmd.Flags().BoolVar(&disableBootstrap, "disable-bootstrap", false, "Run messaging-only emergency server without recovery candidate endpoints (safe fail-closed state)")
 
 	sendCmd.Flags().StringVar(&resolverAddr, "resolver", "8.8.8.8:53", "Recursive DNS resolver address (e.g. 8.8.8.8:53)")
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
@@ -112,16 +114,24 @@ func parseKeyBytes(rawStr string) ([]byte, error) {
 	return nil, fmt.Errorf("invalid key length %d: must decode to 32 bytes (base64, hex, or raw)", len(rawStr))
 }
 
-func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, error) {
+func setupBootstrapManager() (*transport.BootstrapManager, error) {
+	if disableBootstrap {
+		log.Println("[EMERGENCY-SERVER] Running in messaging-only mode (--disable-bootstrap); recovery candidate endpoint responses disabled")
+		return transport.NewBootstrapManager(nil, "", 1)
+	}
+
 	var records []transport.BootstrapEndpointRecord
 
 	if bootstrapConfigFile != "" {
 		data, err := os.ReadFile(bootstrapConfigFile)
 		if err != nil {
-			return nil, fmt.Errorf("read bootstrap config %s: %w", bootstrapConfigFile, err)
+			return nil, fmt.Errorf("read bootstrap config file %s: %w", bootstrapConfigFile, err)
 		}
 		if err := json.Unmarshal(data, &records); err != nil {
-			return nil, fmt.Errorf("parse bootstrap config JSON: %w", err)
+			return nil, fmt.Errorf("parse bootstrap config JSON in %s: %w (format must be valid JSON array of BootstrapEndpointRecord)", bootstrapConfigFile, err)
+		}
+		if len(records) == 0 {
+			return nil, fmt.Errorf("bootstrap config file %s contains 0 candidate records (must contain at least one valid candidate)", bootstrapConfigFile)
 		}
 	} else {
 		ip := bootstrapIP
@@ -129,12 +139,12 @@ func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, er
 			ip = os.Getenv("PAQET_BOOTSTRAP_IP")
 		}
 		if ip == "" {
-			ip = "77.37.65.2"
+			return nil, errors.New("missing recovery endpoint configuration: a production emergency server must be supplied an explicit configuration via --bootstrap-config <file.json>, --bootstrap-ip <ip>, or explicitly pass --disable-bootstrap to run as a messaging-only emergency server (implicit defaults removed for fail-closed security)")
 		}
 
 		port := bootstrapPort
-		if port <= 0 {
-			port = 18089
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("invalid bootstrap port %d: must be between 1 and 65535", port)
 		}
 
 		mode := bootstrapMode
@@ -144,6 +154,7 @@ func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, er
 
 		var idType transport.EndpointIdentityType
 		var idValue string
+		var provenance string
 
 		switch mode {
 		case "tls-outer", "tls-stream":
@@ -154,10 +165,12 @@ func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, er
 					return nil, fmt.Errorf("tls bootstrap cert error: %w", err)
 				}
 				idValue = fp
+				provenance = fmt.Sprintf("cert_file:%s", filepath.Base(bootstrapCertFile))
 			} else if bootstrapPin != "" {
 				idValue = bootstrapPin
+				provenance = fmt.Sprintf("pin:%s", bootstrapPin[:min(14, len(bootstrapPin))]+"...[truncated]")
 			} else {
-				return nil, errors.New("tls-outer bootstrap requires --bootstrap-cert or --bootstrap-pin (cannot use shared PSK as TLS certificate fingerprint)")
+				return nil, errors.New("tls-outer bootstrap requires an explicit certificate identity via --bootstrap-cert or --bootstrap-pin (cannot use shared PSK as TLS certificate fingerprint)")
 			}
 
 		case "aead-stream", "raw-kcp":
@@ -169,16 +182,18 @@ func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, er
 				}
 				kBytes, err := parseKeyBytes(string(kData))
 				if err != nil {
-					return nil, fmt.Errorf("parse bootstrap key: %w", err)
+					return nil, fmt.Errorf("parse bootstrap key in %s: %w", bootstrapKeyFile, err)
 				}
 				idValue = fmt.Sprintf("SHA256:%x", sha256.Sum256(kBytes))
+				provenance = fmt.Sprintf("key_file:%s", filepath.Base(bootstrapKeyFile))
 			} else if bootstrapPin != "" {
 				idValue = bootstrapPin
+				provenance = fmt.Sprintf("pin:%s", bootstrapPin[:min(14, len(bootstrapPin))]+"...[truncated]")
 			} else {
-				idValue = fmt.Sprintf("SHA256:%x", sha256.Sum256(emergencyPSK))
+				return nil, fmt.Errorf("%s bootstrap requires an explicit data-plane identity via --bootstrap-key-file or --bootstrap-pin (conflating recovery transport key with emergency PSK is strictly prohibited for security separation)", mode)
 			}
 		default:
-			return nil, fmt.Errorf("unsupported bootstrap transport mode %q", mode)
+			return nil, fmt.Errorf("unsupported bootstrap transport mode %q (fail-closed rejection)", mode)
 		}
 
 		records = append(records, transport.BootstrapEndpointRecord{
@@ -187,6 +202,7 @@ func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, er
 			TransportMode: mode,
 			IdentityType:  idType,
 			IdentityValue: idValue,
+			Provenance:    provenance,
 			ValiditySec:   7200,
 		})
 	}
@@ -203,7 +219,7 @@ var serverCmd = &cobra.Command{
 			log.Fatalf("failed to load emergency key: %v", err)
 		}
 
-		bm, err := setupBootstrapManager(psk)
+		bm, err := setupBootstrapManager()
 		if err != nil {
 			log.Fatalf("failed to initialize bootstrap manager: %v", err)
 		}

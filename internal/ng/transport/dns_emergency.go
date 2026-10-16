@@ -242,8 +242,9 @@ type BootstrapEndpointRecord struct {
 	TransportPort int                  `json:"transport_port" yaml:"transport_port"`
 	TransportMode string               `json:"transport_mode" yaml:"transport_mode"`
 	IdentityType  EndpointIdentityType `json:"identity_type" yaml:"identity_type"`
-	IdentityValue string               `json:"identity_value" yaml:"identity_value"` // Canonical "SHA256:<64 hex>"
-	ValiditySec   int64                `json:"validity_sec" yaml:"validity_sec"`     // Expiry seconds relative to generation time
+	IdentityValue string               `json:"identity_value" yaml:"identity_value"`             // Canonical "SHA256:<64 hex>"
+	Provenance    string               `json:"provenance,omitempty" yaml:"provenance,omitempty"` // Provenance metadata (e.g. "key_file:bundle.key", "pin:SHA256:...")
+	ValiditySec   int64                `json:"validity_sec" yaml:"validity_sec"`                 // Expiry seconds relative to generation time
 }
 
 // BootstrapManager manages mode-aware, validated recovery candidate records and produces authenticated bootstrap payloads.
@@ -274,6 +275,7 @@ func (bm *BootstrapManager) AddRecord(rec BootstrapEndpointRecord) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
+	// 1. IP validation & Disallowed IP address classes
 	if rec.ServerIP == "" {
 		return errors.New("bootstrap record: missing server IP")
 	}
@@ -281,14 +283,29 @@ func (bm *BootstrapManager) AddRecord(rec BootstrapEndpointRecord) error {
 	if ip == nil {
 		return fmt.Errorf("bootstrap record: invalid server IP: %q", rec.ServerIP)
 	}
-	if rec.TransportPort <= 0 || rec.TransportPort > 65535 {
-		return fmt.Errorf("bootstrap record: invalid port %d", rec.TransportPort)
+	if ip.IsUnspecified() {
+		return fmt.Errorf("bootstrap record: disallowed unspecified IP: %s", rec.ServerIP)
 	}
+	if ip.IsMulticast() {
+		return fmt.Errorf("bootstrap record: disallowed multicast IP: %s", rec.ServerIP)
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("bootstrap record: disallowed link-local IP: %s", rec.ServerIP)
+	}
+
+	// 2. Port validation
+	if rec.TransportPort <= 0 || rec.TransportPort > 65535 {
+		return fmt.Errorf("bootstrap record: invalid port %d (must be 1-65535)", rec.TransportPort)
+	}
+
+	// 3. Transport mode validation (strict whitelist)
 	switch rec.TransportMode {
 	case "raw-kcp", "aead-stream", "tls-outer", "tls-stream":
 	default:
-		return fmt.Errorf("bootstrap record: unsupported transport mode %q", rec.TransportMode)
+		return fmt.Errorf("bootstrap record: unsupported transport mode %q (fail-closed rejection)", rec.TransportMode)
 	}
+
+	// 4. Identity validation
 	if rec.IdentityValue == "" {
 		return fmt.Errorf("bootstrap record: missing identity value for mode %s", rec.TransportMode)
 	}
@@ -305,12 +322,40 @@ func (bm *BootstrapManager) AddRecord(rec BootstrapEndpointRecord) error {
 			return fmt.Errorf("bootstrap record: invalid identity type %q for %s mode (must be psk-id)", rec.IdentityType, rec.TransportMode)
 		}
 	}
+
+	// 5. Validity window validation (positive, max 24h)
 	if rec.ValiditySec <= 0 {
-		rec.ValiditySec = 7200 // default 2 hours
+		return fmt.Errorf("bootstrap record: invalid non-positive validity duration %d (must be > 0)", rec.ValiditySec)
+	}
+	if rec.ValiditySec > 86400 {
+		return fmt.Errorf("bootstrap record: validity duration %d exceeds maximum allowable 24h window", rec.ValiditySec)
+	}
+
+	// 6. Conflicting duplicate check
+	if existing, exists := bm.records[rec.TransportMode]; exists {
+		if existing.ServerIP != rec.ServerIP || existing.TransportPort != rec.TransportPort ||
+			existing.IdentityValue != rec.IdentityValue || existing.IdentityType != rec.IdentityType {
+			return fmt.Errorf("bootstrap record: duplicate conflicting record for transport mode %q", rec.TransportMode)
+		}
 	}
 
 	bm.records[rec.TransportMode] = rec
 	return nil
+}
+
+// RecordCount returns the count of registered candidate endpoints.
+func (bm *BootstrapManager) RecordCount() int {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	return len(bm.records)
+}
+
+// GetRecord retrieves a registered candidate endpoint record for a given mode.
+func (bm *BootstrapManager) GetRecord(mode string) (BootstrapEndpointRecord, bool) {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	rec, ok := bm.records[mode]
+	return rec, ok
 }
 
 // SetRecoveryGen updates the active recovery revision generation.
@@ -324,6 +369,10 @@ func (bm *BootstrapManager) SetRecoveryGen(gen uint64) {
 func (bm *BootstrapManager) GenerateResponse(req *EmergencyMessage, requestedMode string) (*BootstrapEndpointData, error) {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
+
+	if len(bm.records) == 0 {
+		return nil, errors.New("recovery: no recovery endpoints configured; recovery plane disabled (fail-closed safe state)")
+	}
 
 	mode := requestedMode
 	if mode == "" || mode == "REQUEST_BOOTSTRAP_ENDPOINT" {
@@ -1037,13 +1086,14 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 
 // EmergencyDNSClientConfig configures the emergency DNS client.
 type EmergencyDNSClientConfig struct {
-	ResolverAddr string // e.g. "8.8.8.8:53"
-	DomainSuffix string // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
-	ClientID     string
-	PSK          []byte
-	SessionID    uint64
-	Timeout      time.Duration
-	MaxRetries   int
+	ResolverAddr   string // e.g. "8.8.8.8:53"
+	DomainSuffix   string // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
+	ClientID       string
+	PSK            []byte
+	SessionID      uint64
+	Timeout        time.Duration
+	MaxRetries     int
+	EDNSBufferSize uint16 // Advertised UDP buffer size in OPT RR (default 1232)
 }
 
 // EmergencyDNSClient sends authenticated application messages over public recursive DNS and verifies responses.
@@ -1074,6 +1124,9 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 	}
 	if cfg.SessionID == 0 {
 		cfg.SessionID = cryptoRandUint64()
+	}
+	if cfg.EDNSBufferSize == 0 {
+		cfg.EDNSBufferSize = DefaultEDNSUDPPayloadSize
 	}
 
 	sess, err := NewClientAsymmetricSession(cfg.SessionID, cfg.PSK)
@@ -1192,7 +1245,7 @@ func (c *EmergencyDNSClient) attemptExchange(
 		}
 
 		txID := uint16(cryptoRandUint64())
-		queryPkt := BuildDNSQuery(qname, 0x0010 /* TXT */, txID)
+		queryPkt := BuildDNSQueryWithEDNS(qname, 0x0010 /* TXT */, txID, c.cfg.EDNSBufferSize)
 		if _, err := conn.WriteToUDP(queryPkt, resolverUDP); err != nil {
 			return nil, err
 		}
@@ -1233,6 +1286,12 @@ func (c *EmergencyDNSClient) attemptExchange(
 			continue
 		}
 
+		respFlags := binary.BigEndian.Uint16(respPkt[2:4])
+		if respFlags&0x0200 != 0 {
+			// TC (Truncation) flag is set: payload exceeded safe UDP buffer. Fall back to RFC 7766 TCP port 53!
+			return c.attemptTCPExchange(ctx, resolverUDP.String(), queries[0].qname, expectedMsgID)
+		}
+
 		txtAnswer, err := ParseDNSTXTResponse(respPkt)
 		if err != nil || len(txtAnswer) < AsymmetricHeaderLen {
 			continue
@@ -1255,6 +1314,68 @@ func (c *EmergencyDNSClient) attemptExchange(
 	}
 
 	return nil, errors.New("timeout waiting for valid response")
+}
+
+func (c *EmergencyDNSClient) attemptTCPExchange(
+	ctx context.Context,
+	resolverAddr string,
+	qname string,
+	expectedMsgID string,
+) (*EmergencyResponse, error) {
+	d := &net.Dialer{Timeout: c.cfg.Timeout}
+	conn, err := d.DialContext(ctx, "tcp", resolverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dns fallback dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(c.cfg.Timeout))
+
+	txID := uint16(cryptoRandUint64())
+	queryPkt := BuildDNSQueryWithEDNS(qname, 0x0010 /* TXT */, txID, c.cfg.EDNSBufferSize)
+
+	// RFC 7766 TCP framing: 2-byte big-endian length prefix
+	frameBuf := make([]byte, 2+len(queryPkt))
+	binary.BigEndian.PutUint16(frameBuf[0:2], uint16(len(queryPkt)))
+	copy(frameBuf[2:], queryPkt)
+
+	if _, err := conn.Write(frameBuf); err != nil {
+		return nil, fmt.Errorf("tcp dns write: %w", err)
+	}
+
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("tcp dns read len: %w", err)
+	}
+	respLen := binary.BigEndian.Uint16(lenBuf[:])
+	respBuf := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, respBuf); err != nil {
+		return nil, fmt.Errorf("tcp dns read packet: %w", err)
+	}
+
+	if len(respBuf) < 12 {
+		return nil, errors.New("tcp dns: response too short")
+	}
+
+	txtAnswer, err := ParseDNSTXTResponse(respBuf)
+	if err != nil || len(txtAnswer) < AsymmetricHeaderLen {
+		return nil, fmt.Errorf("tcp dns parse txt: %w", err)
+	}
+
+	_, _, respPlaintext, err := c.session.openFrame(txtAnswer)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dns auth frame: %w", err)
+	}
+
+	var resp EmergencyResponse
+	if err := json.Unmarshal(respPlaintext, &resp); err != nil {
+		return nil, fmt.Errorf("tcp dns unmarshal json: %w", err)
+	}
+
+	if resp.ID == expectedMsgID {
+		return &resp, nil
+	}
+	return nil, fmt.Errorf("tcp dns unexpected message id: got %s, want %s", resp.ID, expectedMsgID)
 }
 
 // GenerateEmergencyKey produces a fresh 32-byte cryptographically secure random key.

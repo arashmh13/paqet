@@ -121,3 +121,18 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 - **Empirical Scope (Phase 14):** In Phase 14, failover between primary (`77.37.65.2:18088`) and candidate (`77.37.65.2:18089`) was proven across the international border under targeted port-level blocking.
 - **Explicit Boundary:** Because both the primary transport, candidate transport, and authoritative emergency DNS daemon are hosted on `77.37.65.2` (Hetzner AS24940), this test proves **port-level and process-level failover resilience**, not IP-level or ASN-level survival.
 - **Unverified Invariant:** If the censor blocks destination IP `77.37.65.2` entirely, both the proxy data plane and emergency control plane are severed. Survival of IP blocking requires deploying candidate endpoints and a secondary authoritative nameserver (`ns2...`) on an independent cloud provider and distinct BGP autonomous system (see `docs/research/failure_domain_resilience_matrix.md`). Do not claim IP-block survival until independent cloud infrastructure is provisioned.
+
+---
+
+## 15. Post-Activation Request Latency vs. Total End-to-End Failover Duration
+
+- **Scope & Distinction (Phase 15):** In live testing, the application request through SOCKS5 `:11990` completed in **87.94 ms** (or 179.16 ms in Phase 14). This metric represents the HTTP round-trip latency *after* the recovery candidate has been authenticated and placed in `RECOVERY_READY`.
+- **Total Failover Duration:** The full duration from the moment the primary transport is severed to the moment the first valid application response is verified includes:
+  1. Primary failure detection threshold crossing (35.40 ms).
+  2. Degraded-state hysteresis delay (60.62 ms).
+  3. Public recursive DNS bootstrap exchange RTT (4639.34 ms via Google `8.8.8.8:53`).
+  4. Candidate cryptographic handshake validation (0.00 ms).
+  5. State activation delay (0.00 ms).
+  6. Post-activation application request through SOCKS5 (87.94 ms).
+  7. **Total Monotonic Failover Duration: 4993.79 ms (~4.99 seconds)**.
+- **Operational Reality:** An 87 ms application request latency is expected for an active proxy channel, but operators must understand that automated failover across international public recursive DNS takes approximately 5 seconds from initial failure to restored traffic. Technical documentation must never misrepresent an 87 ms post-activation request as "87 ms total failover".

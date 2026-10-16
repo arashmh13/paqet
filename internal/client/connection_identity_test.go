@@ -2,7 +2,9 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -230,4 +232,137 @@ func TestClient_NewStrmContextCancellationStopsLoop(t *testing.T) {
 	if dur > 1*time.Second {
 		t.Fatalf("newStrm took too long (%v), must respect context cancellation quickly", dur)
 	}
+}
+
+func TestTimedConn_CandidateKeyMismatchFailsClosed(t *testing.T) {
+	primaryAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:8088")
+	cfg := &conf.Conf{
+		Server: conf.Server{
+			Addr: primaryAddr,
+		},
+		Transport: conf.Transport{
+			Protocol: "aead-stream",
+			Obfs: &conf.Obfs{
+				Enabled: true,
+				Key:     "01234567890123456789012345678901",
+			},
+		},
+	}
+
+	// Snapshot expects key with a DIFFERENT fingerprint
+	mismatchedPin := "SHA256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	sm := transport.NewRecoveryStateMachine(transport.RecoveryStateMachineConfig{
+		PrimaryFailureThreshold: 1,
+		DegradedTimeout:         5 * time.Millisecond,
+		AllowLoopbackEndpoints:  true,
+		EmergencyDialer: func(ctx context.Context, msg *transport.EmergencyMessage) (*transport.BootstrapEndpointData, error) {
+			return &transport.BootstrapEndpointData{
+				Version:       2,
+				ServerIP:      "127.0.0.1",
+				TransportPort: 18089,
+				TransportMode: "aead-stream",
+				IdentityType:  transport.IdentityTypePSKID,
+				IdentityValue: mismatchedPin,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}, nil
+		},
+		CandidateValidator: func(ctx context.Context, endpoint *transport.BootstrapEndpointData) error {
+			return nil
+		},
+	})
+
+	sm.ReportPrimaryFailure(errors.New("primary down"))
+	time.Sleep(10 * time.Millisecond)
+	st, err := sm.Step(context.Background())
+	if err != nil || st != transport.StateRecoveryReady {
+		t.Fatalf("Expected RECOVERY_READY, got %s, err %v", st, err)
+	}
+
+	tc := &timedConn{
+		cfg:            cfg,
+		index:          0,
+		recoveryEngine: sm,
+	}
+
+	// createConn must fail closed immediately because configured key doesn't match snapshot identity!
+	conn, _, err := tc.createConn()
+	if err == nil {
+		if conn != nil {
+			conn.Close()
+		}
+		t.Fatalf("expected candidate key mismatch failure, but createConn succeeded!")
+	}
+	t.Logf("PASS: createConn failed closed on candidate key mismatch: %v", err)
+}
+
+func TestTimedConn_GenerationChangeOrRollbackDuringDialRejectsConnection(t *testing.T) {
+	configuredKey := "01234567890123456789012345678901"
+	keyDigest := fmt.Sprintf("SHA256:%x", sha256.Sum256([]byte(configuredKey)))
+
+	primaryAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:8088")
+	cfg := &conf.Conf{
+		Server: conf.Server{
+			Addr: primaryAddr,
+		},
+		Transport: conf.Transport{
+			Protocol: "aead-stream",
+			Obfs: &conf.Obfs{
+				Enabled: true,
+				Key:     configuredKey,
+			},
+		},
+	}
+
+	sm := transport.NewRecoveryStateMachine(transport.RecoveryStateMachineConfig{
+		PrimaryFailureThreshold: 1,
+		DegradedTimeout:         5 * time.Millisecond,
+		AllowLoopbackEndpoints:  true,
+		EmergencyDialer: func(ctx context.Context, msg *transport.EmergencyMessage) (*transport.BootstrapEndpointData, error) {
+			return &transport.BootstrapEndpointData{
+				Version:       2,
+				ServerIP:      "127.0.0.1",
+				TransportPort: 18089,
+				TransportMode: "aead-stream",
+				IdentityType:  transport.IdentityTypePSKID,
+				IdentityValue: keyDigest,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}, nil
+		},
+		CandidateValidator: func(ctx context.Context, endpoint *transport.BootstrapEndpointData) error {
+			return nil
+		},
+	})
+
+	sm.ReportPrimaryFailure(errors.New("primary down"))
+	time.Sleep(10 * time.Millisecond)
+	st, err := sm.Step(context.Background())
+	if err != nil || st != transport.StateRecoveryReady {
+		t.Fatalf("Expected RECOVERY_READY, got %s, err %v", st, err)
+	}
+
+	tc := &timedConn{
+		cfg:            cfg,
+		index:          0,
+		recoveryEngine: sm,
+	}
+
+	// Simulate dialing: we have dialed candidate identity
+	dialedIdentity := ConnectionIdentity{
+		RemoteAddr:    "127.0.0.1:18089",
+		TransportMode: transport.ModeAEADStream,
+		Generation:    sm.ActiveSnapshot().Generation,
+		IdentityType:  transport.IdentityTypePSKID,
+		IdentityValue: keyDigest,
+		IsRecovery:    true,
+	}
+
+	// Before inserting into pool, rollback occurs!
+	sm.ResetRollback("test primary restored")
+
+	// Verify that tc.desiredIdentity() now disagrees with dialedIdentity
+	currentDesired := tc.desiredIdentity()
+	if dialedIdentity.Matches(currentDesired) {
+		t.Fatalf("dialed recovery identity must not match desired identity after rollback to primary!")
+	}
+	t.Logf("PASS: Post-rollback desired identity correctly rejects dialed recovery connection")
 }

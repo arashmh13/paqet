@@ -1,0 +1,150 @@
+{
+  "timestamp": "2026-10-16T11:22:54.112107042Z",
+  "phase": "Phase 15 (Fail-Closed Config, Identity Continuity \u0026 Monotonic Timeline)",
+  "test_token": "PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0",
+  "primary_endpoint": "77.37.65.2:18088",
+  "candidate_endpoint": "77.37.65.2:18089",
+  "socks5_listen_port": 11990,
+  "http_origin_port": 18999,
+  "dns_path": {
+    "resolver_configured": "8.8.8.8:53",
+    "path_type": "public_recursive",
+    "authoritative_host": "77.37.65.2:53",
+    "domain_suffix": "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir",
+    "edns_buffer_size": 1232,
+    "exchange_rtt_ms": 4639.339,
+    "authenticated": true,
+    "received_message_id": "msg-d058c79fa8ba59bb541606ef8c1c4681"
+  },
+  "timeline": {
+    "t0_primary_failure_injected_ms": 0,
+    "t1_failure_threshold_crossed_ms": 35.398,
+    "t2_degraded_hysteresis_ended_ms": 96.016,
+    "t3_dns_request_started_ms": 96.055,
+    "t4_dns_response_received_ms": 4905.791,
+    "t5_candidate_validation_started_ms": 4905.791,
+    "t6_candidate_validation_completed_ms": 4905.792,
+    "t7_recovery_state_activated_ms": 4905.792,
+    "t8_first_app_conn_started_ms": 4905.853,
+    "t9_first_app_response_verified_ms": 4993.794,
+    "t10_rollback_completed_ms": 4994.424,
+    "t11_primary_restoration_completed_ms": 5042.75
+  },
+  "intervals": {
+    "primary_failure_detection_ms": 35.398,
+    "degraded_hysteresis_ms": 60.618,
+    "dns_exchange_rtt_ms": 4639.339,
+    "candidate_validation_rtt_ms": 0.0010000000002037268,
+    "state_activation_delay_ms": 0,
+    "post_activation_app_rtt_ms": 87.9409999999998,
+    "total_failover_duration_ms": 4993.794
+  },
+  "step_a_baseline": {
+    "passed": true,
+    "description": "Baseline SOCKS5 request routed through primary transport :18088",
+    "duration_ms": 93.382,
+    "details": "HTTP 200 returned in 93.38 ms, verified token PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0"
+  },
+  "step_b_primary_drop": {
+    "passed": true,
+    "description": "Iptables DROP applied to primary port 18088, failure threshold crossed",
+    "duration_ms": 35.398,
+    "details": "Primary failure registered; state transitioned to PRIMARY_DEGRADED"
+  },
+  "step_c_signaling": {
+    "passed": true,
+    "description": "Emergency DNS bootstrap exchange via public recursive resolver 8.8.8.8:53",
+    "duration_ms": 4639.339,
+    "details": "Received authenticated bootstrap payload (candidate: 77.37.65.2:18089, mode: aead-stream, gen: 6)"
+  },
+  "step_d_validation": {
+    "passed": true,
+    "description": "Remote candidate cryptographic handshake validation",
+    "duration_ms": 0,
+    "details": "Validated 77.37.65.2:18089 (aead-stream) remote handshake with pin SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d"
+  },
+  "step_e_recovery": {
+    "passed": true,
+    "description": "Application request traversed SOCKS5 and recovery candidate transport to remote HTTP origin",
+    "duration_ms": 87.94,
+    "details": "HTTP 200 received in 87.94 ms, byte-exact token verified: PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0"
+  },
+  "step_f_adverse_tests": [
+    {
+      "passed": true,
+      "description": "Candidate with mismatched PSK fingerprint fails closed",
+      "duration_ms": 0.37,
+      "details": "Rejected in 0.37 ms: recovery: candidate endpoint failed authenticated validation handshake: aead-stream key fingerprint mismatch: expected SHA256:0000000000000000000000000000000000000000000000000000000000000000, configured PSK fingerprint is SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d"
+    },
+    {
+      "passed": true,
+      "description": "Candidate with expired ValidUntil rejected fail-closed",
+      "duration_ms": 0.007,
+      "details": "Rejected in 0.01 ms: bootstrap: endpoint coordinates expired at 1792149769 (current time 1792149779, ValidUntil \u003c= now is expired)"
+    },
+    {
+      "passed": true,
+      "description": "Candidate with unknown transport mode rejected fail-closed",
+      "duration_ms": 0.003,
+      "details": "Rejected in 0.00 ms: bootstrap: unsupported transport mode: \"unknown-vpn-protocol\" (fail-closed rejection)"
+    }
+  ],
+  "step_g_rollback": {
+    "passed": true,
+    "description": "ResetRollback executed; state returned to PRIMARY_HEALTHY",
+    "duration_ms": 0.004,
+    "details": "State: PRIMARY_HEALTHY, Snapshot Cleared: true"
+  },
+  "step_h_restoration": {
+    "passed": true,
+    "description": "Iptables DROP rule on port 18088 removed; primary transport restored",
+    "duration_ms": 48.317,
+    "details": "Port 18088 restored for primary traffic"
+  },
+  "production_health": "UNKNOWN",
+  "history": [
+    {
+      "from_state": "PRIMARY_HEALTHY",
+      "to_state": "PRIMARY_HEALTHY",
+      "reason": "initialization",
+      "timestamp": "2026-10-16T14:52:54.112351508+03:30"
+    },
+    {
+      "from_state": "PRIMARY_HEALTHY",
+      "to_state": "PRIMARY_DEGRADED",
+      "reason": "consecutive primary failures (1) reached threshold: primary transport timeout (simulated port-block)",
+      "timestamp": "2026-10-16T14:52:54.532418653+03:30"
+    },
+    {
+      "from_state": "PRIMARY_DEGRADED",
+      "to_state": "EMERGENCY_SIGNALING",
+      "reason": "degraded timeout elapsed; requesting bootstrap failover via emergency DNS",
+      "timestamp": "2026-10-16T14:52:54.593110772+03:30"
+    },
+    {
+      "from_state": "EMERGENCY_SIGNALING",
+      "to_state": "BOOTSTRAP_RECEIVED",
+      "reason": "received authenticated bootstrap endpoint 77.37.65.2:18089 (aead-stream)",
+      "timestamp": "2026-10-16T14:52:59.232797194+03:30"
+    },
+    {
+      "from_state": "BOOTSTRAP_RECEIVED",
+      "to_state": "CANDIDATE_ENDPOINT_VALIDATING",
+      "reason": "initiating independent authenticated handshake validation",
+      "timestamp": "2026-10-16T14:52:59.232797693+03:30"
+    },
+    {
+      "from_state": "CANDIDATE_ENDPOINT_VALIDATING",
+      "to_state": "RECOVERY_READY",
+      "reason": "candidate endpoint 77.37.65.2:18089 (aead-stream) validated and active for new connections",
+      "timestamp": "2026-10-16T14:52:59.402784257+03:30"
+    },
+    {
+      "from_state": "RECOVERY_READY",
+      "to_state": "PRIMARY_HEALTHY",
+      "reason": "manual or automated rollback: Live experiment complete",
+      "timestamp": "2026-10-16T14:52:59.491447072+03:30"
+    }
+  ],
+  "outcome": "PHASE15_VERIFIED_FAILOVER_TIMELINE_PROVEN"
+}

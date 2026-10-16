@@ -35,6 +35,10 @@ This document defines an explicit, empirically grounded resilience matrix classi
 | **FD-11** | **Candidate on Independent IP** | Candidate hosted on distinct IPv4 address | Candidate validated via independent handshake | Blocked pending second cloud VPS acquisition | **EXTERNALLY BLOCKED** |
 | **FD-12** | **Candidate on Distinct Provider / ASN** | Candidate hosted on non-Hetzner autonomous system | Candidate accessible even if Hetzner AS24940 is blocked | Blocked pending second cloud VPS acquisition | **EXTERNALLY BLOCKED** |
 | **FD-13** | **Multi-Server Uncoordinated Replay** | Same query sent across two independent authoritative daemons | Single-datagram queries succeed; multipart reassembly fails | Proven in Phase 11 (`TestDualAuthoritativeServerCrossServerRetriesAndReplay`) | **DOCUMENTED BOUNDARY** |
+| **FD-14** | **Candidate Key Mismatch During Dial** | Client key does not match snapshot identity pin | Key checked before network dial; fails closed | Tested via `TestTimedConn_CandidateKeyMismatchFailsClosed` | **FAIL-CLOSED SAFE** |
+| **FD-15** | **Rollback / Generation Race During Dial** | Rollback or generation increments while dial in flight | Identity verified before pool insertion; socket closed | Tested via `TestTimedConn_GenerationChangeOrRollbackDuringDialRejectsConnection` | **FAIL-CLOSED SAFE** |
+| **FD-16** | **DNS Response Exceeding Safe UDP Limit** | Server response exceeds 1400 bytes | Server sets TC=1; client retries via RFC 7766 TCP :53 | Tested via `TestEDNS0_ResponseTruncationWhenExceedingLimit` & `TestEDNS0_TCPPort53FallbackOnTruncation` | **PROVEN & VERIFIED** |
+| **FD-17** | **Emergency PSK Conflation** | Emergency server started without candidate identity flags | Implicit fallback removed; daemon fails startup | Tested via `TestEmergencyServerStartup_AEADWithoutKeyOrPinFails` & live CLI verification | **FAIL-CLOSED SAFE** |
 
 ---
 

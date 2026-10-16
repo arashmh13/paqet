@@ -1,8 +1,10 @@
 package stream
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -85,6 +87,60 @@ func DialTLS(addr string, obfsCfg *conf.Obfs, tlsCfg *conf.TLS) (tnet.Conn, erro
 		session:    sess,
 		rawConn:    rawConn,
 	}, nil
+}
+
+// DialTLSPinned establishes an authentic TLS 1.3 outer connection and validates that the remote peer
+// presents a leaf certificate (or public key) matching expectedPin.
+func DialTLSPinned(addr string, obfsCfg *conf.Obfs, tlsCfg *conf.TLS, expectedPin string, isPubKeyPin bool) (tnet.Conn, error) {
+	conn, err := DialTLS(addr, obfsCfg, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	streamConn, ok := conn.(*Conn)
+	if !ok || streamConn.underlying == nil {
+		_ = conn.Close()
+		return nil, errors.New("tls stream: invalid underlying connection type")
+	}
+
+	tlsConn, ok := streamConn.underlying.(*tls.Conn)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("tls stream: underlying connection is not *tls.Conn")
+	}
+
+	cs := tlsConn.ConnectionState()
+	if len(cs.PeerCertificates) == 0 {
+		_ = conn.Close()
+		return nil, errors.New("tls stream: peer presented no certificates")
+	}
+	leaf := cs.PeerCertificates[0]
+
+	expectedDigest, err := transport.ParseSHA256Fingerprint(expectedPin)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("tls stream: invalid expected pin %q: %w", expectedPin, err)
+	}
+
+	var actualDigest [32]byte
+	if isPubKeyPin {
+		pubKeyBytes, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("tls stream: marshal leaf public key: %w", err)
+		}
+		actualDigest = sha256.Sum256(pubKeyBytes)
+	} else {
+		actualDigest = sha256.Sum256(leaf.Raw)
+	}
+
+	if actualDigest != expectedDigest {
+		_ = conn.Close()
+		return nil, fmt.Errorf("tls stream: peer certificate pin mismatch: got SHA256:%x, want %s (fail-closed)",
+			actualDigest, expectedPin)
+	}
+
+	return conn, nil
 }
 
 // TLSListener wraps net.Listener to accept genuine TLS connections into tnet.Conn.

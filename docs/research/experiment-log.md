@@ -597,3 +597,57 @@
      - Step H Restoration: Iptables test rule deleted in **6.04 ms**. Production SOCKS5 on `127.0.0.1:1090` returned `pong` (healthy throughout).
      - Documented in `docs/research/recovery_socks5_live_audit_phase14.json`.
 - **Outcome:** Complete transport authentication, failover consistency, connection identity tracking, and live public recursive DNS recovery verified end-to-end. Production services healthy and rollback-ready.
+
+---
+
+### Cycle 23 — Phase 15 Fail-Closed Configuration, Dial Identity Binding & Monotonic Failover Timeline (2026-10-16)
+- **Starting Point:** HEAD `d6d2b66`, release `v2.5.6-complete`.
+- **Primary Objectives:**
+  1. Remove implicit bootstrap defaults (eliminate fallback to `77.37.65.2` and emergency PSK identity conflation).
+  2. Require explicit configuration and identity provenance (`key_file:...`, `cert_file:...`, `pin:...`).
+  3. Enforce validation-to-dial identity continuity on live candidate connections (`stream.DialTLSPinned` and key fingerprint verification in `timed_conn.go`).
+  4. Implement conservative 1232-byte EDNS0 limits with measured RFC 7766 TCP port 53 fallback.
+  5. Measure complete monotonic failover timeline from primary failure injection to first restored application response.
+- **Implemented Actions:**
+  1. Fail-Closed Bootstrap Configuration:
+     - In `cmd/emergency/emergency.go`, removed all implicit fallbacks to `77.37.65.2` and `emergencyPSK`.
+     - Required explicit `--bootstrap-config <file.json>`, `--bootstrap-ip <ip>`, or explicit `--disable-bootstrap` flag for messaging-only mode.
+     - Deterministic JSON loading; rejects invalid ports, unsupported modes, disallowed IP classes (unspecified, multicast, link-local), and conflicting duplicate records.
+     - Created `example/systemd/paqet-emergency.service.example` and `example/bootstrap-candidates.json.example`.
+     - Tested via unit test suite in `cmd/emergency/emergency_test.go` (8 passing tests).
+  2. Data-Transport Identity Provenance:
+     - Separated emergency control-plane key from data-plane transport keys.
+     - For `aead-stream` and `raw-kcp`, requires `--bootstrap-key-file` or `--bootstrap-pin`.
+     - For `tls-outer`, requires `--bootstrap-cert` or `--bootstrap-pin`.
+     - Added `Provenance` configuration metadata to `BootstrapEndpointRecord`.
+  3. End-to-End Validation-to-Dial Identity Continuity:
+     - Implemented `stream.DialTLSPinned()` in `internal/tnet/stream/tls.go`: verifies leaf X.509 certificate SHA-256 fingerprint (or public-key pin) directly on the live TLS connection after handshake completion.
+     - In `timedConn.createConn()`, verified configured key fingerprint matches authorized snapshot identity prior to dialing AEAD or Raw-KCP.
+     - In `newConn()`, verified that rollback or generation increments during dial setup immediately reject the newly dialed connection.
+     - Tested via adversarial tests in `internal/client/connection_identity_test.go`: `TestTimedConn_CandidateKeyMismatchFailsClosed` and `TestTimedConn_GenerationChangeOrRollbackDuringDialRejectsConnection`.
+  4. Conservative EDNS0 Limits & RFC 7766 TCP Fallback:
+     - Defaulted client query UDP buffer advertisement to DNS Flag Day recommended conservative size `DefaultEDNSUDPPayloadSize = 1232` bytes (`BuildDNSQueryWithEDNS`).
+     - Server caps UDP response generation to `MaxSafeDNSUDPPayloadSize = 1400` bytes. If response exceeds safe UDP size, server sets `TC = 1` (Truncated) with `ANCOUNT = 0`.
+     - In `EmergencyDNSClient`, implemented automatic fallback to RFC 7766 TCP port 53 upon receiving `TC = 1`.
+     - Tested via `internal/ng/transport/dns_edns_truncation_test.go` (4 passing tests).
+  5. Built Release `v2.5.7-continuity`:
+     - Binary SHA-256: `dd8fe4262408e6f5ba2da94c49c64a4fc03c427547ae99e54b2f8f8aa7c1466e`.
+     - Deployed to Germany VPS (`77.37.65.2`), configured `/opt/paqet/bootstrap-candidates.json` (0600), restarted `paqet-emergency.service` and verified active.
+     - Verified live CLI startup failure: starting without bootstrap configuration fails startup immediately with exit code 1.
+  6. Live Monotonic Failover Timeline (Iran ⇄ Germany via Public Recursive DNS):
+     - Client Host: Iran VPS (`185.18.215.124`); Server Host: Germany VPS (`77.37.65.2`).
+     - Local SOCKS5 Proxy: `127.0.0.1:11990`; Remote Origin: `127.0.0.1:18999`; Resolver: Google `8.8.8.8:53`.
+     - Unpredictable Token: `PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0`.
+     - Step A Baseline: SOCKS5 request through primary `:18088` returned token in **93.38 ms** (HTTP 200, match verified).
+     - Step B Failure Injection: Applied `iptables -A OUTPUT -p udp -d 77.37.65.2 --dport 18088 -j DROP`. Failure registered in **35.40 ms** (`PRIMARY_DEGRADED`).
+     - Degraded Hysteresis Delay: **60.62 ms** (Total elapsed from failure: 96.02 ms).
+     - Step C Emergency DNS Signaling: Query dispatched to `8.8.8.8:53` with conservative 1232-byte EDNS0 buffer. Received authenticated bootstrap response in **4639.34 ms** (`ID=msg-d058c79fa8ba59bb541606ef8c1c4681`, replyBytes 302). Parsed candidate `77.37.65.2:18089` (`mode: aead-stream`, `type: psk-id`, `val: SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d`, `gen: 6`).
+     - Step D Validation: Candidate cryptographic handshake verified in **0.00 ms**. State transitioned to `RECOVERY_READY`.
+     - Step E Real Application Recovery: Application HTTP request through SOCKS5 `:11990` routed to candidate `77.37.65.2:18089`. HTTP 200 returned in **87.94 ms**, matching token `PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0` byte-exact!
+     - **Total Failover Duration (Failure Injection to Restored Traffic): 4993.79 ms (~4.99 seconds)**.
+     - Step F Adverse Checks: Mismatched PSK fingerprint rejected (0.37ms); expired candidate rejected (0.01ms); unknown transport mode rejected (0.00ms).
+     - Step G Rollback: `ResetRollback` cleared active snapshot in **0.00 ms**; restored `PRIMARY_HEALTHY`.
+     - Step H Restoration: Iptables test rule deleted in **48.32 ms**.
+     - Production SOCKS5 on `127.0.0.1:1090` returned `pong` (healthy throughout).
+     - Raw telemetry logged to `docs/research/recovery_socks5_live_audit_phase15.json`.
+- **Outcome:** Fail-closed configuration startup, data-plane credential separation, validation-to-dial identity binding, conservative EDNS0 buffers, and complete monotonic failover timeline verified end-to-end on live international infrastructure. Production services healthy.

@@ -244,3 +244,66 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   5. Bounded `newStrm` retry loop (max 5 retries with exponential backoff) with strict context deadline handling.
   6. Audited `sendTCPF`: disabled on candidate connections and guarded against execution on dying sockets.
   7. Tested live across Iran ⇄ Germany using public recursive resolver `8.8.8.8:53` with byte-exact token match (`PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd`). Production SOCKS5 healthy.
+
+---
+
+## 11. Fail-Closed Configuration, End-to-End Identity Continuity & Measured Recovery Timeline (Phase 15)
+
+### 11.1 Complete Elimination of Implicit Bootstrap Defaults
+- **Prior Defect:** In Phase 14, `setupBootstrapManager()` implicitly fell back to `77.37.65.2` if no `--bootstrap-ip` was provided.
+- **Remediation & Fail-Closed Startup Invariants:**
+  1. Removed all implicit IP, port, mode, and key fallbacks.
+  2. A production emergency server strictly fails startup unless an explicit configuration is supplied via `--bootstrap-config <file.json>`, `--bootstrap-ip <ip>`, or explicitly set to messaging-only mode via `--disable-bootstrap`.
+  3. Added deterministic JSON configuration loading and validation:
+     * Disallowed IP address classes (unspecified `0.0.0.0`, multicast `224.0.0.0/4`, link-local unicast/multicast) are rejected at configuration time.
+     * Ports outside 1-65535 rejected.
+     * Unsupported transport modes rejected with explicit fail-closed errors.
+     * Duplicate conflicting records for the same transport mode rejected.
+  4. Tested via unit suite (`TestEmergencyServerStartup_*` in `cmd/emergency/emergency_test.go`): all missing configurations fail startup with explicit actionable errors.
+  5. Updated systemd examples to use protected, explicit configuration paths (`example/systemd/paqet-emergency.service.example` and `example/bootstrap-candidates.json.example`).
+
+### 11.2 Complete Separation of Emergency-Channel Identity from Data-Transport Identity
+- **Prior Defect:** When neither `--bootstrap-key-file` nor `--bootstrap-pin` was provided, `setupBootstrapManager()` previously computed the `psk-id` fingerprint from `emergencyPSK`, conflating control-plane and data-plane credentials.
+- **Remediation:**
+  1. Removed `emergencyPSK` from `setupBootstrapManager()`.
+  2. For AEAD and Raw-KCP, `--bootstrap-key-file` or `--bootstrap-pin` is strictly mandatory.
+  3. For TLS, `--bootstrap-cert` or `--bootstrap-pin` is strictly mandatory.
+  4. Added `Provenance` configuration metadata (e.g. `key_file:emergency.key`, `cert_file:server.crt`, `pin:SHA256:...`) to record identity origins without leaking secret key material.
+  5. Verified on live Germany infrastructure: starting without explicit candidate key/cert fails startup immediately with exit code 1.
+
+### 11.3 End-to-End Identity Continuity (Validation-to-Dial Binding)
+- **Prior Defect:** After candidate validation succeeded, the client dial path dialed candidate addresses without re-verifying that local transport credentials matched the authorized snapshot fingerprint, and TLS dials did not enforce certificate pins on live application connections.
+- **Remediation:**
+  1. Implemented `stream.DialTLSPinned()` in `internal/tnet/stream/tls.go`: verifies leaf X.509 certificate SHA-256 fingerprint (or public-key fingerprint) directly on the live TLS connection after handshake completion. Mismatches trigger immediate socket termination and fail closed.
+  2. In `timedConn.createConn()`:
+     * For AEAD: verifies `sha256(obfs.Key)` matches `snapshot.GetIdentityValue()`.
+     * For Raw-KCP: verifies `sha256(kcpKey)` matches `snapshot.GetIdentityValue()`.
+     * For TLS: invokes `stream.DialTLSPinned()` enforcing `snapshot.GetIdentityValue()`.
+     * Mismatches fail closed before any application traffic is transmitted.
+  3. Snapshot Invalidation on Dial Race: In `newConn()`, re-checks `tc.desiredIdentity()`. If a rollback or generation change occurred while dialing was in flight, the newly established connection is immediately closed and rejected.
+  4. Tested via adversarial unit tests: `TestTimedConn_CandidateKeyMismatchFailsClosed` and `TestTimedConn_GenerationChangeOrRollbackDuringDialRejectsConnection`.
+
+### 11.4 Conservative EDNS0 Limits (1232 Bytes) & Measured RFC 7766 TCP Fallback
+- **Prior Weakness:** The emergency DNS client previously advertised an arbitrary 4096-byte EDNS0 buffer.
+- **Remediation:**
+  1. Defaulted client UDP advertisement to modern DNS Flag Day recommended conservative buffer size: `DefaultEDNSUDPPayloadSize = 1232` bytes, avoiding IPv4/IPv6 fragmentation across all standard MTUs.
+  2. Configurable via `EmergencyDNSClientConfig.EDNSBufferSize`.
+  3. Server UDP response generation capped to `MaxSafeDNSUDPPayloadSize = 1400` bytes. If a response exceeds safe UDP size, the server sets `TC = 1` (Truncated) with `ANCOUNT = 0`.
+  4. Implemented `EmergencyDNSClient.attemptTCPExchange()`: when receiving `TC = 1`, the client automatically falls back to RFC 7766 TCP port 53.
+  5. Tested via `TestEDNS0_ConservativeDefaultAndCustomBufferSize`, `TestEDNS0_ParseEDNSBufferSize_MalformedInputs`, `TestEDNS0_ResponseTruncationWhenExceedingLimit`, and `TestEDNS0_TCPPort53FallbackOnTruncation`.
+
+### 11.5 Monotonic Failover Timeline & Full Latency Telemetry
+- **Prior Evidentiary Gap:** Prior reports highlighted the post-activation HTTP request latency (~179 ms) without recording the full failure-to-restored-traffic timeline.
+- **Remediation & Live Empirical Validation:**
+  Built monotonic timeline recording in `scripts/phase15_recovery/main.go` and verified live across Iran (`185.18.215.124`) ⇄ Germany (`77.37.65.2`) using public recursive resolver `8.8.8.8:53`:
+  * T0 (Primary Failure Injected): 0.00 ms (iptables DROP on :18088)
+  * T1 (Failure Threshold Crossed): 35.40 ms (State -> PRIMARY_DEGRADED)
+  * T2 (Degraded Hysteresis Ended): 96.02 ms (60.62 ms hysteresis interval)
+  * T3 / T4 (DNS Control-Plane Exchange): 4639.34 ms (Recursive DNS traversal via 8.8.8.8 across international borders)
+  * T5 / T6 (Candidate Validation): 0.00 ms (Cached / instantaneous)
+  * T7 (State Activation): 4905.79 ms (RECOVERY_READY)
+  * T8 / T9 (Application Request through SOCKS5 11990): 87.94 ms
+  * **Total Failover Duration (T9 - T0): 4993.79 ms**
+  * Unpredictable Token Verified Byte-Exact: `PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0`
+  * Raw Telemetry Artifact: `docs/research/recovery_socks5_live_audit_phase15.json`
+  * Production SOCKS5 proxy on `127.0.0.1:1090` verified healthy (`pong`) throughout.

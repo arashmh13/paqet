@@ -319,8 +319,57 @@ func (d *DNSAsymmetricDialer) Metrics() HealthMetrics {
 	return d.metrics
 }
 
-// BuildDNSQuery constructs an RFC 1035 compliant UDP DNS Query packet with RFC 6891 EDNS0 support.
-func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
+const (
+	// DefaultEDNSUDPPayloadSize is the DNS Flag Day recommended conservative buffer size (1232 bytes)
+	// that guarantees UDP datagrams avoid IPv4/IPv6 fragmentation across all standard MTUs.
+	DefaultEDNSUDPPayloadSize uint16 = 1232
+	// MaxSafeDNSUDPPayloadSize is the maximum safe UDP DNS packet size before forcing TCP truncation (1400 bytes).
+	MaxSafeDNSUDPPayloadSize = 1400
+)
+
+// ParseEDNSBufferSize extracts the client's advertised UDP buffer size from an incoming wire DNS query,
+// or returns 512 if no valid RFC 6891 OPT record is present.
+func ParseEDNSBufferSize(packet []byte) uint16 {
+	if len(packet) < 12 {
+		return 512
+	}
+	arcount := binary.BigEndian.Uint16(packet[10:12])
+	if arcount == 0 {
+		return 512
+	}
+
+	// Walk Question section
+	offset := 12
+	for offset < len(packet) {
+		length := int(packet[offset])
+		offset++
+		if length == 0 {
+			break
+		}
+		offset += length
+	}
+	offset += 4 // QTYPE + QCLASS
+	if offset >= len(packet) {
+		return 512
+	}
+
+	// Check for Root Name (0x00) and TYPE 41 (0x00 0x29) in additional section
+	if offset+11 <= len(packet) && packet[offset] == 0x00 {
+		qtype := binary.BigEndian.Uint16(packet[offset+1 : offset+3])
+		if qtype == 41 { // OPT
+			bufSize := binary.BigEndian.Uint16(packet[offset+3 : offset+5])
+			if bufSize >= 512 {
+				return bufSize
+			}
+		}
+	}
+	return 512
+}
+
+// BuildDNSQueryWithEDNS constructs an RFC 1035 / RFC 6891 compliant UDP DNS Query packet.
+// If ednsBufSize > 0, an RFC 6891 OPT record is appended advertising ednsBufSize.
+// If ednsBufSize == 0, a standard RFC 1035 query (512-byte limit) is built.
+func BuildDNSQueryWithEDNS(qname string, qtype uint16, id uint16, ednsBufSize uint16) []byte {
 	var buf []byte
 
 	// 12-byte DNS Header
@@ -328,7 +377,9 @@ func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
 	binary.BigEndian.PutUint16(header[0:2], id)
 	binary.BigEndian.PutUint16(header[2:4], 0x0100) // Standard query, recursion desired
 	binary.BigEndian.PutUint16(header[4:6], 1)      // QDCOUNT = 1
-	binary.BigEndian.PutUint16(header[10:12], 1)    // ARCOUNT = 1 (EDNS0 OPT RR)
+	if ednsBufSize > 0 {
+		binary.BigEndian.PutUint16(header[10:12], 1) // ARCOUNT = 1 (EDNS0 OPT RR)
+	}
 	buf = append(buf, header...)
 
 	// QNAME: series of length-prefixed labels
@@ -345,22 +396,23 @@ func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
 	binary.BigEndian.PutUint16(trailer[2:4], 0x0001) // Class IN
 	buf = append(buf, trailer...)
 
-	// RFC 6891 EDNS0 OPT RR (11 bytes):
-	// Root Name: 0x00
-	// TYPE: 41 (OPT)
-	// CLASS: 4096 (UDP payload size)
-	// TTL: 0
-	// RDLENGTH: 0
-	optRR := []byte{
-		0x00,
-		0x00, 0x29,
-		0x10, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00,
+	if ednsBufSize > 0 {
+		optRR := []byte{
+			0x00,
+			0x00, 0x29, // TYPE 41 (OPT)
+			byte(ednsBufSize >> 8), byte(ednsBufSize),
+			0x00, 0x00, 0x00, 0x00, // TTL = 0
+			0x00, 0x00, // RDLENGTH = 0
+		}
+		buf = append(buf, optRR...)
 	}
-	buf = append(buf, optRR...)
 
 	return buf
+}
+
+// BuildDNSQuery constructs an RFC 1035 compliant UDP DNS Query packet with default conservative EDNS0 buffer size (1232 bytes).
+func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
+	return BuildDNSQueryWithEDNS(qname, qtype, id, DefaultEDNSUDPPayloadSize)
 }
 
 // ParseDNSQuery extracts QNAME, QTYPE, and transaction ID from an incoming wire DNS query.
@@ -433,20 +485,13 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(hdr[6:8], 1) // ANCOUNT = 1
 
 	reqAR := binary.BigEndian.Uint16(reqPacket[10:12])
-	if reqAR > 0 {
-		binary.BigEndian.PutUint16(hdr[10:12], 1) // ARCOUNT = 1 (EDNS0)
+
+	// Cap server UDP response generation to documented safe size (1400 bytes).
+	// If a valid response cannot safely fit in UDP, set TC (Truncated) bit so client retries over RFC 7766 TCP.
+	maxUDPSize := MaxSafeDNSUDPPayloadSize
+	if clientBuf := int(ParseEDNSBufferSize(reqPacket)); clientBuf >= int(DefaultEDNSUDPPayloadSize) && clientBuf < MaxSafeDNSUDPPayloadSize {
+		maxUDPSize = clientBuf
 	}
-
-	resp = append(resp, hdr...)
-	resp = append(resp, questionSec...)
-
-	// Answer Section: Name pointer pointing to Question QNAME at offset 12 (0xC00C)
-	ansHdr := make([]byte, 10)
-	binary.BigEndian.PutUint16(ansHdr[0:2], 0xC00C) // Pointer to QNAME
-	binary.BigEndian.PutUint16(ansHdr[2:4], 0x0010) // TYPE TXT
-	binary.BigEndian.PutUint16(ansHdr[4:6], 0x0001) // CLASS IN
-	binary.BigEndian.PutUint32(ansHdr[6:10], 0)     // TTL 0 (Do not cache)
-	resp = append(resp, ansHdr...)
 
 	// RDATA: One or more RFC 1035 character-strings (max 255 bytes each)
 	var rdata []byte
@@ -464,6 +509,54 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 		}
 	}
 
+	// Check if response exceeds safe UDP size limit -> set TC (Truncated) bit
+	expectedLen := 12 + len(questionSec) + 10 + 2 + len(rdata)
+	if reqAR > 0 {
+		expectedLen += 11
+	}
+
+	if expectedLen > maxUDPSize {
+		// Truncated response: TC bit set (0x0200), ANCOUNT = 0
+		truncHdr := make([]byte, 12)
+		binary.BigEndian.PutUint16(truncHdr[0:2], id)
+		truncFlags := respFlags | 0x0200 // TC = 1
+		binary.BigEndian.PutUint16(truncHdr[2:4], truncFlags)
+		binary.BigEndian.PutUint16(truncHdr[4:6], 1) // QDCOUNT = 1
+		binary.BigEndian.PutUint16(truncHdr[6:8], 0) // ANCOUNT = 0
+		if reqAR > 0 {
+			binary.BigEndian.PutUint16(truncHdr[10:12], 1) // ARCOUNT = 1
+		}
+		var truncResp []byte
+		truncResp = append(truncResp, truncHdr...)
+		truncResp = append(truncResp, questionSec...)
+		if reqAR > 0 {
+			optRR := []byte{
+				0x00,
+				0x00, 0x29,
+				byte(maxUDPSize >> 8), byte(maxUDPSize),
+				0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00,
+			}
+			truncResp = append(truncResp, optRR...)
+		}
+		return truncResp, nil
+	}
+
+	if reqAR > 0 {
+		binary.BigEndian.PutUint16(hdr[10:12], 1) // ARCOUNT = 1 (EDNS0)
+	}
+
+	resp = append(resp, hdr...)
+	resp = append(resp, questionSec...)
+
+	// Answer Section: Name pointer pointing to Question QNAME at offset 12 (0xC00C)
+	ansHdr := make([]byte, 10)
+	binary.BigEndian.PutUint16(ansHdr[0:2], 0xC00C) // Pointer to QNAME
+	binary.BigEndian.PutUint16(ansHdr[2:4], 0x0010) // TYPE TXT
+	binary.BigEndian.PutUint16(ansHdr[4:6], 0x0001) // CLASS IN
+	binary.BigEndian.PutUint32(ansHdr[6:10], 0)     // TTL 0 (Do not cache)
+	resp = append(resp, ansHdr...)
+
 	rdLen := make([]byte, 2)
 	binary.BigEndian.PutUint16(rdLen, uint16(len(rdata)))
 	resp = append(resp, rdLen...)
@@ -473,7 +566,7 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 		optRR := []byte{
 			0x00,
 			0x00, 0x29,
-			0x10, 0x00,
+			byte(maxUDPSize >> 8), byte(maxUDPSize),
 			0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00,
 		}
