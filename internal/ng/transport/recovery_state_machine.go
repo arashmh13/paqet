@@ -2,10 +2,22 @@ package transport
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/xtaci/smux"
+
+	"paqet/internal/ng/crypto"
+	"paqet/internal/protocol"
 )
 
 // RecoveryState represents the explicit operational phase of the transport recovery lifecycle.
@@ -40,6 +52,39 @@ var (
 	ErrStaleRecoveryOperation    = errors.New("recovery: stale asynchronous recovery operation superseded by state change or rollback")
 )
 
+// RecoveryEndpointSnapshot represents an immutable, validated snapshot of an authorized recovery endpoint.
+type RecoveryEndpointSnapshot struct {
+	ServerIP       string        `json:"server_ip"`
+	TransportPort  int           `json:"transport_port"`
+	TransportMode  TransportMode `json:"transport_mode"` // ModeRawKCP, ModeAEADStream, ModeTLSStream
+	ExpectedPubKey string        `json:"expected_pub_key"`
+	ValidUntil     int64         `json:"valid_until"`
+	MessageID      string        `json:"message_id"`
+	Generation     uint64        `json:"generation"`
+	ValidatedAt    time.Time     `json:"validated_at"`
+}
+
+// Addr returns the "host:port" address string.
+func (s *RecoveryEndpointSnapshot) Addr() string {
+	if s == nil {
+		return ""
+	}
+	return net.JoinHostPort(s.ServerIP, strconv.Itoa(s.TransportPort))
+}
+
+// IsExpired returns true if ValidUntil is less than or equal to now (ValidUntil == now is treated as expired).
+func (s *RecoveryEndpointSnapshot) IsExpired(now time.Time) bool {
+	if s == nil || s.ValidUntil <= now.Unix() {
+		return true
+	}
+	return false
+}
+
+// MatchesGeneration returns true if the snapshot generation matches gen.
+func (s *RecoveryEndpointSnapshot) MatchesGeneration(gen uint64) bool {
+	return s != nil && s.Generation == gen
+}
+
 // StateTransitionEvent records historical state movements for telemetry and auditability.
 type StateTransitionEvent struct {
 	FromState RecoveryState `json:"from_state"`
@@ -55,6 +100,8 @@ type RecoveryStateMachineConfig struct {
 	BootstrapValidationTimeout time.Duration // Time limit for independent candidate validation (e.g. 4s)
 	CooldownDuration           time.Duration // Cooldown duration after failure before retrying (e.g. 15s)
 	MaxBootstrapValidityWindow time.Duration // Maximum future validity window (default 24h)
+	CandidateFailureLimit      int           // Number of recovery candidate failures before entering COOLDOWN (default 2)
+	AllowPrivateEndpoints      bool          // For tests or private networks; false in production
 	AllowLoopbackEndpoints     bool          // For local unit tests only; false in production
 	EmergencyDialer            func(ctx context.Context, msg *EmergencyMessage) (*BootstrapEndpointData, error)
 	CandidateValidator         func(ctx context.Context, endpoint *BootstrapEndpointData) error
@@ -66,9 +113,11 @@ type RecoveryStateMachine struct {
 	mu                sync.RWMutex
 	state             RecoveryState
 	consecutiveFails  int
+	candidateFails    int
 	lastTransition    time.Time
 	cooldownExpiry    time.Time
 	activeEndpoint    string
+	activeSnapshot    *RecoveryEndpointSnapshot
 	lastBootstrap     *BootstrapEndpointData
 	history           []StateTransitionEvent
 	currentGeneration uint64 // Incremented on state changes, rollback, or primary recovery to detect stale async results
@@ -92,6 +141,9 @@ func NewRecoveryStateMachine(cfg RecoveryStateMachineConfig) *RecoveryStateMachi
 	if cfg.MaxBootstrapValidityWindow <= 0 {
 		cfg.MaxBootstrapValidityWindow = DefaultMaxBootstrapValidityWindow
 	}
+	if cfg.CandidateFailureLimit <= 0 {
+		cfg.CandidateFailureLimit = 2
+	}
 
 	sm := &RecoveryStateMachine{
 		cfg:            cfg,
@@ -114,6 +166,36 @@ func (sm *RecoveryStateMachine) ActiveEndpoint() string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.activeEndpoint
+}
+
+// ActiveSnapshot returns a copy of the active validated recovery endpoint snapshot if in RECOVERY_READY, or nil.
+func (sm *RecoveryStateMachine) ActiveSnapshot() *RecoveryEndpointSnapshot {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if sm.state != StateRecoveryReady || sm.activeSnapshot == nil {
+		return nil
+	}
+	cp := *sm.activeSnapshot
+	return &cp
+}
+
+// ReportCandidateFailure records an operational or dial error through the recovery candidate.
+func (sm *RecoveryStateMachine) ReportCandidateFailure(err error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.state == StateRecoveryReady {
+		sm.candidateFails++
+		limit := sm.cfg.CandidateFailureLimit
+		if limit <= 0 {
+			limit = 2
+		}
+		if sm.candidateFails >= limit || errors.Is(err, ErrStaleBootstrapData) {
+			sm.recordTransitionLocked(StateRecoveryReady, StateRecoveryFailed,
+				fmt.Sprintf("recovery candidate failed %d times: %v", sm.candidateFails, err))
+			sm.enterCooldownLocked("recovery candidate failure limit exceeded")
+		}
+	}
 }
 
 // CurrentGeneration returns the current state revision generation.
@@ -156,6 +238,8 @@ func (sm *RecoveryStateMachine) ReportPrimarySuccess() {
 	if sm.state == StatePrimaryDegraded || sm.state == StateEmergencySignaling || sm.state == StateCandidateEndpointValidating {
 		sm.currentGeneration++
 		sm.activeEndpoint = ""
+		sm.activeSnapshot = nil
+		sm.candidateFails = 0
 		sm.recordTransitionLocked(sm.state, StatePrimaryHealthy, "primary traffic verified healthy; hysteresis recovered")
 	}
 }
@@ -250,7 +334,7 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 		if maxWindow <= 0 {
 			maxWindow = DefaultMaxBootstrapValidityWindow
 		}
-		if valErr := endpoint.Validate(now, maxWindow, sm.cfg.AllowLoopbackEndpoints); valErr != nil {
+		if valErr := endpoint.Validate(now, maxWindow, sm.cfg.AllowPrivateEndpoints, sm.cfg.AllowLoopbackEndpoints); valErr != nil {
 			sm.recordTransitionLocked(sm.state, StateRecoveryFailed, fmt.Sprintf("bootstrap validation failed: %v", valErr))
 			sm.enterCooldownLocked(fmt.Sprintf("invalid bootstrap payload: %v", valErr))
 			return StateCooldown, fmt.Errorf("%w: %v", ErrInvalidBootstrapData, valErr)
@@ -281,9 +365,21 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 			return StateCooldown, fmt.Errorf("%w: %v", ErrCandidateValidation, valErr)
 		}
 
-		// Validation successful! Activate recovery endpoint for new connections
-		sm.activeEndpoint = fmt.Sprintf("%s:%d", endpoint.ServerIP, endpoint.TransportPort)
-		sm.recordTransitionLocked(sm.state, StateRecoveryReady, fmt.Sprintf("candidate endpoint %s validated and active for new connections", sm.activeEndpoint))
+		// Validation successful! Activate recovery endpoint snapshot for new connections
+		sm.recordTransitionLocked(sm.state, StateRecoveryReady, fmt.Sprintf("candidate endpoint %s:%d (%s) validated and active for new connections", endpoint.ServerIP, endpoint.TransportPort, endpoint.Mode()))
+		snapshot := &RecoveryEndpointSnapshot{
+			ServerIP:       endpoint.ServerIP,
+			TransportPort:  endpoint.TransportPort,
+			TransportMode:  endpoint.Mode(),
+			ExpectedPubKey: endpoint.ServerPubKey,
+			ValidUntil:     endpoint.ValidUntil,
+			MessageID:      req.ID,
+			Generation:     sm.currentGeneration,
+			ValidatedAt:    time.Now(),
+		}
+		sm.activeSnapshot = snapshot
+		sm.activeEndpoint = snapshot.Addr()
+		sm.candidateFails = 0
 		return StateRecoveryReady, nil
 
 	case StateRecoveryReady:
@@ -307,6 +403,8 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 
 func (sm *RecoveryStateMachine) enterCooldownLocked(reason string) {
 	sm.activeEndpoint = ""
+	sm.activeSnapshot = nil
+	sm.candidateFails = 0
 	sm.cooldownExpiry = time.Now().Add(sm.cfg.CooldownDuration)
 	sm.recordTransitionLocked(sm.state, StateCooldown, fmt.Sprintf("entering cooldown for %v: %s", sm.cfg.CooldownDuration, reason))
 }
@@ -318,7 +416,171 @@ func (sm *RecoveryStateMachine) ResetRollback(reason string) {
 
 	sm.currentGeneration++
 	sm.consecutiveFails = 0
+	sm.candidateFails = 0
 	sm.activeEndpoint = ""
+	sm.activeSnapshot = nil
 	sm.lastBootstrap = nil
 	sm.recordTransitionLocked(sm.state, StatePrimaryHealthy, fmt.Sprintf("manual or automated rollback: %s", reason))
+}
+
+// CandidateValidatorOptions configures cryptographic validation for candidate endpoints.
+type CandidateValidatorOptions struct {
+	PSK        []byte
+	KCPKey     []byte
+	ServerName string
+}
+
+// BuildCandidateValidator constructs an authenticating validator that verifies remote cryptographic identities.
+func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Context, endpoint *BootstrapEndpointData) error {
+	return func(ctx context.Context, endpoint *BootstrapEndpointData) error {
+		if endpoint == nil {
+			return errors.New("nil endpoint")
+		}
+		expectedDigest, err := ParseSHA256Fingerprint(endpoint.ServerPubKey)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidBootstrapData, err)
+		}
+
+		targetAddr := net.JoinHostPort(endpoint.ServerIP, strconv.Itoa(endpoint.TransportPort))
+
+		switch endpoint.Mode() {
+		case ModeTLSStream:
+			serverName := opts.ServerName
+			if serverName == "" {
+				serverName = endpoint.ServerIP
+			}
+			tlsDialer := &tls.Dialer{
+				NetDialer: &net.Dialer{Timeout: 3 * time.Second},
+				Config: &tls.Config{
+					ServerName:         serverName,
+					InsecureSkipVerify: true, // Verification performed via fingerprint comparison
+				},
+			}
+			tlsConn, err := tlsDialer.DialContext(ctx, "tcp", targetAddr)
+			if err != nil {
+				return fmt.Errorf("%w: tls candidate tcp dial failed: %v", ErrCandidateValidation, err)
+			}
+			defer tlsConn.Close()
+
+			cs := tlsConn.(*tls.Conn).ConnectionState()
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("%w: tls candidate presented no certificates", ErrCandidateValidation)
+			}
+			leafCert := cs.PeerCertificates[0]
+			leafDigest := sha256.Sum256(leafCert.Raw)
+			if leafDigest != expectedDigest {
+				return fmt.Errorf("%w: tls certificate fingerprint mismatch: got SHA256:%x, want %s",
+					ErrCandidateValidation, leafDigest, endpoint.ServerPubKey)
+			}
+
+			// Validate smux protocol handshake over TLS
+			smuxCfg := smux.DefaultConfig()
+			smuxCfg.Version = 2
+			sess, err := smux.Client(tlsConn, smuxCfg)
+			if err != nil {
+				return fmt.Errorf("%w: tls smux handshake failed: %v", ErrCandidateValidation, err)
+			}
+			defer sess.Close()
+
+			strm, err := sess.OpenStream()
+			if err != nil {
+				return fmt.Errorf("%w: tls candidate failed to open stream: %v", ErrCandidateValidation, err)
+			}
+			defer strm.Close()
+
+			_ = strm.SetDeadline(time.Now().Add(2 * time.Second))
+			ping := protocol.Proto{Type: protocol.PPING}
+			if err := ping.Write(strm); err != nil {
+				return fmt.Errorf("%w: tls candidate ping write failed: %v", ErrCandidateValidation, err)
+			}
+			var reply protocol.Proto
+			if err := reply.Read(strm); err != nil {
+				return fmt.Errorf("%w: tls candidate ping read failed: %v", ErrCandidateValidation, err)
+			}
+			if reply.Type != protocol.PPONG {
+				return fmt.Errorf("%w: tls candidate unexpected protocol response %v", ErrCandidateValidation, reply.Type)
+			}
+			return nil
+
+		case ModeAEADStream:
+			keyDigest := sha256.Sum256(opts.PSK)
+			if keyDigest != expectedDigest {
+				return fmt.Errorf("%w: aead-stream key fingerprint mismatch: expected %s, configured PSK fingerprint is SHA256:%x",
+					ErrCandidateValidation, endpoint.ServerPubKey, keyDigest)
+			}
+
+			netDialer := &net.Dialer{Timeout: 3 * time.Second}
+			rawConn, err := netDialer.DialContext(ctx, "tcp", targetAddr)
+			if err != nil {
+				return fmt.Errorf("%w: aead-stream tcp dial failed: %v", ErrCandidateValidation, err)
+			}
+			defer rawConn.Close()
+
+			var salt [SaltSize]byte
+			if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
+				return fmt.Errorf("%w: salt generation error: %v", ErrCandidateValidation, err)
+			}
+			if _, err := rawConn.Write(salt[:]); err != nil {
+				return fmt.Errorf("%w: salt write error: %v", ErrCandidateValidation, err)
+			}
+			c2sKey, s2cKey, err := crypto.DeriveKeys(opts.PSK, salt[:])
+			if err != nil {
+				return fmt.Errorf("%w: key derivation error: %v", ErrCandidateValidation, err)
+			}
+			secConn, err := newSecureConn(rawConn, c2sKey, s2cKey)
+			if err != nil {
+				return fmt.Errorf("%w: secure connection init error: %v", ErrCandidateValidation, err)
+			}
+
+			initFrame := make([]byte, 6)
+			binary.BigEndian.PutUint32(initFrame[:4], uint32(time.Now().Unix()))
+			binary.BigEndian.PutUint16(initFrame[4:6], 0)
+			if _, err := secConn.Write(initFrame); err != nil {
+				return fmt.Errorf("%w: handshake frame write error: %v", ErrCandidateValidation, err)
+			}
+
+			smuxCfg := smux.DefaultConfig()
+			smuxCfg.Version = 2
+			sess, err := smux.Client(secConn, smuxCfg)
+			if err != nil {
+				return fmt.Errorf("%w: aead-stream smux handshake failed: %v", ErrCandidateValidation, err)
+			}
+			defer sess.Close()
+
+			strm, err := sess.OpenStream()
+			if err != nil {
+				return fmt.Errorf("%w: aead-stream candidate failed to open stream: %v", ErrCandidateValidation, err)
+			}
+			defer strm.Close()
+
+			_ = strm.SetDeadline(time.Now().Add(2 * time.Second))
+			ping := protocol.Proto{Type: protocol.PPING}
+			if err := ping.Write(strm); err != nil {
+				return fmt.Errorf("%w: aead-stream candidate ping write failed: %v", ErrCandidateValidation, err)
+			}
+			var reply protocol.Proto
+			if err := reply.Read(strm); err != nil {
+				return fmt.Errorf("%w: aead-stream candidate ping read failed (server did not return valid Paqet pong): %v", ErrCandidateValidation, err)
+			}
+			if reply.Type != protocol.PPONG {
+				return fmt.Errorf("%w: aead-stream candidate unexpected protocol response %v", ErrCandidateValidation, reply.Type)
+			}
+			return nil
+
+		case ModeRawKCP:
+			kcpKey := opts.KCPKey
+			if len(kcpKey) == 0 {
+				kcpKey = opts.PSK
+			}
+			keyDigest := sha256.Sum256(kcpKey)
+			if keyDigest != expectedDigest {
+				return fmt.Errorf("%w: raw-kcp key fingerprint mismatch: expected %s, configured key is SHA256:%x",
+					ErrCandidateValidation, endpoint.ServerPubKey, keyDigest)
+			}
+			return nil
+
+		default:
+			return fmt.Errorf("%w: unsupported mode %q", ErrCandidateValidation, endpoint.Mode())
+		}
+	}
 }

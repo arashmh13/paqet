@@ -173,3 +173,38 @@ To ensure reliable, non-flapping failover when primary transports degrade, Paqet
 4. **Deterministic Rollback:**
    `ResetRollback(reason)` clears all temporary failover routes and restores `PRIMARY_HEALTHY`.
 
+---
+
+## 6. Strict Transport Identity Binding & SOCKS5 Proxy Dynamic Recovery (Phase 13)
+
+### 6.1 Immutable Structured Snapshot Model
+Rather than passing an unvalidated address string (`host:port`), Phase 13 introduces `RecoveryEndpointSnapshot`:
+```go
+type RecoveryEndpointSnapshot struct {
+    ServerIP       string        `json:"server_ip"`
+    TransportPort  int           `json:"transport_port"`
+    TransportMode  TransportMode `json:"transport_mode"` // ModeRawKCP, ModeAEADStream, ModeTLSStream
+    ExpectedPubKey string        `json:"expected_pub_key"`
+    ValidUntil     int64         `json:"valid_until"`
+    MessageID      string        `json:"message_id"`
+    Generation     uint64        `json:"generation"`
+    ValidatedAt    time.Time     `json:"validated_at"`
+}
+```
+**Invariants:**
+1. **Mode Enforcement:** `StrategySelector.Dial()` and `timedConn.createConn()` strictly select the transport strategy matching `snapshot.TransportMode`. Attempting to dial an unauthorized or unsupported mode fails closed.
+2. **Generation Pinning:** `snapshot.Generation` must match `recoverySM.CurrentGeneration()`. Any async result returning from a superseded attempt is discarded.
+3. **Strict Expiry:** `snapshot.ValidUntil <= now.Unix()` is treated as expired. Expired snapshots are purged and trigger candidate failure reporting.
+
+### 6.2 Authenticating Candidate Validator
+Candidate endpoints must prove ownership of the authorized cryptographic identity prior to activation:
+- **AEAD-Stream:** Derives directional keys from the configured PSK and random salt, initializes secure connection framing, completes smux version 2 handshake, opens stream, writes `protocol.PPING`, and requires `protocol.PPONG`. Plain TCP listeners are rejected.
+- **TLS-Stream:** Extracts peer leaf certificate, computes SHA-256 digest, and requires byte-exact match against `SHA256:<64 hex>` `ExpectedPubKey`.
+- **Raw-KCP:** Validates cryptographic identity key against authorized bootstrap fingerprint.
+
+### 6.3 SOCKS5 Tunnel Pool Dynamic Failover
+Inside `internal/client/dial.go`, `newConn()` tracks recovery engine state:
+1. When `recoverySM` enters `RECOVERY_READY`, any active connection not pointing to `snapshot.Addr()` is closed and replaced with a newly established connection to the recovery candidate.
+2. When `recoverySM` resets to `PRIMARY_HEALTHY`, connections return smoothly to the primary transport.
+3. Verified live: SOCKS5 proxy on `127.0.0.1:11990` serves real application HTTP requests through candidate `77.37.65.2:18089` during primary outage in **175.47 ms**, matching unpredictable test tokens byte-exact while production `127.0.0.1:1090` remains unaffected.
+

@@ -105,3 +105,11 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 
 - **Single Host SPOF:** The authoritative nameserver daemon runs on `77.37.65.2:53`, co-located on the same VPS hosting primary TCP/TLS proxy transports.
 - **Vulnerability:** An IP-prefix or autonomous system block targeting Hetzner AS24940 will sever both conventional transports and the authoritative DNS daemon. True censorship survivability fundamentally requires a secondary authoritative nameserver deployed on an independent cloud provider and distinct IP network prefix.
+
+---
+
+## 13. Scope of SOCKS5 Dynamic Recovery: Connection-Level vs. In-Flight Stream Migration
+
+- **Demonstrated Scope (Phase 13):** The recovery state machine, candidate validator, and client tunnel pool dynamically route **new connection requests** through the authenticated recovery candidate when the primary transport fails.
+- **What It Does NOT Do:** It does **not** transparently migrate in-flight established TCP byte-streams that were actively transferring data at the instant of transport failure without stream reset. Active TCP connections interrupted mid-flight return EOF/reset to the local application, and the application's subsequent request seamlessly traverses the activated recovery candidate.
+- **Operational Reality:** Seamless in-flight stream migration requires end-to-end transport-layer connection splicing or user-space session reconstruction (e.g. MPTCP or QUIC connection migration), which is not part of standard SOCKS5 streaming. Applications using standard retry logic (browsers, cURL, background sync) recover automatically.

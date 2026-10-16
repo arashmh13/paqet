@@ -166,3 +166,34 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   * When primary dials fail, `re.ReportPrimaryFailure(err)` and `re.Step(ctx)` are triggered.
   * When `re.CurrentState() == StateRecoveryReady`, new connections use `re.ActiveEndpoint()`.
   * Verified via `TestRecoverySelectorIntegration_EndToEndFailover`.
+
+---
+
+## 9. Real SOCKS5 Recovery, Strict Transport Identity Binding & Evidentiary Gap Closure (Phase 13)
+
+### 9.1 Evidentiary Gap Closure & Immutable Structured Snapshot Architecture
+- **Prior Evidentiary Gap:** Phase 12 integrated the recovery state machine into `StrategySelector`, but the live validation test issued a direct HTTP request to the recovery candidate. This left an evidentiary gap: it did not prove that the client's SOCKS5 proxy or Paqet transport layer actually selected, validated, and routed traffic through the candidate.
+- **Remediation & Architecture:**
+  1. **Typed Recovery Snapshot:** Replaced the string-only (`host:port`) interface with `RecoveryEndpointSnapshot`.
+     * Preserves: `ServerIP`, `TransportPort`, `TransportMode` (`ModeRawKCP`, `ModeAEADStream`, `ModeTLSStream`), `ExpectedPubKey`, `ValidUntil`, `MessageID`, `Generation`, and `ValidatedAt`.
+     * Snapshot is strictly immutable once validated.
+     * `StrategySelector.Dial()` and `timedConn.createConn()` consume the structured snapshot, validating freshness (`IsExpired`), generation revision (`MatchesGeneration`), and explicit transport mode match.
+  2. **Generation Binding:** Stale async recovery results cannot activate superseded endpoints because snapshot generation must strictly match `recoverySM.CurrentGeneration()`.
+  3. **Preservation of Recovery Endpoint:** Successful dials through the recovery candidate record `lastSuccessMode` and update active transport metrics without erroneously triggering `ReportPrimarySuccess()`, preventing premature eviction of the recovery candidate while primary remains degraded.
+
+### 9.2 Strict Cryptographic Identity Binding & Authenticating Validator
+- **Prior Weakness:** A TCP connect alone or a non-empty string check was insufficient proof of remote endpoint authenticity.
+- **Canonical Identity Format:** Standardized on canonical `SHA256:<64 hex chars>` fingerprint for all authenticated transport modes.
+  * Format parsed and strictly validated by `ParseSHA256Fingerprint()`. Rejecting missing prefix, non-64 hex length, or non-hex characters.
+- **Fail-Closed Authenticating Handshake (`BuildCandidateValidator`):**
+  * **AEAD-Stream:** Derives session keys using genuine `crypto.DeriveKeys(opts.PSK, salt)`, initializes encrypted session framing, establishes smux session, opens an authenticated stream, and verifies genuine Paqet `PPING` / `PPONG` round-trip. Rejects any dummy TCP listener or non-Paqet server.
+  * **TLS-Stream:** Validates peer certificate SHA-256 fingerprint against `ExpectedPubKey`, opens smux session, and verifies protocol `PPING` / `PPONG`.
+  * **Raw-KCP:** Validates cryptographic key identity fingerprint against authorized bootstrap data.
+- **Freshness Invariant:** Enforced that `ValidUntil <= now.Unix()` is strictly expired (resolving edge condition where `ValidUntil == now` was treated as valid).
+
+### 9.3 Client SOCKS5 Tunnel Dynamic Switching
+- **Remediated Integration Defect:** In `internal/client/dial.go`, `newConn()` previously relied solely on `tc.conn.Ping(false)`, which created local smux streams without wire I/O. When an iptables drop severed the primary TCP transport, `tc.conn.Ping(false)` returned nil, causing SOCKS5 requests to hang on stale primary connections.
+- **Fix:** `newConn()` inspects `recoverySM.CurrentState()`. When in `RECOVERY_READY`, if `tc.conn` is not connected to `snapshot.Addr()`, it immediately tears down the stale connection and routes to the validated candidate. When rolling back to `PRIMARY_HEALTHY`, it smoothly transitions back to the primary endpoint.
+- **Tested & Proven:**
+  * Automated regression test: `TestSOCKS5_LiveApplicationRecoveryFlow` (`go test -race`).
+  * Live cross-border test: Iran VPS (`185.18.215.124`) to Germany VPS (`77.37.65.2`), dedicated isolated SOCKS5 port `11990`, remote HTTP origin `18999`, byte-exact matching of unpredictable token `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf` in 175.47ms while production SOCKS5 on `1090` remained completely unaffected.

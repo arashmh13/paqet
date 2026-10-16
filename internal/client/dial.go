@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"paqet/internal/flog"
+	"paqet/internal/ng/transport"
 	"paqet/internal/tnet"
 )
 
@@ -14,14 +15,40 @@ func (c *Client) newConn() (tnet.Conn, error) {
 	autoExpire := 300
 	tc := c.iter.Next()
 	go tc.sendTCPF(tc.conn)
+
 	err := tc.conn.Ping(false)
-	if err != nil {
-		flog.Infof("connection lost, retrying....")
+	needsRecreate := err != nil
+
+	re := c.recoveryEngine
+	if re != nil {
+		if re.CurrentState() == transport.StateRecoveryReady {
+			snapshot := re.ActiveSnapshot()
+			if snapshot != nil {
+				if tc.conn == nil || tc.conn.RemoteAddr() == nil || tc.conn.RemoteAddr().String() != snapshot.Addr() {
+					needsRecreate = true
+				}
+			}
+		} else if re.CurrentState() == transport.StatePrimaryHealthy {
+			target := tc.getTargetAddr()
+			if target != "" && tc.conn != nil && tc.conn.RemoteAddr() != nil {
+				if tc.conn.RemoteAddr().String() != target {
+					needsRecreate = true
+				}
+			}
+		}
+	}
+
+	if needsRecreate {
+		flog.Infof("connection lost or switched to recovery endpoint, recreating connection....")
 		if tc.conn != nil {
 			tc.conn.Close()
 		}
 		conn, err := tc.createConn()
 		if err != nil {
+			if c.recoveryEngine != nil && c.recoveryEngine.CurrentState() != transport.StateRecoveryReady {
+				c.recoveryEngine.ReportPrimaryFailure(err)
+				_, _ = c.recoveryEngine.Step(context.Background())
+			}
 			return nil, err
 		}
 		tc.conn = conn

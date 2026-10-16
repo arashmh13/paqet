@@ -1,0 +1,97 @@
+{
+  "timestamp": "2026-10-16T08:18:49Z",
+  "phase": "Phase 13 Real SOCKS5 Recovery",
+  "test_token": "PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf",
+  "primary_endpoint": "77.37.65.2:18088",
+  "candidate_endpoint": "77.37.65.2:18089",
+  "socks5_listen_port": 11990,
+  "http_origin_port": 18999,
+  "step_a_baseline": {
+    "passed": true,
+    "description": "Baseline HTTP request through primary Paqet transport served by :18088",
+    "duration_ms": 91.69147699999999,
+    "details": "HTTP 200 OK, token PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf verified byte-exact"
+  },
+  "step_b_primary_drop": {
+    "passed": true,
+    "description": "Applied narrowly scoped iptables DROP rule; verified primary request fails",
+    "duration_ms": 7.21776,
+    "details": "iptables -I OUTPUT -p tcp -d 77.37.65.2 --dport 18088 -j DROP; request failed: Get \"http://127.0.0.1:18999/test-token\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+  },
+  "step_c_signaling": {
+    "passed": true,
+    "description": "Emergency signaling via authenticated DNS query and response",
+    "duration_ms": 85.244237,
+    "details": "DNS exchange completed; received candidate 77.37.65.2:18089 (mode: aead-stream)"
+  },
+  "step_d_validation": {
+    "passed": true,
+    "description": "Cryptographic identity binding and AEAD handshake validation",
+    "duration_ms": 164.405177,
+    "details": "Candidate 77.37.65.2:18089 passed AEAD key derivation, smux handshake, and PPING/PPONG protocol check"
+  },
+  "step_e_recovery": {
+    "passed": true,
+    "description": "Real application HTTP request through isolated SOCKS5 proxy routed via recovery candidate",
+    "duration_ms": 175.47203,
+    "details": "HTTP 200 OK; token PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf matched byte-exact; candidate served connection in 175.47ms"
+  },
+  "step_f_rollback": {
+    "passed": true,
+    "description": "Deterministic ResetRollback clears active snapshot and returns to PRIMARY_HEALTHY",
+    "duration_ms": 0.008492,
+    "details": "Active snapshot cleared, state returned to PRIMARY_HEALTHY"
+  },
+  "step_g_restoration": {
+    "passed": true,
+    "description": "Iptables test rule deleted; production SOCKS5 verified healthy",
+    "duration_ms": 10.470429999999999,
+    "details": "iptables rule removed; production 127.0.0.1:1090 returned: pong"
+  },
+  "production_health": "pong",
+  "history": [
+    {
+      "from_state": "PRIMARY_HEALTHY",
+      "to_state": "PRIMARY_HEALTHY",
+      "reason": "initialization",
+      "timestamp": "2026-10-16T11:48:49.005634597+03:30"
+    },
+    {
+      "from_state": "PRIMARY_HEALTHY",
+      "to_state": "PRIMARY_DEGRADED",
+      "reason": "consecutive primary failures (1) reached threshold: primary unreachable: Get \"http://127.0.0.1:18999/test-token\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+      "timestamp": "2026-10-16T11:48:52.801582233+03:30"
+    },
+    {
+      "from_state": "PRIMARY_DEGRADED",
+      "to_state": "EMERGENCY_SIGNALING",
+      "reason": "degraded timeout elapsed; requesting bootstrap failover via emergency DNS",
+      "timestamp": "2026-10-16T11:48:52.902426783+03:30"
+    },
+    {
+      "from_state": "EMERGENCY_SIGNALING",
+      "to_state": "BOOTSTRAP_RECEIVED",
+      "reason": "received authenticated bootstrap endpoint 77.37.65.2:18089 (aead-stream)",
+      "timestamp": "2026-10-16T11:48:52.988516906+03:30"
+    },
+    {
+      "from_state": "BOOTSTRAP_RECEIVED",
+      "to_state": "CANDIDATE_ENDPOINT_VALIDATING",
+      "reason": "initiating independent authenticated handshake validation",
+      "timestamp": "2026-10-16T11:48:52.988517594+03:30"
+    },
+    {
+      "from_state": "CANDIDATE_ENDPOINT_VALIDATING",
+      "to_state": "RECOVERY_READY",
+      "reason": "candidate endpoint 77.37.65.2:18089 (aead-stream) validated and active for new connections",
+      "timestamp": "2026-10-16T11:48:53.152993233+03:30"
+    },
+    {
+      "from_state": "RECOVERY_READY",
+      "to_state": "PRIMARY_HEALTHY",
+      "reason": "manual or automated rollback: operator manual restoration",
+      "timestamp": "2026-10-16T11:48:53.328705386+03:30"
+    }
+  ],
+  "outcome": "PHASE 13 SOCKS5 RECOVERY VERIFIED WITH FULL CRYPTOGRAPHIC IDENTITY BINDING"
+}

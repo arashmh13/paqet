@@ -6,14 +6,16 @@ import (
 
 	"paqet/internal/conf"
 	"paqet/internal/flog"
+	"paqet/internal/ng/transport"
 	"paqet/internal/pkg/iterator"
 )
 
 type Client struct {
-	cfg     *conf.Conf
-	iter    *iterator.Iterator[*timedConn]
-	udpPool *udpPool
-	mu      sync.Mutex
+	cfg            *conf.Conf
+	iter           *iterator.Iterator[*timedConn]
+	udpPool        *udpPool
+	recoveryEngine *transport.RecoveryStateMachine
+	mu             sync.Mutex
 }
 
 func New(cfg *conf.Conf) (*Client, error) {
@@ -25,9 +27,28 @@ func New(cfg *conf.Conf) (*Client, error) {
 	return c, nil
 }
 
+// SetRecoveryEngine attaches an integrated recovery state machine to the client and its connections.
+func (c *Client) SetRecoveryEngine(re *transport.RecoveryStateMachine) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recoveryEngine = re
+	if c.iter != nil {
+		for _, tc := range c.iter.Items {
+			tc.recoveryEngine = re
+		}
+	}
+}
+
+// RecoveryEngine returns the attached recovery state machine.
+func (c *Client) RecoveryEngine() *transport.RecoveryStateMachine {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.recoveryEngine
+}
+
 func (c *Client) Start(ctx context.Context) error {
 	for i := range c.cfg.Transport.Conn {
-		tc, err := newTimedConn(c.cfg, i)
+		tc, err := newTimedConn(c.cfg, i, c.recoveryEngine)
 		if err != nil {
 			flog.Errorf("failed to create connection %d: %v", i+1, err)
 			return err

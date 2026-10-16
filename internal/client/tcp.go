@@ -29,6 +29,10 @@ func (c *Client) TCP(ctx context.Context, addr string) (tnet.Strm, error) {
 	if err != nil {
 		flog.Debugf("failed to write TCP protocol for %s on stream %d: %v", addr, strm.SID(), err)
 		strm.Close()
+		if c.recoveryEngine != nil {
+			c.recoveryEngine.ReportPrimaryFailure(err)
+			_, _ = c.recoveryEngine.Step(context.Background())
+		}
 		return nil, err
 	}
 

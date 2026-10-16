@@ -131,3 +131,46 @@ Conducted live cross-border validation across Iran VPS (`185.18.215.124`) and Ge
      `{"status":"RECOVERY_CANDIDATE_HTTP_VERIFIED","token":"8ca6632a150dfa9f"}`!
   5. Teardown & Rollback: Removed temporary test rule on Iran VPS; stopped test units on Germany.
   6. Production SOCKS5 proxy on `127.0.0.1:1090` remained active and unaffected ($0.145\text{ s}$, HTTP 200).
+
+---
+
+## 6. Phase 13 Real SOCKS5 Application Failover & Cryptographic Identity Binding Verification
+
+### 6.1 Adversarial Identity & Handshake Negative Tests
+- `TestRecoveryStateMachine_MalformedFingerprintsFailClosed`: Verified fail-closed rejection across all malformed fingerprint formats: empty string, missing `SHA256:` prefix, truncated hex (63 chars), oversized hex (65 chars), and invalid non-hex characters ('g'). All cases return `ErrInvalidBootstrapData`.
+- `TestRecoveryStateMachine_ValidUntilEqualToNowExpired`: Proved that when `ValidUntil == now.Unix()`, the coordinate is treated as strictly expired (`ValidUntil <= now`), preventing single-second race condition fail-open activations.
+- `TestRecoveryStateMachine_CandidateValidatorFingerprintMismatch`: Proved that when the candidate server possesses a key whose SHA-256 digest does not match the authorized bootstrap fingerprint, candidate validation fails closed (`ErrCandidateValidation`).
+- `TestRecoveryStateMachine_TCPListenerWithoutPaqetHandshakeRejected`: Started a dummy TCP listener that accepts connections and sends raw HTTP responses. Verified that `BuildCandidateValidator` attempts AEAD key derivation, smux session establishment, and protocol `PPING`/`PPONG`, correctly rejecting the dummy listener with `ErrCandidateValidation`. **Proves a TCP connect alone can never activate a candidate endpoint.**
+- `TestRecoveryStateMachine_RecoveryCandidateFailureLimitCooldown`: Verified that repeated dial failures to the recovery candidate trigger the documented cooldown transition after reaching `CandidateFailureLimit = 2`.
+- `TestRecoverySelectorIntegration_UnauthorizedModeFailClosed`: Verified that if the bootstrap authorizes a mode (e.g. `tls-outer`) that is not present in selector candidate strategies, the selector fails closed and enters cooldown rather than falling back to weaker or unauthorized modes.
+- `TestRecoverySelectorIntegration_RecoveryDialSuccessDoesNotClearRecovery`: Verified that successful dials through the recovery candidate preserve `RECOVERY_READY` and keep the recovery endpoint active without prematurely reverting to primary.
+
+### 6.2 End-to-End Automated SOCKS5 Regression Test
+- `TestSOCKS5_LiveApplicationRecoveryFlow`: Automated end-to-end integration test executed under `go test -v -race`:
+  1. Starts genuine primary Paqet server on isolated port, candidate Paqet server on isolated port, HTTP test origin on 127.0.0.1, and client with SOCKS5 on 127.0.0.1.
+  2. Issues baseline HTTP request through SOCKS5 proxy to HTTP test origin. Verifies HTTP 200 and unpredictable test token.
+  3. Cancels primary server.
+  4. Issues subsequent request through SOCKS5. Client detects primary failure, executes emergency signaling and candidate validation, enters `RECOVERY_READY`, dynamically routes to candidate server, and verifies byte-exact token match!
+  5. Verifies complete transition history: `PRIMARY_HEALTHY -> PRIMARY_DEGRADED -> EMERGENCY_SIGNALING -> BOOTSTRAP_RECEIVED -> CANDIDATE_ENDPOINT_VALIDATING -> RECOVERY_READY`.
+  6. Executes `ResetRollback()`, verifying state resets to `PRIMARY_HEALTHY` and clears active snapshot.
+
+### 6.3 Live Cross-Border Real-Transport SOCKS5 Failover (Iran ⇄ Germany)
+Executed live on authorized infrastructure:
+- **Client Host:** Iran VPS (`185.18.215.124`, Panel01)
+- **Server Host:** Germany VPS (`77.37.65.2`, Hetzner)
+- **Isolated Ports:**
+  * Local SOCKS5 Proxy: `127.0.0.1:11990` (Production `127.0.0.1:1090` untouched)
+  * Primary Test Transport: `77.37.65.2:18088` (`aead-stream`)
+  * Candidate Test Transport: `77.37.65.2:18089` (`aead-stream`)
+  * HTTP Test Origin: `127.0.0.1:18999` (on Germany VPS localhost, unreachable directly from Iran)
+  * Unpredictable Token: `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf`
+- **Observed Sequence & Latency Metrics:**
+  1. **Step A Baseline:** SOCKS5 request (`127.0.0.1:11990`) routed through primary (`77.37.65.2:18088`). Received HTTP 200 and verified token in **91.69 ms**.
+  2. **Step B Failure:** Narrowly scoped `iptables -I OUTPUT -p tcp -d 77.37.65.2 --dport 18088 -j DROP` applied in **7.22 ms**. Request through primary failed (`Client.Timeout`), triggering transition to `PRIMARY_DEGRADED`.
+  3. **Step C Signaling:** Emergency DNS query dispatched to `77.37.65.2:53`. Authenticated bootstrap reply received in **85.24 ms**. Parsed candidate `77.37.65.2:18089` (mode `aead-stream`, pubKey `SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d`, ValidUntil `1792145932`).
+  4. **Step D Validation:** Cryptographic candidate handshake executed in **164.41 ms**. AEAD key derivation, smux handshake, and protocol `PPING`/`PPONG` verified. State transitioned to `RECOVERY_READY` with generation revision 6.
+  5. **Step E Recovery:** SOCKS5 request (`127.0.0.1:11990`) routed through recovery candidate (`77.37.65.2:18089`). Remote Paqet server forwarded to `127.0.0.1:18999`. HTTP 200 returned in **175.47 ms**, matching token `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf` byte-exact!
+  6. **Step F Rollback:** `ResetRollback` executed in **0.01 ms**; active snapshot cleared; state returned to `PRIMARY_HEALTHY`.
+  7. **Step G Restoration:** Iptables rule deleted in **10.47 ms**; test services stopped.
+  8. **Production SOCKS5 Health:** Checked `127.0.0.1:1090` -> returned `pong` (HTTP 200, unmodified and fully operational throughout).
+- **Evidentiary Proof:** Complete JSON audit trail logged to `docs/research/recovery_socks5_live_audit.json`.

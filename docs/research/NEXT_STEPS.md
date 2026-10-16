@@ -3,9 +3,10 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.5.4-failclosed`
-- **Active Binary SHA-256:** `8845f43d9b813ff383bbf8e1ca457df797ea6ad52ced417ea2bfed80e143cc8e`
+- **Current Version:** `v2.5.5-recoveryproof`
+- **Active Binary SHA-256:** `3d28bc9e1a5a1e9d069c015a6bb9ba0c16ae1624610a237085e24efad0fd0ce3`
 - **Architectural Validation Status:**
+  - Phase 13 Real SOCKS5 Recovery & Transport Identity Binding: **COMPLETE & WIRE-VERIFIED** (Closed evidentiary gap between unit-tested recovery state machine and actual application SOCKS5 tunnel routing; immutable `RecoveryEndpointSnapshot` preserving authorized transport mode, canonical `SHA256:<64 hex>` identity, generation revision, and strict non-zero freshness; authenticating `BuildCandidateValidator` enforcing genuine Paqet AEAD/TLS handshakes and smux PPING/PPONG protocol verification while rejecting dummy TCP listeners; dynamic tunnel pool switching in `dial.go`; live cross-border validation across Iran ⇄ Germany using dedicated SOCKS5 port `11990` and remote HTTP origin `18999` with byte-exact verification of unpredictable token `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf` in 175.47ms while production `1090` remained completely healthy throughout).
   - Candidate 1 (Genuine TLS 1.3 Outer Transport): **COMPLETE & WIRE-VERIFIED** (RFC 8446 standard TLS 1.3 handshake, ContentType 0x17 ApplicationData records, 90.9 ms RTT, 11.60 Mbps line rate, CA certificate validation verified).
   - Candidate 2 (Raw TCP Decoy Sequence Injection): **COMPLETE & WIRE-VERIFIED** (`wrong_seq` out-of-window packet injection, silent kernel drop on Germany VPS, 123.4 ms RTT).
   - Asymmetric Directional Decoupling (`AsymmetricConn`): **COMPLETE & HARDENED** (independent `UpstreamSender` and `DownstreamReceiver` channels, AAD header authentication, sequence exhaustion protection, RTO retransmission queue, and memory bounds).

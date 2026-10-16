@@ -2,11 +2,16 @@ package transport
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+const testValidPubKey = "SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func TestRecoveryStateMachine_SuccessfulTransition(t *testing.T) {
 	cfg := RecoveryStateMachineConfig{
@@ -20,12 +25,12 @@ func TestRecoveryStateMachine_SuccessfulTransition(t *testing.T) {
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid-crypto-fingerprint-node1",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil
 		},
 		CandidateValidator: func(ctx context.Context, endpoint *BootstrapEndpointData) error {
-			if endpoint.ServerIP == "77.37.65.2" && endpoint.TransportPort == 18089 && endpoint.ServerPubKey != "" {
+			if endpoint.ServerIP == "77.37.65.2" && endpoint.TransportPort == 18089 && endpoint.ServerPubKey == testValidPubKey {
 				return nil // Handshake and cryptographic identity validated!
 			}
 			return errors.New("candidate handshake failed")
@@ -104,7 +109,7 @@ func TestRecoveryStateMachine_MissingValidatorFailClosed(t *testing.T) {
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil
 		},
@@ -135,7 +140,7 @@ func TestRecoveryStateMachine_ZeroOrMissingExpiryFailClosed(t *testing.T) {
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    0, // Zero expiry must fail closed!
 			}, nil
 		},
@@ -166,7 +171,7 @@ func TestRecoveryStateMachine_DistantExpiryRejected(t *testing.T) {
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(10 * time.Hour).Unix(), // Exceeds 2h window!
 			}, nil
 		},
@@ -254,7 +259,7 @@ func TestRecoveryStateMachine_StaleAsyncDialerDiscardedOnPrimaryRecovery(t *test
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil
 		},
@@ -310,7 +315,7 @@ func TestRecoveryStateMachine_StaleCandidateValidatorDiscardedOnRollback(t *test
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil
 		},
@@ -369,7 +374,7 @@ func TestRecoveryStateMachine_ConcurrentStepOperations(t *testing.T) {
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:valid",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil
 		},
@@ -418,5 +423,169 @@ func TestRecoveryStateMachine_HysteresisRecovery(t *testing.T) {
 	sm.ReportPrimarySuccess()
 	if sm.CurrentState() != StatePrimaryHealthy {
 		t.Fatalf("Expected state to recover to PRIMARY_HEALTHY, got %s", sm.CurrentState())
+	}
+}
+
+func TestRecoveryStateMachine_MalformedFingerprintsFailClosed(t *testing.T) {
+	malformedCases := []string{
+		"", // empty
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", // missing SHA256: prefix
+		"SHA256:too-short", // too short
+		"SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",   // 63 hex (one short)
+		"SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0", // 65 hex (one long)
+		"SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",  // invalid non-hex char 'g'
+	}
+
+	for _, tc := range malformedCases {
+		t.Run("Fingerprint_"+tc, func(t *testing.T) {
+			b := &BootstrapEndpointData{
+				ServerIP:      "77.37.65.2",
+				TransportPort: 18089,
+				TransportMode: "aead-stream",
+				ServerPubKey:  tc,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}
+			err := b.Validate(time.Now(), 24*time.Hour, true, true)
+			if err == nil {
+				t.Fatalf("Expected validation error for malformed fingerprint %q, got nil", tc)
+			}
+		})
+	}
+}
+
+func TestRecoveryStateMachine_ValidUntilEqualToNowExpired(t *testing.T) {
+	// P0 REQUIREMENT: Ensure ValidUntil == now.Unix() is treated as expired, rather than valid
+	now := time.Now()
+	b := &BootstrapEndpointData{
+		ServerIP:      "77.37.65.2",
+		TransportPort: 18089,
+		TransportMode: "aead-stream",
+		ServerPubKey:  testValidPubKey,
+		ValidUntil:    now.Unix(), // Exactly equal to now
+	}
+	err := b.Validate(now, 24*time.Hour, true, true)
+	if err == nil {
+		t.Fatalf("Expected validation failure when ValidUntil == now.Unix(), but got nil (fail-closed violation)")
+	}
+}
+
+func TestRecoveryStateMachine_CandidateValidatorFingerprintMismatch(t *testing.T) {
+	// Test candidate validator rejecting mismatched key fingerprint
+	differentKey := make([]byte, 32)
+	differentKey[0] = 0xAA
+
+	validator := BuildCandidateValidator(CandidateValidatorOptions{
+		PSK: differentKey,
+	})
+
+	endpoint := &BootstrapEndpointData{
+		ServerIP:      "77.37.65.2",
+		TransportPort: 18089,
+		TransportMode: "aead-stream",
+		ServerPubKey:  testValidPubKey, // Does not match differentKey
+		ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+	}
+
+	err := validator(context.Background(), endpoint)
+	if err == nil {
+		t.Fatalf("Expected validator error for mismatched key fingerprint, got nil")
+	}
+	if !errors.Is(err, ErrCandidateValidation) {
+		t.Fatalf("Expected ErrCandidateValidation, got %v", err)
+	}
+}
+
+func TestRecoveryStateMachine_TCPListenerWithoutPaqetHandshakeRejected(t *testing.T) {
+	// Start a dummy TCP listener that accepts connections but does NOT speak Paqet
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Just close or send garbage
+			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	testPSK := []byte("01234567890123456789012345678901")
+	digest := sha256.Sum256(testPSK)
+	pubKey := fmt.Sprintf("SHA256:%x", digest)
+
+	validator := BuildCandidateValidator(CandidateValidatorOptions{
+		PSK: testPSK,
+	})
+
+	endpoint := &BootstrapEndpointData{
+		ServerIP:      "127.0.0.1",
+		TransportPort: tcpAddr.Port,
+		TransportMode: "aead-stream",
+		ServerPubKey:  pubKey,
+		ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	valErr := validator(ctx, endpoint)
+	if valErr == nil {
+		t.Fatalf("A plain TCP listener with no Paqet handshake MUST NOT be accepted as a valid candidate! (P0 violation)")
+	}
+	if !errors.Is(valErr, ErrCandidateValidation) {
+		t.Fatalf("Expected ErrCandidateValidation, got %v", valErr)
+	}
+}
+
+func TestRecoveryStateMachine_RecoveryCandidateFailureLimitCooldown(t *testing.T) {
+	cfg := RecoveryStateMachineConfig{
+		PrimaryFailureThreshold: 1,
+		DegradedTimeout:         10 * time.Millisecond,
+		CandidateFailureLimit:   2,
+		CooldownDuration:        500 * time.Millisecond,
+		AllowLoopbackEndpoints:  true,
+		EmergencyDialer: func(ctx context.Context, msg *EmergencyMessage) (*BootstrapEndpointData, error) {
+			return &BootstrapEndpointData{
+				ServerIP:      "77.37.65.2",
+				TransportPort: 18089,
+				TransportMode: "aead-stream",
+				ServerPubKey:  testValidPubKey,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}, nil
+		},
+		CandidateValidator: func(ctx context.Context, endpoint *BootstrapEndpointData) error {
+			return nil
+		},
+	}
+
+	sm := NewRecoveryStateMachine(cfg)
+	sm.ReportPrimaryFailure(errors.New("primary down"))
+	time.Sleep(15 * time.Millisecond)
+
+	state, err := sm.Step(context.Background())
+	if err != nil || state != StateRecoveryReady {
+		t.Fatalf("Expected StateRecoveryReady, got state %s, err %v", state, err)
+	}
+
+	// First candidate failure: below limit (2)
+	sm.ReportCandidateFailure(errors.New("dial timeout 1"))
+	if sm.CurrentState() != StateRecoveryReady {
+		t.Fatalf("Expected StateRecoveryReady after 1 failure, got %s", sm.CurrentState())
+	}
+
+	// Second candidate failure: reaches limit (2) -> transitions to COOLDOWN!
+	sm.ReportCandidateFailure(errors.New("dial timeout 2"))
+	if sm.CurrentState() != StateCooldown {
+		t.Fatalf("Expected StateCooldown after reaching candidate failure limit, got %s", sm.CurrentState())
+	}
+	if sm.ActiveSnapshot() != nil {
+		t.Fatalf("Active snapshot must be cleared in COOLDOWN, got %v", sm.ActiveSnapshot())
 	}
 }

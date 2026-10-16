@@ -117,35 +117,81 @@ func (s *StrategySelector) Dial(ctx context.Context, addr string) (Session, erro
 	re := s.cfg.RecoveryEngine
 	s.mu.RUnlock()
 
-	// 1. If recovery state machine is active and in RECOVERY_READY, use active recovery endpoint for new connections
+	// 1. If recovery state machine is active and in RECOVERY_READY, use authorized recovery endpoint snapshot
 	if re != nil && re.CurrentState() == StateRecoveryReady {
-		recovAddr := re.ActiveEndpoint()
-		if recovAddr != "" {
+		snapshot := re.ActiveSnapshot()
+		if snapshot != nil {
+			now := time.Now()
+			// Expiration check (P0 Requirement: ValidUntil <= now is expired)
+			if snapshot.IsExpired(now) {
+				re.ReportCandidateFailure(ErrStaleBootstrapData)
+				s.mu.Lock()
+				s.lastFallbackReason = fmt.Sprintf("recovery candidate %s expired at %d (now %d)", snapshot.Addr(), snapshot.ValidUntil, now.Unix())
+				s.mu.Unlock()
+				return nil, fmt.Errorf("recovery candidate %s expired: %w", snapshot.Addr(), ErrStaleBootstrapData)
+			}
+
+			// Generation/revision check (prevents superseded attempts from activating)
+			if !snapshot.MatchesGeneration(re.CurrentGeneration()) {
+				re.ReportCandidateFailure(ErrStaleRecoveryOperation)
+				s.mu.Lock()
+				s.lastFallbackReason = fmt.Sprintf("recovery candidate %s generation mismatch (got %d, current %d)",
+					snapshot.Addr(), snapshot.Generation, re.CurrentGeneration())
+				s.mu.Unlock()
+				return nil, fmt.Errorf("recovery candidate generation mismatch: %w", ErrStaleRecoveryOperation)
+			}
+
+			// P0 REQUIREMENT: Select EXACTLY the transport mode authorized by the bootstrap.
+			// Do not blindly try unrelated or weaker modes!
 			s.mu.RLock()
-			cur := s.current
-			candidates := make([]Strategy, len(s.cfg.Candidates))
-			copy(candidates, s.cfg.Candidates)
+			var authorizedStrat Strategy
+			for _, strat := range s.cfg.Candidates {
+				if strat.Mode() == snapshot.TransportMode {
+					authorizedStrat = strat
+					break
+				}
+			}
 			s.mu.RUnlock()
 
-			// Try current strategy with the verified recovery endpoint address
-			if cur != nil {
-				sess, err := cur.Dial(ctx, recovAddr)
-				if err == nil {
-					return sess, nil
-				}
+			if authorizedStrat == nil {
+				err := fmt.Errorf("authorized recovery transport mode %s is unavailable in selector candidates (fail-closed)", snapshot.TransportMode)
+				re.ReportCandidateFailure(err)
+				s.mu.Lock()
+				s.lastFallbackReason = err.Error()
+				s.mu.Unlock()
+				return nil, err
 			}
-			// Try other candidates with the recovery address
-			for _, strat := range candidates {
-				if strat != cur {
-					sess, err := strat.Dial(ctx, recovAddr)
-					if err == nil {
-						s.mu.Lock()
-						s.current = strat
-						s.mu.Unlock()
-						return sess, nil
-					}
-				}
+
+			if !authorizedStrat.Capabilities().PrerequisitesMet {
+				err := fmt.Errorf("prerequisites not met for authorized recovery mode %s: %s (fail-closed)",
+					snapshot.TransportMode, authorizedStrat.Capabilities().PrerequisiteNotice)
+				re.ReportCandidateFailure(err)
+				s.mu.Lock()
+				s.lastFallbackReason = err.Error()
+				s.mu.Unlock()
+				return nil, err
 			}
+
+			// Dial the authorized recovery candidate endpoint
+			sess, err := authorizedStrat.Dial(ctx, snapshot.Addr())
+			if err != nil {
+				re.ReportCandidateFailure(err)
+				s.recordFailure(authorizedStrat, err)
+				s.mu.Lock()
+				s.lastFallbackReason = fmt.Sprintf("authorized recovery candidate %s (%s) dial failed: %v",
+					snapshot.Addr(), snapshot.TransportMode, err)
+				s.mu.Unlock()
+				return nil, fmt.Errorf("recovery dial to %s (%s) failed: %w", snapshot.Addr(), snapshot.TransportMode, err)
+			}
+
+			// Recovery dial succeeded! Record telemetry without clearing recovery state
+			s.mu.Lock()
+			s.current = authorizedStrat
+			s.lastSuccessMode = authorizedStrat.Mode()
+			s.lastSwitch = time.Now()
+			s.mu.Unlock()
+			// Note: Do NOT call re.ReportPrimarySuccess() here, as this connection traversed the recovery path!
+			return sess, nil
 		}
 	}
 

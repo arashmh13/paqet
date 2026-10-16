@@ -54,13 +54,50 @@ type BootstrapEndpointData struct {
 	ValidUntil    int64  `json:"valid_until"`
 }
 
+// ParseSHA256Fingerprint parses and validates a canonical SHA-256 fingerprint string.
+// Canonical format: "SHA256:<64 hex characters>" (case-insensitive hex).
+func ParseSHA256Fingerprint(raw string) ([32]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToUpper(raw), "SHA256:") {
+		return [32]byte{}, fmt.Errorf("malformed fingerprint: missing 'SHA256:' prefix in %q", raw)
+	}
+	hexPart := raw[7:]
+	if len(hexPart) != 64 {
+		return [32]byte{}, fmt.Errorf("malformed fingerprint: expected 64 hex characters, got %d in %q", len(hexPart), raw)
+	}
+	b, err := hex.DecodeString(hexPart)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("malformed fingerprint hex decoding: %w", err)
+	}
+	var digest [32]byte
+	copy(digest[:], b)
+	return digest, nil
+}
+
+// Mode returns the strongly-typed TransportMode corresponding to b.TransportMode.
+func (b *BootstrapEndpointData) Mode() TransportMode {
+	if b == nil {
+		return ModeAuto
+	}
+	switch b.TransportMode {
+	case "raw-kcp":
+		return ModeRawKCP
+	case "aead-stream", "stream":
+		return ModeAEADStream
+	case "tls-outer", "tls", "tls-stream":
+		return ModeTLSStream
+	default:
+		return TransportMode(b.TransportMode)
+	}
+}
+
 // Validate validates that BootstrapEndpointData meets all cryptographic, network, and validity constraints.
-func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.Duration, allowLoopback bool) error {
+func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.Duration, allowPrivate, allowLoopback bool) error {
 	if b == nil {
 		return errors.New("nil bootstrap endpoint data")
 	}
 
-	// 1. IP validation
+	// 1. IP address and address class validation
 	if b.ServerIP == "" {
 		return errors.New("bootstrap: missing server IP")
 	}
@@ -68,11 +105,20 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 	if ip == nil {
 		return fmt.Errorf("bootstrap: invalid server IP format: %q", b.ServerIP)
 	}
-	if ip.IsUnspecified() || ip.IsMulticast() {
-		return fmt.Errorf("bootstrap: disallowed IP address class: %s", b.ServerIP)
+	if ip.IsUnspecified() {
+		return fmt.Errorf("bootstrap: disallowed unspecified IP: %s", b.ServerIP)
+	}
+	if ip.IsMulticast() {
+		return fmt.Errorf("bootstrap: disallowed multicast IP: %s", b.ServerIP)
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("bootstrap: disallowed link-local IP: %s", b.ServerIP)
 	}
 	if ip.IsLoopback() && !allowLoopback {
 		return fmt.Errorf("bootstrap: loopback IP rejected by production security policy: %s", b.ServerIP)
+	}
+	if ip.IsPrivate() && !allowPrivate {
+		return fmt.Errorf("bootstrap: private IP rejected by production security policy: %s", b.ServerIP)
 	}
 
 	// 2. Port validation
@@ -82,19 +128,20 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 
 	// 3. Transport mode validation (strict whitelist)
 	switch b.TransportMode {
-	case "raw-kcp", "aead-stream", "tls-outer":
-		// Allowed modes
+	case "raw-kcp", "aead-stream", "tls-outer", "tls-stream":
+		// Whitelisted supported modes
 	default:
 		return fmt.Errorf("bootstrap: unsupported transport mode: %q (fail-closed rejection)", b.TransportMode)
 	}
 
 	// 4. Timestamp & Validity Window (strictly nonzero and within bounds)
+	// P0 REQUIREMENT: ValidUntil == now.Unix() MUST be treated as expired!
 	if b.ValidUntil <= 0 {
 		return errors.New("bootstrap: missing or zero expiry timestamp (nonzero ValidUntil required for fail-closed recovery)")
 	}
 	nowUnix := now.Unix()
-	if b.ValidUntil < nowUnix {
-		return fmt.Errorf("bootstrap: endpoint coordinates expired at %d (current time %d)", b.ValidUntil, nowUnix)
+	if b.ValidUntil <= nowUnix {
+		return fmt.Errorf("bootstrap: endpoint coordinates expired at %d (current time %d, ValidUntil <= now is expired)", b.ValidUntil, nowUnix)
 	}
 	if maxValidityWindow > 0 {
 		maxFutureUnix := now.Add(maxValidityWindow).Unix()
@@ -105,13 +152,12 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 	}
 
 	// 5. Cryptographic Identity Binding
-	if b.TransportMode == "tls-outer" || b.TransportMode == "aead-stream" {
-		if b.ServerPubKey == "" {
-			return fmt.Errorf("bootstrap: missing server public key/certificate identity fingerprint for mode %s", b.TransportMode)
-		}
-		if len(b.ServerPubKey) < 8 {
-			return fmt.Errorf("bootstrap: server public key identity too short: %q", b.ServerPubKey)
-		}
+	// Mandatory canonical SHA-256 fingerprint for all authenticated transports
+	if b.ServerPubKey == "" {
+		return fmt.Errorf("bootstrap: missing server public key/certificate identity fingerprint for mode %s", b.TransportMode)
+	}
+	if _, err := ParseSHA256Fingerprint(b.ServerPubKey); err != nil {
+		return fmt.Errorf("bootstrap: invalid cryptographic identity fingerprint: %w", err)
 	}
 
 	return nil

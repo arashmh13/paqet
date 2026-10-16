@@ -512,3 +512,38 @@
      - Executed candidate HTTP request on recovery port 18089: retrieved byte-exact payload `{"status":"RECOVERY_CANDIDATE_HTTP_VERIFIED","token":"8ca6632a150dfa9f"}`!
      - Rolled back test rules. Production SOCKS5 proxy on `127.0.0.1:1090` remained completely unaffected throughout test ($0.145\text{ s}$, HTTP 200).
 - **Outcome:** Fail-closed endpoint recovery, generation token invalidation, DNS resource bounds, and real `StrategySelector` integration verified end-to-end. Production services healthy and rollback-ready.
+
+---
+
+## Cycle 21: Phase 13 Real SOCKS5 Recovery, Strict Transport Identity Binding & Evidentiary Gap Closure
+- **Objective:** Close the evidentiary gap between the unit-tested recovery state machine and observed application-level behavior; enforce strict binding between authenticated bootstrap data and the selected transport; replace string-only recovery endpoints with immutable typed snapshots; enforce canonical `SHA256:<64 hex>` identity verification; implement authenticating candidate validation requiring real AEAD/TLS handshakes and smux PPING/PPONG; dynamically route SOCKS5 proxy traffic to the candidate upon failover; validate live across Iran ⇄ Germany using dedicated isolated SOCKS5 port `11990` and unpredictable test token.
+- **Actions:**
+  1. Structured Recovery Endpoint Snapshot:
+     - Replaced `ActiveEndpoint() string` with `RecoveryEndpointSnapshot` struct containing `ServerIP`, `TransportPort`, `TransportMode`, `ExpectedPubKey`, `ValidUntil`, `MessageID`, `Generation`, and `ValidatedAt`.
+     - Bound active snapshots to the state machine's monotonically increasing `currentGeneration uint64`.
+     - In `StrategySelector.Dial()` and `timedConn.createConn()`, enforced strict transport mode mapping (`ModeRawKCP`, `ModeAEADStream`, `ModeTLSStream`). Attempting to dial an unauthorized mode fails closed.
+  2. Cryptographic Identity Binding & Authenticating Handshake:
+     - Standardized canonical identity format: `SHA256:<64 hex chars>`. Added `ParseSHA256Fingerprint()` in `dns_emergency.go`.
+     - Implemented `BuildCandidateValidator` in `recovery_state_machine.go`: performs genuine Paqet AEAD/TLS handshake, establishes smux session, and requires protocol `PPING` / `PPONG` round-trip. Proved dummy TCP listeners fail closed (`TestRecoveryStateMachine_TCPListenerWithoutPaqetHandshakeRejected`).
+     - Enforced `ValidUntil <= now.Unix()` as strictly expired (`TestRecoveryStateMachine_ValidUntilEqualToNowExpired`).
+  3. Dynamic SOCKS5 Tunnel Pool Failover:
+     - Audited `internal/client/dial.go`. Discovered `tc.conn.Ping(false)` created local smux stream structs without wire I/O, allowing stale primary connections to remain active after iptables drop.
+     - Updated `newConn()`: when `recoverySM` enters `RECOVERY_READY` and `tc.conn` does not match `snapshot.Addr()`, the stale connection is immediately torn down and recreated through the recovery candidate. When rolling back to `PRIMARY_HEALTHY`, connections return smoothly to primary.
+     - Built automated end-to-end regression test: `TestSOCKS5_LiveApplicationRecoveryFlow` (`go test -race`).
+  4. Built and Deployed Release `v2.5.5-recoveryproof`:
+     - WSL build: SHA-256 `3d28bc9e1a5a1e9d069c015a6bb9ba0c16ae1624610a237085e24efad0fd0ce3`.
+     - Deployed binary to Germany VPS; updated `paqet-emergency.service` and verified active.
+  5. Live Cross-Border Real-Transport SOCKS5 Failover (Iran ⇄ Germany):
+     - Isolated test environment:
+       * Iran VPS: SOCKS5 proxy on `127.0.0.1:11990` (`paqet-ng`).
+       * Germany VPS: Primary server on `0.0.0.0:18088` (`aead-stream`), Candidate server on `0.0.0.0:18089` (`aead-stream`), HTTP test origin on `127.0.0.1:18999` (`test-server-helper`).
+       * Unpredictable test token: `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf`.
+     - Step A Baseline: HTTP request via SOCKS5 `:11990` through primary `:18088` returned token in **91.69 ms** (match verified).
+     - Step B Failure: Applied `iptables -I OUTPUT -p tcp -d 77.37.65.2 --dport 18088 -j DROP` in **7.22 ms**. Request through primary failed (`Client.Timeout`), triggering transition to `PRIMARY_DEGRADED`.
+     - Step C Signaling: Emergency DNS query sent to `77.37.65.2:53`. Authenticated bootstrap reply received in **85.24 ms**. Parsed candidate `77.37.65.2:18089` (mode `aead-stream`, pubKey `SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d`, ValidUntil `1792145932`).
+     - Step D Validation: Candidate validation handshake executed in **164.41 ms**. AEAD key derivation, smux session, and protocol `PPING`/`PPONG` verified. State transitioned to `RECOVERY_READY` with generation revision 6.
+     - Step E Recovery: Real application HTTP request through SOCKS5 `:11990` dynamically routed via recovery candidate `77.37.65.2:18089`. HTTP 200 returned in **175.47 ms**, matching token `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf` byte-exact!
+     - Step F Rollback: `ResetRollback` cleared active snapshot in **0.01 ms** and restored `PRIMARY_HEALTHY`.
+     - Step G Restoration: Iptables test rule deleted in **10.47 ms**. Production SOCKS5 proxy on `127.0.0.1:1090` remained completely unaffected throughout test (`pong`).
+     - Documented in `docs/research/recovery_socks5_live_audit.json`.
+- **Outcome:** Evidentiary gap completely closed. Structured recovery snapshot architecture, authenticating candidate validation, and real SOCKS5 failover proven across international censorship boundary. Production services healthy and rollback-ready.

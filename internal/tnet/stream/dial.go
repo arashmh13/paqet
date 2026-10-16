@@ -27,7 +27,7 @@ func Dial(addr string, obfsCfg *conf.Obfs) (tnet.Conn, error) {
 		maxPad = 64
 	}
 
-	rawConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	rawConn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("stream: failed to dial %s: %w", addr, err)
 	}

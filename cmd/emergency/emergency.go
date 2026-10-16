@@ -2,8 +2,10 @@ package emergency
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -31,6 +33,8 @@ var (
 	timeoutSec    int
 	scanResolvers string
 	scanCacheFile string
+	bootstrapPort int
+	bootstrapMode string
 )
 
 func init() {
@@ -42,6 +46,8 @@ func init() {
 	serverCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
+	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
+	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
 
 	sendCmd.Flags().StringVar(&resolverAddr, "resolver", "8.8.8.8:53", "Recursive DNS resolver address (e.g. 8.8.8.8:53)")
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
@@ -80,6 +86,34 @@ var serverCmd = &cobra.Command{
 				// Privacy and Security: Log only metadata, never plaintext payload or key material
 				log.Printf("[EMERGENCY-SERVER] Authenticated message ID=%s Type=%s PayloadBytes=%d ClientID=%s Status=PROCESSED",
 					msg.ID, msg.Type, len(msg.Payload), clientID)
+
+				if msg.Type == "bootstrap_request" {
+					port := bootstrapPort
+					if port <= 0 {
+						port = 18089
+					}
+					mode := bootstrapMode
+					if mode == "" {
+						mode = "aead-stream"
+					}
+					bootstrapResp := transport.BootstrapEndpointData{
+						ServerIP:      "77.37.65.2",
+						TransportPort: port,
+						TransportMode: mode,
+						ServerPubKey:  fmt.Sprintf("SHA256:%x", sha256.Sum256(psk)),
+						ValidUntil:    time.Now().Add(2 * time.Hour).Unix(),
+					}
+					payload, err := json.Marshal(bootstrapResp)
+					if err == nil {
+						return &transport.EmergencyResponse{
+							ID:        msg.ID,
+							Status:    "OK",
+							Reply:     payload,
+							Timestamp: time.Now().Unix(),
+						}, nil
+					}
+				}
+
 				return &transport.EmergencyResponse{
 					ID:        msg.ID,
 					Status:    "OK",

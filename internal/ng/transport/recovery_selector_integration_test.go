@@ -73,12 +73,12 @@ func TestRecoverySelectorIntegration_EndToEndFailover(t *testing.T) {
 				ServerIP:      "77.37.65.2",
 				TransportPort: 18089,
 				TransportMode: "aead-stream",
-				ServerPubKey:  "SHA256:pin-test-recovery-node",
+				ServerPubKey:  testValidPubKey,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil
 		},
 		CandidateValidator: func(ctx context.Context, endpoint *BootstrapEndpointData) error {
-			if endpoint.ServerIP == "77.37.65.2" && endpoint.TransportPort == 18089 && endpoint.ServerPubKey == "SHA256:pin-test-recovery-node" {
+			if endpoint.ServerIP == "77.37.65.2" && endpoint.TransportPort == 18089 && endpoint.ServerPubKey == testValidPubKey {
 				return nil // Authenticated handshake validated!
 			}
 			return errors.New("candidate validation failed")
@@ -172,5 +172,176 @@ func TestRecoverySelectorIntegration_EndToEndFailover(t *testing.T) {
 	}
 	if primaryStrat.lastDialAddr != primaryTarget {
 		t.Fatalf("Expected dial to primary target %s, got %s", primaryTarget, primaryStrat.lastDialAddr)
+	}
+}
+
+func TestRecoverySelectorIntegration_UnauthorizedModeFailClosed(t *testing.T) {
+	// P0 REQUIREMENT: Selector must honor the explicitly validated mode.
+	// If required strategy is unavailable in candidates, fail closed!
+	primaryStrat := &mockStrategy{mode: ModeAEADStream} // Only AEADStream is available
+
+	recoverySM := NewRecoveryStateMachine(RecoveryStateMachineConfig{
+		PrimaryFailureThreshold:    1,
+		DegradedTimeout:            10 * time.Millisecond,
+		BootstrapValidationTimeout: 100 * time.Millisecond,
+		CooldownDuration:           500 * time.Millisecond,
+		AllowLoopbackEndpoints:     true,
+		EmergencyDialer: func(ctx context.Context, msg *EmergencyMessage) (*BootstrapEndpointData, error) {
+			return &BootstrapEndpointData{
+				ServerIP:      "77.37.65.2",
+				TransportPort: 8443,
+				TransportMode: "tls-outer", // Bootstrap explicitly authorizes TLS!
+				ServerPubKey:  testValidPubKey,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}, nil
+		},
+		CandidateValidator: func(ctx context.Context, endpoint *BootstrapEndpointData) error {
+			return nil
+		},
+	})
+
+	selector := NewStrategySelector(SelectorConfig{
+		Candidates:      []Strategy{primaryStrat}, // No TLS strategy configured!
+		PreferredMode:   ModeAEADStream,
+		CircuitCooldown: 10 * time.Millisecond,
+		RecoveryEngine:  recoverySM,
+	})
+
+	ctx := context.Background()
+	primaryTarget := "77.37.65.2:8089"
+
+	// Trigger primary failure -> recovery state machine advances to RECOVERY_READY
+	primaryStrat.isDown.Store(true)
+	_, _ = selector.Dial(ctx, primaryTarget)
+	time.Sleep(15 * time.Millisecond)
+	_, _ = selector.Dial(ctx, primaryTarget)
+
+	if recoverySM.CurrentState() != StateRecoveryReady {
+		t.Fatalf("Expected StateRecoveryReady, got %s", recoverySM.CurrentState())
+	}
+
+	// Dialing must FAIL CLOSED because authorized mode tls-outer is not in selector candidates!
+	_, dialErr := selector.Dial(ctx, primaryTarget)
+	if dialErr == nil {
+		t.Fatalf("Expected dial to fail closed when authorized mode is missing, but dial succeeded!")
+	}
+}
+
+func TestRecoverySelectorIntegration_RecoveryDialSuccessDoesNotClearRecovery(t *testing.T) {
+	// P1 REQUIREMENT: A primary success result cannot accidentally clear an active recovery endpoint
+	// if the successful dial actually used the recovery endpoint.
+	strat := &mockStrategy{mode: ModeAEADStream}
+
+	recoverySM := NewRecoveryStateMachine(RecoveryStateMachineConfig{
+		PrimaryFailureThreshold:    1,
+		DegradedTimeout:            10 * time.Millisecond,
+		BootstrapValidationTimeout: 100 * time.Millisecond,
+		CooldownDuration:           500 * time.Millisecond,
+		AllowLoopbackEndpoints:     true,
+		EmergencyDialer: func(ctx context.Context, msg *EmergencyMessage) (*BootstrapEndpointData, error) {
+			return &BootstrapEndpointData{
+				ServerIP:      "77.37.65.2",
+				TransportPort: 18089,
+				TransportMode: "aead-stream",
+				ServerPubKey:  testValidPubKey,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}, nil
+		},
+		CandidateValidator: func(ctx context.Context, endpoint *BootstrapEndpointData) error {
+			return nil
+		},
+	})
+
+	selector := NewStrategySelector(SelectorConfig{
+		Candidates:      []Strategy{strat},
+		PreferredMode:   ModeAEADStream,
+		CircuitCooldown: 10 * time.Millisecond,
+		RecoveryEngine:  recoverySM,
+	})
+
+	ctx := context.Background()
+	primaryTarget := "77.37.65.2:8089"
+
+	strat.isDown.Store(true)
+	_, _ = selector.Dial(ctx, primaryTarget)
+	time.Sleep(15 * time.Millisecond)
+	_, _ = selector.Dial(ctx, primaryTarget)
+
+	if recoverySM.CurrentState() != StateRecoveryReady {
+		t.Fatalf("Expected StateRecoveryReady, got %s", recoverySM.CurrentState())
+	}
+
+	// Make candidate accept dials
+	strat.isDown.Store(false)
+
+	// Dial succeeds through recovery candidate!
+	sess, err := selector.Dial(ctx, primaryTarget)
+	if err != nil || sess == nil {
+		t.Fatalf("Dial through recovery candidate should succeed: %v", err)
+	}
+
+	// Recovery engine MUST STILL BE in RECOVERY_READY (not cleared by dial success!)
+	if recoverySM.CurrentState() != StateRecoveryReady {
+		t.Fatalf("Active recovery endpoint must not be cleared by successful dial through recovery, got state %s", recoverySM.CurrentState())
+	}
+	if recoverySM.ActiveEndpoint() != "77.37.65.2:18089" {
+		t.Fatalf("Active endpoint must remain set, got %s", recoverySM.ActiveEndpoint())
+	}
+}
+
+func TestRecoverySelectorIntegration_RecoveryCandidateFailureTriggersCooldown(t *testing.T) {
+	// P1 REQUIREMENT: Candidate failures trigger documented state transition and cooldown.
+	strat := &mockStrategy{mode: ModeAEADStream}
+
+	recoverySM := NewRecoveryStateMachine(RecoveryStateMachineConfig{
+		PrimaryFailureThreshold: 1,
+		DegradedTimeout:         10 * time.Millisecond,
+		CandidateFailureLimit:   2,
+		CooldownDuration:        500 * time.Millisecond,
+		AllowLoopbackEndpoints:  true,
+		EmergencyDialer: func(ctx context.Context, msg *EmergencyMessage) (*BootstrapEndpointData, error) {
+			return &BootstrapEndpointData{
+				ServerIP:      "77.37.65.2",
+				TransportPort: 18089,
+				TransportMode: "aead-stream",
+				ServerPubKey:  testValidPubKey,
+				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
+			}, nil
+		},
+		CandidateValidator: func(ctx context.Context, endpoint *BootstrapEndpointData) error {
+			return nil
+		},
+	})
+
+	selector := NewStrategySelector(SelectorConfig{
+		Candidates:      []Strategy{strat},
+		PreferredMode:   ModeAEADStream,
+		CircuitCooldown: 10 * time.Millisecond,
+		RecoveryEngine:  recoverySM,
+	})
+
+	ctx := context.Background()
+	primaryTarget := "77.37.65.2:8089"
+
+	strat.isDown.Store(true)
+	_, _ = selector.Dial(ctx, primaryTarget)
+	time.Sleep(15 * time.Millisecond)
+	_, _ = selector.Dial(ctx, primaryTarget)
+
+	if recoverySM.CurrentState() != StateRecoveryReady {
+		t.Fatalf("Expected StateRecoveryReady, got %s", recoverySM.CurrentState())
+	}
+
+	// Candidate continues to fail (isDown = true)
+	// Dial 1: candidate failure 1
+	_, _ = selector.Dial(ctx, primaryTarget)
+	if recoverySM.CurrentState() != StateRecoveryReady {
+		t.Fatalf("Expected still StateRecoveryReady after 1 candidate failure, got %s", recoverySM.CurrentState())
+	}
+
+	// Dial 2: candidate failure 2 -> reaches limit -> enters COOLDOWN!
+	_, _ = selector.Dial(ctx, primaryTarget)
+	if recoverySM.CurrentState() != StateCooldown {
+		t.Fatalf("Expected StateCooldown after reaching candidate failure limit, got %s", recoverySM.CurrentState())
 	}
 }
