@@ -250,12 +250,11 @@ func validateServerStartupConfig(serverID, serverSecretFile string, legacyMode b
 		if serverSecretFile == "" {
 			return nil, errors.New("emergency server: --server-secret-file is mandatory for multi-authoritative emergency server (shared PSK fallback prohibited)")
 		}
-		secret, err := parseKey("", serverSecretFile)
+		// Same deployment credential-file policy as the client loader: regular file
+		// (no symlinks), no group/world access bits, exactly 32 decoded bytes.
+		secret, err := loadProtectedCredentialFile(serverSecretFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load server secret file %q: %w", serverSecretFile, err)
-		}
-		if len(secret) != 32 {
-			return nil, fmt.Errorf("emergency server: server secret in %q must be exactly 32 bytes, got %d", serverSecretFile, len(secret))
+			return nil, fmt.Errorf("failed to load server secret file: %w", err)
 		}
 		return secret, nil
 	}
