@@ -12,10 +12,13 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"paqet/internal/ng/crypto"
 )
 
 const (
@@ -464,6 +467,7 @@ type EmergencyDNSServerConfig struct {
 	ServerID             string // Unique cryptographic identity of this authoritative server instance (e.g. "ns-de-01")
 	ServerSecret         []byte // Dedicated 32-byte response secret (mandatory in multi-server mode)
 	IsLegacySingleServer bool   // If true, enables legacy single-server mode using PSK only
+	ProtocolV4           bool   // If true, sessions speak v4 ("PAQD") framing with per-session random seed keying
 	Handler              func(msg *EmergencyMessage) (*EmergencyResponse, error)
 }
 
@@ -552,6 +556,9 @@ func NewEmergencyDNSServer(cfg EmergencyDNSServerConfig) (*EmergencyDNSServer, e
 	}
 	if len(cfg.PSK) != 32 {
 		return nil, errors.New("emergency dns: PSK must be exactly 32 bytes")
+	}
+	if cfg.IsLegacySingleServer && cfg.ProtocolV4 {
+		return nil, errors.New("emergency dns: v4 protocol cannot be combined with legacy single-server mode (fail-closed)")
 	}
 
 	if !cfg.IsLegacySingleServer {
@@ -804,9 +811,27 @@ func (s *EmergencyDNSServer) processQuery(reqPacket []byte, normalizedSuffix str
 		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
 	}
 
-	sessionID := binary.BigEndian.Uint64(fullFrame[4:12])
+	magic := binary.BigEndian.Uint32(fullFrame[0:4])
 	reqSeq := binary.BigEndian.Uint32(fullFrame[12:16])
 	reqDigest := sha256.Sum256(fullFrame)
+
+	var sessionID uint64
+	switch magic {
+	case AsymmetricMagicV4:
+		// v4 header: Magic(4)+SessionID(8)+Seq(4)+Ack(4)+SeedLen(1)+Seed(16)...
+		if len(fullFrame) < AsymmetricHeaderV4MinLen+crypto.SessionSeedSize {
+			return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
+		}
+		seedLen := int(fullFrame[20])
+		if seedLen != crypto.SessionSeedSize {
+			return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
+		}
+		sessionID = binary.BigEndian.Uint64(fullFrame[4:12])
+	case AsymmetricMagicV3, AsymmetricMagic:
+		sessionID = binary.BigEndian.Uint64(fullFrame[4:12])
+	default:
+		return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
+	}
 
 	// Step 1: Check if session already exists
 	s.mu.Lock()
@@ -819,6 +844,11 @@ func (s *EmergencyDNSServer) processQuery(reqPacket []byte, normalizedSuffix str
 	if exists {
 		defer atomic.AddInt32(&entry.activeOps, -1)
 		return s.processExistingSessionQuery(reqPacket, entry, fullFrame, reqSeq, reqDigest)
+	}
+
+	// v4 frames are only processable by v4-configured servers (explicit reject otherwise)
+	if magic == AsymmetricMagicV4 && !s.cfg.ProtocolV4 {
+		return s.processNewSessionQuery(reqPacket, sessionID, fullFrame, reqSeq, reqDigest) // path itself fails closed on v4
 	}
 
 	return s.processNewSessionQuery(reqPacket, sessionID, fullFrame, reqSeq, reqDigest)
@@ -1004,12 +1034,30 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 	reqSeq uint32,
 	reqDigest [32]byte,
 ) []byte {
-	// 1. Ephemeral unpersisted session for candidate validation
+	// 1. Ephemeral unpersisted session for candidate validation.
+	//    The wire magic decides the keying mode; unsupported versions fail closed here.
+	//    NOTE: legacy single-server clients seal v3-magic frames carrying PSK-only
+	//    key schedules (Phase 18 contract), so legacy services accept that magic
+	//    and reject only v4 (which requires dedicated per-session seed keying).
+	magic := binary.BigEndian.Uint32(fullFrame[0:4])
 	var candidateConn *AsymmetricConn
 	var err error
-	if s.cfg.IsLegacySingleServer {
+	switch {
+	case magic == AsymmetricMagicV4:
+		if !s.cfg.ProtocolV4 {
+			// v4 frame against a v3/legacy-configured service: explicit fail-closed reject (no silent keying fallback)
+			return BuildDNSErrorResponse(reqPacket, 5 /* REFUSED */)
+		}
+		if len(fullFrame) < AsymmetricHeaderV4MinLen+crypto.SessionSeedSize {
+			return BuildDNSErrorResponse(reqPacket, 1 /* FORMERR */)
+		}
+		seed := append([]byte(nil), fullFrame[21:21+crypto.SessionSeedSize]...)
+		candidateConn, err = NewServerAsymmetricSessionWithIDV4(sessionID, s.cfg.PSK, s.cfg.ServerSecret, seed, s.cfg.ServerID)
+	case s.cfg.IsLegacySingleServer:
+		// v3-magic frames sealed with the PSK-only legacy schedule (allow-magic, verify by AEAD tag)
 		candidateConn, err = NewServerLegacyAsymmetricSession(sessionID, s.cfg.PSK)
-	} else {
+	default:
+		// v3 multi-authoritative path with mandatory dedicated response secret
 		candidateConn, err = NewServerAsymmetricSessionWithID(sessionID, s.cfg.PSK, s.cfg.ServerSecret, s.cfg.ServerID)
 	}
 	if err != nil {
@@ -1272,7 +1320,7 @@ type EmergencyDNSClientConfig struct {
 	DomainSuffix         string   // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
 	ClientID             string
 	PSK                  []byte
-	SessionID            uint64
+	SessionID            uint64        // 0 -> full-entropy random generation at construction
 	Timeout              time.Duration // Total timeout across all attempts
 	PerAttemptTimeout    time.Duration // Timeout for an individual attempt (default 1500ms)
 	MaxRetries           int
@@ -1280,6 +1328,7 @@ type EmergencyDNSClientConfig struct {
 	ServerIdentities     []AuthorizedServerEntry // Explicit per-server response secrets (mandatory in multi-server mode)
 	IsLegacySingleServer bool                    // If true, enables legacy single-server mode using PSK only
 	AllowLegacyV2        bool                    // Reject legacy v2 frames if false
+	ProtocolV4           bool                    // v4 ("PAQD") framing with per-session random seed keying (session-ID collision safety)
 }
 
 // EmergencyDNSClient sends authenticated application messages over public recursive DNS and verifies responses.
@@ -1347,20 +1396,37 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 		cfg.MaxRetries = 2
 	}
 	if cfg.SessionID == 0 {
-		cfg.SessionID = cryptoRandUint64()
+		if full, rerr := crypto.GenerateFullRandomUint64(); rerr == nil && full != 0 {
+			cfg.SessionID = full
+		} else {
+			cfg.SessionID = cryptoRandUint64()
+		}
 	}
 	if cfg.EDNSBufferSize == 0 {
 		cfg.EDNSBufferSize = DefaultEDNSUDPPayloadSize
 	}
+	if cfg.IsLegacySingleServer && cfg.ProtocolV4 {
+		return nil, errors.New("emergency client: v4 protocol cannot be combined with legacy single-server mode (fail-closed)")
+	}
 
 	var sess *AsymmetricConn
 	var err error
-	if cfg.IsLegacySingleServer {
+	switch {
+	case cfg.IsLegacySingleServer:
 		sess, err = NewClientLegacyAsymmetricSession(cfg.SessionID, cfg.PSK)
 		if err != nil {
 			return nil, err
 		}
-	} else {
+	case cfg.ProtocolV4:
+		set, serr := NewAuthorizedServerSet("inline", cfg.ServerIdentities)
+		if serr != nil {
+			return nil, serr
+		}
+		sess, err = NewClientAsymmetricSessionV4(cfg.SessionID, cfg.PSK, set, nil)
+		if err != nil {
+			return nil, err
+		}
+	default:
 		if len(cfg.ServerIdentities) == 0 {
 			return nil, ErrEmptyServerAllowlist
 		}
@@ -1377,6 +1443,34 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 		cfg:     cfg,
 		session: sess,
 	}, nil
+}
+
+// SessionID returns the session identifier in use by this client.
+func (c *EmergencyDNSClient) SessionID() uint64 {
+	return c.cfg.SessionID
+}
+
+// AuthorizedServerIDs returns a deterministic, safe (non-secret) copy of the
+// authorized server identities. Server IDs are observational metadata only;
+// response secrets are never exposed through this accessor.
+func (c *EmergencyDNSClient) AuthorizedServerIDs() []string {
+	ids := make([]string, 0, len(c.session.authorizedServers))
+	for id := range c.session.authorizedServers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// ProtocolVersionName reports the active wire protocol generation.
+func (c *EmergencyDNSClient) ProtocolVersionName() string {
+	if c.session.protoV4 {
+		return "v4-PAQD"
+	}
+	if c.session.isLegacySingleServer {
+		return "v2-legacy"
+	}
+	return "v3-PAQC"
 }
 
 // Exchange transmits an EmergencyMessage through the recursive DNS resolver and waits for an authenticated response.

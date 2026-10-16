@@ -25,28 +25,44 @@ import (
 )
 
 var (
-	listenAddr          string
-	resolverAddr        string
-	domainSuffix        string
-	keyStr              string
-	keyFile             string
-	clientID            string
-	messageStr          string
-	timeoutSec          int
-	scanResolvers       string
-	scanCacheFile       string
-	bootstrapIP         string
-	bootstrapPort       int
-	bootstrapMode       string
-	bootstrapCertFile   string
-	bootstrapKeyFile    string
-	bootstrapPin        string
-	bootstrapConfigFile string
-	disableBootstrap    bool
-	serverID            string
-	serverSecretFile    string
-	legacySingleServer  bool
+	listenAddr           string
+	resolverAddr         string
+	domainSuffix         string
+	keyStr               string
+	keyFile              string
+	clientID             string
+	messageStr           string
+	timeoutSec           int
+	scanResolvers        string
+	scanCacheFile        string
+	bootstrapIP          string
+	bootstrapPort        int
+	bootstrapMode        string
+	bootstrapCertFile    string
+	bootstrapKeyFile     string
+	bootstrapPin         string
+	bootstrapConfigFile  string
+	disableBootstrap     bool
+	serverID             string
+	serverSecretFile     string
+	legacySingleServer   bool
+	authorizedServersCfg string
 )
+
+// AuthorizedServersConfigFile is the on-disk JSON schema for the explicit
+// multi-server client authorization set. Raw response secrets MUST NOT be embedded;
+// entries reference protected credential files instead.
+type AuthorizedServersConfigFile struct {
+	Version           int                         `json:"version"`
+	Protocol          string                      `json:"protocol"` // must be "v4" for the Phase 19 multi-server construction
+	Generation        uint64                      `json:"generation,omitempty"`
+	AuthorizedServers []AuthorizedServerFileEntry `json:"authorized_servers"`
+}
+
+type AuthorizedServerFileEntry struct {
+	ServerID   string `json:"server_id"`
+	SecretFile string `json:"secret_file"`
+}
 
 func init() {
 	Cmd.AddCommand(serverCmd)
@@ -73,9 +89,10 @@ func init() {
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	sendCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	sendCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
-	sendCmd.Flags().StringVar(&serverID, "server-id", "", "Expected authoritative server ID to authorize (mandatory in multi-server mode)")
-	sendCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing server response secret (mandatory in multi-server mode)")
+	sendCmd.Flags().StringVar(&serverID, "server-id", "", "Expected authoritative server ID to authorize (single-server convenience path)")
+	sendCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing server response secret (single-server convenience path)")
 	sendCmd.Flags().BoolVar(&legacySingleServer, "legacy-single-server", false, "Run in legacy single-server mode using PSK only")
+	sendCmd.Flags().StringVar(&authorizedServersCfg, "authorized-servers-config", "", "Path to JSON file defining the explicit multi-server authorized set (v4 protocol; schema: version, protocol, generation, authorized_servers[{server_id, secret_file}])")
 	sendCmd.Flags().StringVar(&clientID, "client-id", "c01", "Client ID string (max 4 chars)")
 	sendCmd.Flags().StringVarP(&messageStr, "message", "m", "EMERGENCY_PING", "Application payload to transmit")
 	sendCmd.Flags().IntVar(&timeoutSec, "timeout", 5, "Timeout in seconds for response")
@@ -245,6 +262,131 @@ func validateServerStartupConfig(serverID, serverSecretFile string, legacyMode b
 	return nil, nil
 }
 
+// loadAuthorizedServersConfig parses and validates the explicit multi-server
+// authorized-server mapping. Every failure mode is fail-closed BEFORE any network
+// listener or credential is used. Secrets are never logged; only safe metadata
+// (server IDs, generation, protocol) is returned.
+func loadAuthorizedServersConfig(path string) ([]transport.AuthorizedServerEntry, string, uint64, error) {
+	if path == "" {
+		return nil, "", 0, errors.New("authorized-servers-config: empty path")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("authorized-servers-config: read %s: %w", path, err)
+	}
+	var cfg AuthorizedServersConfigFile
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, "", 0, fmt.Errorf("authorized-servers-config: parse %s: %w", path, err)
+	}
+	if cfg.Version != 1 {
+		return nil, "", 0, fmt.Errorf("authorized-servers-config: unsupported schema version %d (want 1)", cfg.Version)
+	}
+	if cfg.Protocol != "v4" {
+		return nil, "", 0, fmt.Errorf("authorized-servers-config: protocol %q not supported (must be explicit v4 multi-server)", cfg.Protocol)
+	}
+	if len(cfg.AuthorizedServers) == 0 {
+		return nil, "", 0, errors.New("authorized-servers-config: authorized_servers list must be nonempty in multi-server mode")
+	}
+	seen := make(map[string]bool, len(cfg.AuthorizedServers))
+	entries := make([]transport.AuthorizedServerEntry, 0, len(cfg.AuthorizedServers))
+	for i, e := range cfg.AuthorizedServers {
+		if e.ServerID == "" {
+			return nil, "", 0, fmt.Errorf("authorized-servers-config: entry %d has empty server_id", i)
+		}
+		if e.ServerID == "default" || e.ServerID == "legacy" {
+			return nil, "", 0, fmt.Errorf("authorized-servers-config: entry %d server_id %q is reserved", i, e.ServerID)
+		}
+		if err := transport.ValidateServerID(e.ServerID); err != nil {
+			return nil, "", 0, fmt.Errorf("authorized-servers-config: entry %d server_id %q rejected: %w", i, e.ServerID, err)
+		}
+		if seen[e.ServerID] {
+			return nil, "", 0, fmt.Errorf("authorized-servers-config: duplicate server_id %q (fail-closed: set replacement is atomic)", e.ServerID)
+		}
+		seen[e.ServerID] = true
+		if e.SecretFile == "" {
+			return nil, "", 0, fmt.Errorf("authorized-servers-config: entry %d (%s) has empty secret_file path (inline secrets prohibited)", i, e.ServerID)
+		}
+		secret, err := loadProtectedCredentialFile(e.SecretFile)
+		if err != nil {
+			return nil, "", 0, fmt.Errorf("authorized-servers-config: entry %d (%s): %w", i, e.ServerID, err)
+		}
+		entries = append(entries, transport.AuthorizedServerEntry{
+			ServerID:       e.ServerID,
+			ResponseSecret: append([]byte(nil), secret...), // deep copy from the file buffer
+		})
+	}
+	return entries, cfg.Protocol, cfg.Generation, nil
+}
+
+// loadProtectedCredentialFile enforces the deployment credential-file policy:
+// regular file only (symlinks rejected), no group/world access bits, decodable to
+// exactly 32 bytes via the canonical key forms. Path and permission failures are
+// reported without file contents.
+func loadProtectedCredentialFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("lstat %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("credential file %s is a symlink (rejected by deployment policy)", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("credential path %s is not a regular file", path)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("credential file %s has unsafe permissions %o (must not be group/world accessible)", path, perm)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	secret, err := parseKeyBytes(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil, fmt.Errorf("credential file %s: %w", path, err)
+	}
+	if len(secret) != 32 {
+		return nil, fmt.Errorf("credential file %s: decoded length %d (want 32)", path, len(secret))
+	}
+	return secret, nil
+}
+
+// resolveClientCredentialConfiguration applies the CLI flag ambiguity policy:
+// CONFIG alone, LEGACY alone, or SINGULAR pair alone — never a mix — and returns
+// the authorized entries plus the selected protocol mode.
+func resolveClientCredentialConfiguration(cfgPath, singleID, singleSecret string, legacyMode bool) ([]transport.AuthorizedServerEntry, string, error) {
+	singular := singleID != "" || singleSecret != ""
+	switch {
+	case legacyMode && cfgPath != "":
+		return nil, "", errors.New("emergency client: --authorized-servers-config cannot be combined with --legacy-single-server (ambiguous mode selection)")
+	case legacyMode && singular:
+		return nil, "", errors.New("emergency client: --legacy-single-server cannot be combined with --server-id/--server-secret-file")
+	case cfgPath != "" && singular:
+		return nil, "", errors.New("emergency client: --authorized-servers-config is mutually exclusive with the singular --server-id/--server-secret-file convenience path")
+	case legacyMode:
+		return nil, "legacy", nil
+	case cfgPath != "":
+		entries, protocol, _, err := loadAuthorizedServersConfig(cfgPath)
+		if err != nil {
+			return nil, "", err
+		}
+		if len(entries) == 0 {
+			return nil, "", errors.New("emergency client: resolved authorized set is empty (fail-closed)")
+		}
+		return entries, protocol, nil
+	case singular:
+		if singleID == "" || singleSecret == "" {
+			return nil, "", errors.New("emergency client: multi-server operation requires both --server-id and --server-secret-file, or --authorized-servers-config")
+		}
+		entries, err := validateClientStartupConfig(singleID, singleSecret, false)
+		if err != nil {
+			return nil, "", err
+		}
+		return entries, "v3", nil
+	default:
+		return nil, "", errors.New("emergency client: no server authorization configuration supplied (provide --authorized-servers-config, or --legacy-single-server)")
+	}
+}
+
 func validateClientStartupConfig(serverID, serverSecretFile string, legacyMode bool) ([]transport.AuthorizedServerEntry, error) {
 	if !legacyMode {
 		if serverID == "" {
@@ -361,13 +503,14 @@ var sendCmd = &cobra.Command{
 			log.Fatalf("failed to load emergency key: %v", err)
 		}
 
-		clientEntries, err := validateClientStartupConfig(serverID, serverSecretFile, legacySingleServer)
+		clientEntries, protocolMode, err := resolveClientCredentialConfiguration(authorizedServersCfg, serverID, serverSecretFile, legacySingleServer)
 		if err != nil {
 			log.Fatalf("failed startup: %v", err)
 		}
 
 		var clientCfg transport.EmergencyDNSClientConfig
-		if legacySingleServer {
+		switch protocolMode {
+		case "legacy":
 			clientCfg = transport.EmergencyDNSClientConfig{
 				ResolverAddr:         resolverAddr,
 				DomainSuffix:         domainSuffix,
@@ -377,7 +520,18 @@ var sendCmd = &cobra.Command{
 				MaxRetries:           2,
 				IsLegacySingleServer: true,
 			}
-		} else {
+		case "v4":
+			clientCfg = transport.EmergencyDNSClientConfig{
+				ResolverAddr:     resolverAddr,
+				DomainSuffix:     domainSuffix,
+				ClientID:         clientID,
+				PSK:              psk,
+				Timeout:          time.Duration(timeoutSec) * time.Second,
+				MaxRetries:       2,
+				ProtocolV4:       true,
+				ServerIdentities: clientEntries,
+			}
+		default: // "v3"
 			clientCfg = transport.EmergencyDNSClientConfig{
 				ResolverAddr:     resolverAddr,
 				DomainSuffix:     domainSuffix,
@@ -393,6 +547,8 @@ var sendCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("failed to initialize emergency client: %v", err)
 		}
+		// Safe, credential-free metadata: active protocol version + authorized server IDs.
+		fmt.Printf("[CLIENT] protocol=%s authorized-servers=%v\n", client.ProtocolVersionName(), client.AuthorizedServerIDs())
 
 		msgID := transport.GenerateRandomMessageID()
 		msg := &transport.EmergencyMessage{

@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -115,6 +116,152 @@ func DeriveServerResponseKey(serverResponseSecret []byte, salt []byte, serverID 
 		return nil, fmt.Errorf("crypto: failed to derive s2c v3 key for server %s: %w", serverID, err)
 	}
 	return s2c, nil
+}
+
+// SessionSeedSize is the size of the per-session random keying-material seed
+// used by the v4 wire protocol ("PAQD"). The seed is transported as
+// authenticated associated data in every frame and mixed into the HKDF salt,
+// so the traffic-key schedule is randomized independently of the 64-bit
+// session identifier.
+const SessionSeedSize = 16
+
+// V4Salt returns the v4 key-derivation salt:
+//
+//	salt = "paqet-v4-" || sessionSeed(16B) || sessionID(8B BE)
+//
+// This guarantees that a session-ID collision alone (64-bit space) cannot
+// recreate a matching key and nonce domain: the 128-bit random sessionSeed is
+// an independent entropy source. Reusing the same key+nonce pair requires a
+// collision of the full (seed, sessionID) pair (~2^(128+63) space), reducing
+// the birthday bound from n^2/2^65 (v3) to n^2/2^129 (v4).
+func V4Salt(sessionSeed []byte, sessionID uint64) []byte {
+	if len(sessionSeed) != SessionSeedSize {
+		sessionSeed = make([]byte, SessionSeedSize) // deterministic zero salt for malformed input (construction paths validate length beforehand)
+	}
+	salt := make([]byte, 0, len("paqet-v4-")+SessionSeedSize+8)
+	salt = append(salt, "paqet-v4-"...)
+	salt = append(salt, sessionSeed...)
+	var sessIDBE [8]byte
+	binary.BigEndian.PutUint64(sessIDBE[:], sessionID)
+	salt = append(salt, sessIDBE[:]...)
+	return salt
+}
+
+// DeriveV4ClientTrafficKey derives the client-to-server upstream key for the v4 protocol.
+// The upstream key remains bound to the shared c2s PSK (all authorized servers can decrypt
+// queries), but is independently re-keyed per session via the random sessionSeed salt.
+func DeriveV4ClientTrafficKey(c2sPSK []byte, sessionSeed []byte, sessionID uint64) ([]byte, error) {
+	if len(c2sPSK) != KeySize {
+		return nil, ErrInvalidKey
+	}
+	extractor := hkdf.New(sha256.New, c2sPSK, V4Salt(sessionSeed, sessionID), []byte("paqet-v4-c2s"))
+	c2s := make([]byte, KeySize)
+	if _, err := io.ReadFull(extractor, c2s); err != nil {
+		return nil, fmt.Errorf("crypto: failed to derive v4 c2s key: %w", err)
+	}
+	return c2s, nil
+}
+
+// DeriveServerTrafficKeysV4 derives v4 directional keys:
+//   - c2sKey: HKDF-SHA256(ikm=c2sPSK, salt=V4Salt(seed, sessionID), info="paqet-v4-c2s")
+//   - s2cKey: HKDF-SHA256(ikm=serverResponseSecret, salt=V4Salt(seed, sessionID), info="paqet-v4-s2c:"+serverID)
+//
+// No implicit fallback to the shared PSK is permitted anywhere in v4 derivation.
+func DeriveServerTrafficKeysV4(c2sPSK []byte, serverResponseSecret []byte, sessionSeed []byte, sessionID uint64, serverID string) ([]byte, []byte, error) {
+	if len(c2sPSK) != KeySize {
+		return nil, nil, ErrInvalidKey
+	}
+	if len(serverResponseSecret) == 0 {
+		return nil, nil, ErrMissingResponseSecret
+	}
+	if len(serverResponseSecret) != KeySize {
+		return nil, nil, ErrInvalidResponseSecret
+	}
+	if serverID == "" {
+		return nil, nil, fmt.Errorf("crypto: serverID cannot be empty in v4 derivation")
+	}
+	salt := V4Salt(sessionSeed, sessionID)
+
+	c2sExtractor := hkdf.New(sha256.New, c2sPSK, salt, []byte("paqet-v4-c2s"))
+	c2s := make([]byte, KeySize)
+	if _, err := io.ReadFull(c2sExtractor, c2s); err != nil {
+		return nil, nil, fmt.Errorf("crypto: failed to derive v4 c2s key: %w", err)
+	}
+
+	s2cInfo := []byte(fmt.Sprintf("paqet-v4-s2c:%s", serverID))
+	s2cExtractor := hkdf.New(sha256.New, serverResponseSecret, salt, s2cInfo)
+	s2c := make([]byte, KeySize)
+	if _, err := io.ReadFull(s2cExtractor, s2c); err != nil {
+		return nil, nil, fmt.Errorf("crypto: failed to derive v4 s2c key: %w", err)
+	}
+
+	return c2s, s2c, nil
+}
+
+// DeriveServerResponseKeyV4 derives only the v4 server-to-client response key
+// from the dedicated server response secret, the per-session random seed, and
+// the server identity.
+func DeriveServerResponseKeyV4(serverResponseSecret []byte, sessionSeed []byte, sessionID uint64, serverID string) ([]byte, error) {
+	if len(serverResponseSecret) == 0 {
+		return nil, ErrMissingResponseSecret
+	}
+	if len(serverResponseSecret) != KeySize {
+		return nil, ErrInvalidResponseSecret
+	}
+	if serverID == "" {
+		return nil, fmt.Errorf("crypto: serverID cannot be empty in v4 response key derivation")
+	}
+	salt := V4Salt(sessionSeed, sessionID)
+	s2cInfo := []byte(fmt.Sprintf("paqet-v4-s2c:%s", serverID))
+	extractor := hkdf.New(sha256.New, serverResponseSecret, salt, s2cInfo)
+	s2c := make([]byte, KeySize)
+	if _, err := io.ReadFull(extractor, s2c); err != nil {
+		return nil, fmt.Errorf("crypto: failed to derive v4 s2c key for server %s: %w", serverID, err)
+	}
+	return s2c, nil
+}
+
+// DownstreamNonceBaseSize is the size of the per-server-instance random nonce
+// stream base used for v4 ("PAQD") server-downstream frames. Because it is
+// regenerated at each server (re)start with fresh session instances, a replayed
+// captured request answered by a restarted server can never reproduce the
+// original (key, nonce) domain for new plaintexts.
+const DownstreamNonceBaseSize = 8
+
+// GenerateDownstreamNonceBase returns a fresh cryptographically random,
+// guaranteed-nonzero 8-byte downstream nonce stream base.
+func GenerateDownstreamNonceBase() ([]byte, error) {
+	b := make([]byte, DownstreamNonceBaseSize)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return nil, err
+	}
+	zero := true
+	for _, x := range b {
+		if x != 0 {
+			zero = false
+			break
+		}
+	}
+	if zero {
+		return nil, errors.New("crypto: degenerate all-zero downstream nonce base")
+	}
+	return b, nil
+}
+
+// GenerateSessionSeed returns a fresh cryptographically random 128-bit per-session seed.
+func GenerateSessionSeed() ([SessionSeedSize]byte, error) {
+	var s [SessionSeedSize]byte
+	_, err := io.ReadFull(rand.Reader, s[:])
+	return s, err
+}
+
+// GenerateFullRandomUint64 returns a full-entropy 64-bit value from crypto/rand.
+func GenerateFullRandomUint64() (uint64, error) {
+	var v uint64
+	if err := binary.Read(rand.Reader, binary.BigEndian, &v); err != nil {
+		return 0, fmt.Errorf("crypto: full 64-bit random read failed: %w", err)
+	}
+	return v, nil
 }
 
 // NewAEAD returns an AES-256-GCM cipher from a 32-byte key.

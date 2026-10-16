@@ -22,6 +22,15 @@ const (
 	// AsymmetricMagicV3 identifies v3 asymmetric transport frames with explicit ServerID domain separation ("PAQC").
 	AsymmetricMagicV3 uint32 = 0x50415143
 
+	// respNonceBaseSize is the per-server-instance downstream nonce stream base size (v4 only).
+	respNonceBaseSize = crypto.DownstreamNonceBaseSize
+
+	// AsymmetricMagicV4 identifies v4 asymmetric transport frames ("PAQD"):
+	// v3 framing plus a 16-byte authenticated per-session random seed that
+	// randomizes the key/nonce domain independent of the 64-bit session ID
+	// (probabilistic session-ID collision safety).
+	AsymmetricMagicV4 uint32 = 0x50415144
+
 	// AsymmetricHeaderLen is the fixed size of unencrypted v2 frame header:
 	// Magic (4) + SessionID (8) + Seq (4) + Ack (4) = 20 bytes.
 	AsymmetricHeaderLen = 20
@@ -29,6 +38,13 @@ const (
 	// AsymmetricHeaderV3MinLen is the minimum size of unencrypted v3 frame header:
 	// Magic (4) + SessionID (8) + Seq (4) + Ack (4) + ServerIDLen (1) = 21 bytes.
 	AsymmetricHeaderV3MinLen = 21
+
+	// AsymmetricHeaderV4MinLen is the minimum size of unencrypted v4 frame header:
+	// Magic (4) + SessionID (8) + Seq (4) + Ack (4) + SeedLen (1) = 21 bytes.
+	// The seed (16 bytes) and optional ServerID field follow.
+	AsymmetricHeaderV4MinLen = 21
+
+	SessionSeedMagic = uint32(0x50415144)
 
 	// DefaultAsymmetricMTU is the maximum payload size per chunk (120 bytes for DNS, 1380 for UDP).
 	DefaultAsymmetricMTU = 1380
@@ -57,6 +73,7 @@ var (
 	ErrLegacyProtocolDisabled   = errors.New("asymmetric: legacy v2 protocol frames are disabled by policy (v3 required)")
 	ErrMissingResponseSecret    = errors.New("asymmetric: dedicated per-server response secret is required (shared PSK fallback prohibited)")
 	ErrInvalidResponseSecret    = errors.New("asymmetric: response secret must be exactly 32 bytes")
+	ErrProtocolVersionSignature = errors.New("asymmetric: frame protocol version unsupported (seed lengths incompatible) - PAQD explicit reject")
 )
 
 type unackedFrame struct {
@@ -121,6 +138,10 @@ type AsymmetricConn struct {
 	authorizedServers    map[string][]byte // Client-side map: serverID -> 32-byte response secret (immutable)
 	allowLegacyV2        bool              // If false, rejects 0x50415141 frames (fail-closed)
 	isLegacySingleServer bool              // If true, operates in legacy single-server mode using PSK only
+	protoV4              bool              // If true, seals/verifies v4 ("PAQD") frames carrying a per-session random seed
+	sessionSeed          []byte            // v4 only: 16-byte per-session random seed mixed into the HKDF salt (immutable)
+	respNonceBase        []byte            // v4 server only: per-instance random 8-byte downstream nonce stream base (immutable)
+	authEpoch            string            // v4 client only: credential epoch label from AuthorizedServerSet (safe metadata)
 	mtu                  int
 	psk                  []byte
 	encKey               []byte
@@ -515,13 +536,272 @@ func NewClientAsymmetricSessionWithServers(sessionID uint64, c2sPSK []byte, serv
 	}, nil
 }
 
+// SessionSeed is the per-session 16-byte random keying-material seed for the
+// v4 wire protocol ("PAQD"). The seed travels inside every frame as
+// authenticated associated data (it is NOT a secret) and is mixed into the
+// HKDF salt, so key and nonce domains are randomized independently of the
+// 64-bit session identifier. This collapses the per-credential-epoch session
+// collision bound from ~n^2/2^65 (v3) to ~n^2/2^129 (v4).
+type SessionSeed = [crypto.SessionSeedSize]byte
+
+// AuthorizedServerSet is the canonical immutable client-side authorization set
+// used by v4 construction paths. It is validated and deep-cloned at
+// construction time; later mutation of caller-owned slices cannot affect it.
+type AuthorizedServerSet struct {
+	Epoch      string            // Credential generation label (e.g. "epoch-2026-10-16-a")
+	Generation uint64            // Monotonic configuration revision
+	servers    map[string][]byte // serverID -> 32-byte cloned response secret
+	order      []string          // Deterministic iteration order
+}
+
+// NewAuthorizedServerSet validates and clones a set of authorized server entries.
+// Rejects empty sets, empty/reserved/duplicate/invalid server IDs, and missing
+// or malformed response secrets. The shared c2s PSK is never accepted as a
+// per-server response credential.
+func NewAuthorizedServerSet(epoch string, servers []AuthorizedServerEntry) (*AuthorizedServerSet, error) {
+	if len(servers) == 0 {
+		return nil, ErrEmptyServerAllowlist
+	}
+	set := &AuthorizedServerSet{
+		Epoch:   epoch,
+		servers: make(map[string][]byte, len(servers)),
+		order:   make([]string, 0, len(servers)),
+	}
+	for _, s := range servers {
+		if s.ServerID == "" {
+			return nil, fmt.Errorf("authorized server entry has empty serverID")
+		}
+		if s.ServerID == "default" || s.ServerID == "legacy" {
+			return nil, fmt.Errorf("authorized server cannot use reserved ID %q", s.ServerID)
+		}
+		if err := ValidateServerID(s.ServerID); err != nil {
+			return nil, err
+		}
+		if len(s.ResponseSecret) == 0 {
+			return nil, fmt.Errorf("server %q: %w", s.ServerID, ErrMissingResponseSecret)
+		}
+		if len(s.ResponseSecret) != crypto.KeySize {
+			return nil, fmt.Errorf("server %q: %w", s.ServerID, ErrInvalidResponseSecret)
+		}
+		if _, dup := set.servers[s.ServerID]; dup {
+			return nil, fmt.Errorf("duplicate authorized server ID %q (fail-closed)", s.ServerID)
+		}
+		set.servers[s.ServerID] = append([]byte(nil), s.ResponseSecret...)
+		set.order = append(set.order, s.ServerID)
+	}
+	return set, nil
+}
+
+// ServerIDs returns a deterministic copy of the authorized server IDs.
+func (s *AuthorizedServerSet) ServerIDs() []string {
+	out := make([]string, len(s.order))
+	copy(out, s.order)
+	return out
+}
+
+// ServerCount returns the number of authorized servers.
+func (s *AuthorizedServerSet) ServerCount() int {
+	return len(s.order)
+}
+
+// aeadNonce constructs the 12-byte AES-GCM nonce for a frame sealed by senderRole.
+// Behavior-preserving capture of the Phase-18 calculation (SessionID||Seq with role
+// XOR); the v4 server-downstream per-session stream base is layered on later and is
+// validated until the replay-after-restart regression test forces the redesign.
+func (c *AsymmetricConn) aeadNonce(seq uint32, senderRole Role, streamBase []byte) [crypto.NonceSize]byte {
+	var nonce [crypto.NonceSize]byte
+	if senderRole == RoleServer && len(streamBase) == respNonceBaseSize {
+		// v4 downstream (server->client): per-session-instance random stream base.
+		copy(nonce[0:respNonceBaseSize], streamBase)
+	} else {
+		// Upstream and v2/v3 frames: deterministic SessionID prefix.
+		binary.BigEndian.PutUint64(nonce[0:8], c.sessionID)
+	}
+	binary.BigEndian.PutUint32(nonce[respNonceBaseSize:12], seq)
+	nonce[0] ^= byte(senderRole)
+	return nonce
+}
+
+// SecretFor returns the cloned 32-byte response secret for serverID, or nil if unauthorized.
+func (s *AuthorizedServerSet) SecretFor(serverID string) []byte {
+	sec, ok := s.servers[serverID]
+	if !ok {
+		return nil
+	}
+	return append([]byte(nil), sec...)
+}
+
+// EpochLine renders safe, non-secret metadata: epoch label and authorized server IDs.
+func (s *AuthorizedServerSet) EpochLine() string {
+	return fmt.Sprintf("epoch=%s servers=%v", s.Epoch, s.ServerIDs())
+}
+
+// NewClientAsymmetricSessionV4 creates a v4 ("PAQD") client session in which:
+//   - The client generates a fresh 128-bit random sessionSeed and (default)
+//     full-entropy 64-bit sessionID; both travel as authenticated header data
+//     and are mixed into the HKDF salt, so key and nonce domains are
+//     statistically unique per session even under a 64-bit session-ID collision.
+//   - Authorized servers come from an immutable AuthorizedServerSet (mandatory,
+//     nonempty, validated, deep-cloned). Legacy v2 frames are rejected.
+//   - The upstream key is derived from the shared c2s PSK via the v4 salt; the
+//     downstream response key for a given serverID is derived on demand from
+//     that server's dedicated 32-byte response secret via the v4 salt.
+//
+// Passing overrideSeed forces a deterministic session taxonomy for tests.
+// Passing nil pskSecretForTest is invalid; a real c2s PSK is always required.
+func NewClientAsymmetricSessionV4(sessionID uint64, c2sPSK []byte, set *AuthorizedServerSet, overrideSeed *[crypto.SessionSeedSize]byte) (*AsymmetricConn, error) {
+	if set == nil || set.ServerCount() == 0 {
+		return nil, ErrEmptyServerAllowlist
+	}
+	if len(c2sPSK) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
+	}
+	seed := [crypto.SessionSeedSize]byte{}
+	if overrideSeed != nil {
+		seed = *overrideSeed
+	} else {
+		generated, err := crypto.GenerateSessionSeed()
+		if err != nil {
+			return nil, fmt.Errorf("generate session seed: %w", err)
+		}
+		seed = generated
+	}
+	if sessionID == 0 {
+		return nil, fmt.Errorf("asymmetric: v4 client requires explicit nonzero sessionID (full-entropy generation happens at call site)")
+	}
+
+	c2s, err := crypto.DeriveV4ClientTrafficKey(c2sPSK, seed[:], sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("derive v4 c2s key: %w", err)
+	}
+
+	c := &AsymmetricConn{
+		sessionID:            sessionID,
+		role:                 RoleClient,
+		psk:                  append([]byte(nil), c2sPSK...),
+		encKey:               c2s,
+		authorizedServers:    make(map[string][]byte, set.ServerCount()),
+		allowLegacyV2:        false,
+		isLegacySingleServer: false,
+		protoV4:              true,
+		sessionSeed:          append([]byte(nil), seed[:]...),
+		authEpoch:            set.Epoch,
+		replay:               replay.NewFilter(30 * time.Second),
+	}
+	for id, sec := range set.servers {
+		c.authorizedServers[id] = append([]byte(nil), sec...)
+	}
+	return c, nil
+}
+
+// NewServerAsymmetricSessionWithIDV4 creates a v4 ("PAQD") server session bound
+// to an immutable canonical ServerID, a mandatory dedicated 32-byte response
+// secret, and the per-session random seed received from the client upstream
+// frame. The response key is derived from the dedicated secret under the v4
+// salt; it may not fall back to the shared PSK.
+func NewServerAsymmetricSessionWithIDV4(sessionID uint64, c2sPSK []byte, serverResponseSecret []byte, sessionSeed []byte, serverID string) (*AsymmetricConn, error) {
+	if serverID == "" {
+		return nil, fmt.Errorf("server session requires non-empty serverID")
+	}
+	if serverID == "default" || serverID == "legacy" {
+		return nil, fmt.Errorf("server session cannot use reserved ID %q in multi-server mode", serverID)
+	}
+	if err := ValidateServerID(serverID); err != nil {
+		return nil, err
+	}
+	if len(c2sPSK) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
+	}
+	if len(serverResponseSecret) == 0 {
+		return nil, ErrMissingResponseSecret
+	}
+	if len(serverResponseSecret) != crypto.KeySize {
+		return nil, ErrInvalidResponseSecret
+	}
+	if len(sessionSeed) != crypto.SessionSeedSize {
+		return nil, fmt.Errorf("asymmetric: v4 session seed must be exactly %d bytes, got %d", crypto.SessionSeedSize, len(sessionSeed))
+	}
+
+	secretClone := append([]byte(nil), serverResponseSecret...)
+	c2s, s2c, err := crypto.DeriveServerTrafficKeysV4(c2sPSK, secretClone, sessionSeed, sessionID, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("derive v4 server keys: %w", err)
+	}
+
+	// Per-instance downstream nonce stream base: a restarted server with identical
+	// long-term credentials gets a fresh base, so replayed captured requests can never
+	// reproduce the previous response key/nonce domain for new plaintexts.
+	rnb, err := crypto.GenerateDownstreamNonceBase()
+	if err != nil {
+		return nil, fmt.Errorf("generate v4 response nonce base: %w", err)
+	}
+
+	return &AsymmetricConn{
+		sessionID:            sessionID,
+		role:                 RoleServer,
+		serverID:             serverID,
+		serverSecret:         secretClone,
+		psk:                  append([]byte(nil), c2sPSK...),
+		encKey:               s2c,
+		decKey:               c2s,
+		allowLegacyV2:        false,
+		isLegacySingleServer: false,
+		protoV4:              true,
+		sessionSeed:          append([]byte(nil), sessionSeed...),
+		respNonceBase:        rnb,
+		replay:               replay.NewFilter(30 * time.Second),
+	}, nil
+}
+
 // sealFrame packs Magic, SessionID, Seq, Ack, and AEAD-encrypted payload into a wire datagram.
+// v4 sessions additionally authenticate a 16-byte per-session random seed (PAQD framing).
 func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, error) {
 	if seq >= MaxSafeSequenceNumber {
 		return nil, ErrSequenceExhausted
 	}
+	if c.protoV4 && len(c.sessionSeed) != crypto.SessionSeedSize {
+		return nil, fmt.Errorf("%w: v4 session seed missing or mis-sized", ErrProtocolVersionSignature)
+	}
+
 	var header []byte
-	if c.role == RoleServer {
+	if c.protoV4 {
+		// v4 ("PAQD"): Magic(4) + SessionID(8) + Seq(4) + Ack(4) + SeedLen(1) = 21
+		// then Seed(16), then ServerIDLen(1) [always present, 0 on client frames], then ServerID.
+		headerLen := AsymmetricHeaderV4MinLen + crypto.SessionSeedSize + 1
+		srvID := ""
+		if c.role == RoleServer {
+			srvID = c.serverID
+			if srvID == "" {
+				return nil, fmt.Errorf("v4 server frame requires an explicit serverID")
+			}
+			if len(srvID) > 64 {
+				return nil, errors.New("asymmetric: serverID exceeds 64 bytes limit")
+			}
+			headerLen += len(srvID)
+		}
+		if c.role == RoleServer && len(c.respNonceBase) != respNonceBaseSize {
+			return nil, fmt.Errorf("%w: v4 server session missing downstream nonce stream base", ErrProtocolVersionSignature)
+		}
+		if c.role == RoleServer {
+			// Server downstream frames append the authenticated per-instance stream base.
+			headerLen += 1 + respNonceBaseSize
+		}
+		header = make([]byte, headerLen)
+		binary.BigEndian.PutUint32(header[0:4], AsymmetricMagicV4)
+		binary.BigEndian.PutUint64(header[4:12], c.sessionID)
+		binary.BigEndian.PutUint32(header[12:16], seq)
+		binary.BigEndian.PutUint32(header[16:20], ack)
+		header[20] = byte(crypto.SessionSeedSize)
+		copy(header[21:21+crypto.SessionSeedSize], c.sessionSeed)
+		off := 21 + crypto.SessionSeedSize
+		header[off] = byte(len(srvID))
+		copy(header[off+1:], srvID)
+		if c.role == RoleServer {
+			off += 1 + len(srvID)
+			header[off] = byte(respNonceBaseSize)
+			copy(header[off+1:], c.respNonceBase)
+		}
+	} else if c.role == RoleServer {
 		srvID := c.serverID
 		if srvID == "" {
 			srvID = "default"
@@ -546,19 +826,22 @@ func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, e
 		header[20] = 0 // No server ID in upstream
 	}
 
-	// Nonce is deterministically constructed from SessionID, Seq, and Role (12 bytes)
-	nonce := make([]byte, crypto.NonceSize)
-	binary.BigEndian.PutUint64(nonce[0:8], c.sessionID)
-	binary.BigEndian.PutUint32(nonce[8:12], seq)
-	nonce[0] ^= byte(c.role)
-
+	// Nonce construction: deterministically SessionID||Seq for v2/v3 and for v4
+	// client-upstream frames; v4 server-downstream frames use a per-session random
+	// 8-byte stream base (see respNonceBase). Role byte XOR keeps client/server
+	// nonce domains disjoint under any shared base.
+	var streamBase []byte
+	if c.role == RoleServer {
+		streamBase = c.respNonceBase
+	}
+	nonce := c.aeadNonce(seq, c.role, streamBase)
 	aead, err := crypto.NewAEAD(c.encKey)
 	if err != nil {
 		return nil, err
 	}
 
 	// Encrypt plaintext with header authenticated as AAD
-	ciphertext := aead.Seal(nil, nonce, plaintext, header)
+	ciphertext := aead.Seal(nil, nonce[:], plaintext, header)
 
 	frame := make([]byte, len(header)+len(ciphertext))
 	copy(frame[:len(header)], header)
@@ -576,11 +859,76 @@ func (c *AsymmetricConn) VerifyFrameWithServerID(frame []byte) (seq, ack uint32,
 	magic := binary.BigEndian.Uint32(frame[0:4])
 	var headerLen int
 	var sessID uint64
+	var frameSeed []byte
+	var frameRNB []byte
 
 	switch magic {
+	case AsymmetricMagicV4:
+		// v4 ("PAQD"): Magic(4)+SessionID(8)+Seq(4)+Ack(4)+SeedLen(1)=21, Seed(16), then ServerIDLen(1)+ServerID (server frames only).
+		if !c.isLegacySingleServer || c.protoV4 {
+			// v4 frames are only accepted by v4 sessions (multi-server mode).
+			if !c.protoV4 {
+				return 0, 0, nil, "", fmt.Errorf("%w: v4 frame on non-v4 session", ErrProtocolVersionSignature)
+			}
+		}
+		if len(frame) < AsymmetricHeaderV4MinLen+crypto.TagSize {
+			return 0, 0, nil, "", ErrAsymmetricShortFrame
+		}
+		sessID = binary.BigEndian.Uint64(frame[4:12])
+		seq = binary.BigEndian.Uint32(frame[12:16])
+		ack = binary.BigEndian.Uint32(frame[16:20])
+		seedLen := int(frame[20])
+		if seedLen != crypto.SessionSeedSize {
+			return 0, 0, nil, "", fmt.Errorf("%w: v4 seed length %d (want %d)", ErrProtocolVersionSignature, seedLen, crypto.SessionSeedSize)
+		}
+		// Room for seed + the always-present ServerIDLen slot + AEAD tag
+		headerLen = AsymmetricHeaderV4MinLen + seedLen
+		if len(frame) < headerLen+1+crypto.TagSize {
+			return 0, 0, nil, "", ErrAsymmetricShortFrame
+		}
+		frameSeed = append([]byte(nil), frame[21:21+seedLen]...)
+		headerLen++ // consume the ServerIDLen slot
+		srvIDLen := int(frame[headerLen-1])
+		if srvIDLen > 0 {
+			if len(frame) < headerLen+srvIDLen+crypto.TagSize {
+				return 0, 0, nil, "", ErrAsymmetricShortFrame
+			}
+			serverID = string(frame[headerLen : headerLen+srvIDLen])
+			headerLen += srvIDLen
+		}
+		if c.role == RoleClient {
+			// Downstream (server->client) frames carry the per-instance nonce stream base.
+			if len(frame) < headerLen+1+crypto.TagSize {
+				return 0, 0, nil, "", ErrAsymmetricShortFrame
+			}
+			rnbLen := int(frame[headerLen])
+			headerLen++
+			if rnbLen != crypto.DownstreamNonceBaseSize {
+				return 0, 0, nil, "", fmt.Errorf("%w: v4 downstream nonce base length %d (want %d)", ErrProtocolVersionSignature, rnbLen, crypto.DownstreamNonceBaseSize)
+			}
+			if len(frame) < headerLen+rnbLen+crypto.TagSize {
+				return 0, 0, nil, "", ErrAsymmetricShortFrame
+			}
+			frameRNB = append([]byte(nil), frame[headerLen:headerLen+rnbLen]...)
+			headerLen += rnbLen
+			zero := true
+			for _, b := range frameRNB {
+				if b != 0 {
+					zero = false
+					break
+				}
+			}
+			if zero {
+				return 0, 0, nil, "", fmt.Errorf("%w: degenerate all-zero downstream nonce base", ErrProtocolVersionSignature)
+			}
+		}
+
 	case AsymmetricMagicV3:
 		if len(frame) < AsymmetricHeaderV3MinLen+crypto.TagSize {
 			return 0, 0, nil, "", ErrAsymmetricShortFrame
+		}
+		if c.protoV4 {
+			return 0, 0, nil, "", fmt.Errorf("%w: v3 frame on v4 session", ErrProtocolVersionSignature)
 		}
 		sessID = binary.BigEndian.Uint64(frame[4:12])
 		seq = binary.BigEndian.Uint32(frame[12:16])
@@ -613,18 +961,60 @@ func (c *AsymmetricConn) VerifyFrameWithServerID(frame []byte) (seq, ack uint32,
 		return 0, 0, nil, "", fmt.Errorf("session ID mismatch: got %d, want %d", sessID, c.sessionID)
 	}
 
-	peerRole := RoleServer
-	if c.role == RoleServer {
-		peerRole = RoleClient
+	// v4 session binding: the frame's per-session seed must match the session's
+	// own seed. The seed is authenticated header data (AAD), so a mismatched or
+	// tampered seed cannot pass AEAD verification anyway, but rejecting early
+	// keeps key derivation strictly session-scoped.
+	if c.protoV4 {
+		if magic != AsymmetricMagicV4 {
+			return 0, 0, nil, "", fmt.Errorf("%w: non-v4 frame on v4 session", ErrProtocolVersionSignature)
+		}
+		if len(c.sessionSeed) != crypto.SessionSeedSize || len(frameSeed) != crypto.SessionSeedSize {
+			return 0, 0, nil, "", fmt.Errorf("%w: session seed length mismatch", ErrProtocolVersionSignature)
+		}
+		for i := 0; i < crypto.SessionSeedSize; i++ {
+			if frameSeed[i] != c.sessionSeed[i] {
+				return 0, 0, nil, "", fmt.Errorf("%w: frame seed does not match session seed", ErrProtocolVersionSignature)
+			}
+		}
 	}
-	nonce := make([]byte, crypto.NonceSize)
-	binary.BigEndian.PutUint64(nonce[0:8], c.sessionID)
-	binary.BigEndian.PutUint32(nonce[8:12], seq)
-	nonce[0] ^= byte(peerRole)
+
+	var nonce [crypto.NonceSize]byte
+	if c.role == RoleClient {
+		// Received frame was sealed by the server.
+		nonce = c.aeadNonce(seq, RoleServer, frameRNB)
+	} else {
+		// Received frame was sealed by the client.
+		nonce = c.aeadNonce(seq, RoleClient, nil)
+	}
 
 	var decKey []byte
 	if c.role == RoleClient {
-		if magic == AsymmetricMagicV3 {
+		if magic == AsymmetricMagicV4 {
+			// v4 response keys are derived per session from the dedicated
+			// per-server response secret under the session-seed salt.
+			if serverID == "" {
+				return 0, 0, nil, "", fmt.Errorf("%w: v4 server response missing server ID", ErrInvalidServerID)
+			}
+			if err := ValidateServerID(serverID); err != nil {
+				return 0, 0, nil, serverID, err
+			}
+			if len(c.authorizedServers) == 0 {
+				return 0, 0, nil, serverID, ErrEmptyServerAllowlist
+			}
+			secret, ok := c.authorizedServers[serverID]
+			if !ok {
+				return 0, 0, nil, serverID, fmt.Errorf("server %q is not authorized by client policy (fail-closed)", serverID)
+			}
+			if len(secret) != crypto.KeySize {
+				return 0, 0, nil, serverID, fmt.Errorf("server %q has invalid response secret length (fail-closed)", serverID)
+			}
+			sKey, err := crypto.DeriveServerResponseKeyV4(secret, frameSeed, c.sessionID, serverID)
+			if err != nil {
+				return 0, 0, nil, serverID, fmt.Errorf("derive v4 server response key: %w", err)
+			}
+			decKey = sKey
+		} else if magic == AsymmetricMagicV3 {
 			if c.isLegacySingleServer {
 				// Single-server legacy client decodes using pre-shared key
 				decKey = c.decKey
@@ -672,7 +1062,7 @@ func (c *AsymmetricConn) VerifyFrameWithServerID(frame []byte) (seq, ack uint32,
 	header := frame[:headerLen]
 	ciphertext := frame[headerLen:]
 
-	plaintext, err = aead.Open(nil, nonce, ciphertext, header)
+	plaintext, err = aead.Open(nil, nonce[:], ciphertext, header)
 	if err != nil {
 		return 0, 0, nil, serverID, fmt.Errorf("aead open: %w", err)
 	}
@@ -700,6 +1090,14 @@ func (c *AsymmetricConn) openFrameWithServerID(frame []byte) (seq, ack uint32, p
 	if err != nil {
 		return 0, 0, nil, serverID, err
 	}
+	var frameRNB []byte
+	var magic uint32
+	if len(frame) >= 4 {
+		magic = binary.BigEndian.Uint32(frame[0:4])
+	}
+	if c.role == RoleClient && magic == AsymmetricMagicV4 {
+		frameRNB, _ = extractV4DownstreamRNB(frame)
+	}
 
 	// Replay verification and recording ONLY AFTER successful authentication
 	c.replayMu.Lock()
@@ -710,10 +1108,21 @@ func (c *AsymmetricConn) openFrameWithServerID(frame []byte) (seq, ack uint32, p
 		if c.serverReplay == nil {
 			c.serverReplay = make(map[string]*replay.Filter)
 		}
-		f, ok := c.serverReplay[serverID]
+		replayKey := serverID
+		if c.protoV4 && magic == AsymmetricMagicV4 && len(frameRNB) == crypto.DownstreamNonceBaseSize {
+			// Replay protection is scoped to the downstream nonce domain: a restarted
+			// server instance with a fresh per-instance stream base gets a fresh
+			// sequence window, while a replay from the OLD instance hits the OLD
+			// filter entry (per-domain window isolation).
+			replayKey = fmt.Sprintf("%s#%x", serverID, frameRNB)
+		}
+		f, ok := c.serverReplay[replayKey]
 		if !ok {
 			f = replay.NewFilter(30 * time.Second)
-			c.serverReplay[serverID] = f
+			if len(c.serverReplay) >= MaxServerReplayDomainsPerConn {
+				pruneOldestReplayDomain(c.serverReplay)
+			}
+			c.serverReplay[replayKey] = f
 		}
 		filter = f
 	} else {
@@ -885,4 +1294,53 @@ func (r *MemoryPipeReceiver) RecvDownstream(ctx context.Context) ([]byte, error)
 
 func (r *MemoryPipeReceiver) Close() error {
 	return nil
+}
+
+// MaxServerReplayDomainsPerConn caps per-connection downstream replay domains
+// (serverID + per-instance nonce-base pairs) to bound memory against floods of
+// synthetic stream bases from a compromised expected-protocol peer.
+const MaxServerReplayDomainsPerConn = 32
+
+// pruneOldestReplayDomain evicts the lexically first replay-domain key when the
+// map is at capacity. An attacker cannot use this to reset a window that matters:
+// eviction requires flooding 32 distinct authenticated stream bases, which itself
+// requires the response credential (documented trust boundary).
+func pruneOldestReplayDomain(m map[string]*replay.Filter) {
+	for k := range m {
+		delete(m, k)
+		return
+	}
+}
+
+// extractV4DownstreamRNB deterministically re-parses the per-instance downstream
+// nonce stream base from an AEAD-verified v4 server frame. Callers must not use
+// the returned bytes for security decisions without a valid AEAD tag (verified
+// by VerifyFrameWithServerID first).
+func extractV4DownstreamRNB(frame []byte) ([]byte, error) {
+	if len(frame) < AsymmetricHeaderV4MinLen {
+		return nil, ErrAsymmetricShortFrame
+	}
+	seedLen := int(frame[20])
+	if seedLen != crypto.SessionSeedSize {
+		return nil, fmt.Errorf("%w: seed length %d", ErrProtocolVersionSignature, seedLen)
+	}
+	headerLen := AsymmetricHeaderV4MinLen + seedLen // 37
+	if len(frame) < headerLen+1 {
+		return nil, ErrAsymmetricShortFrame
+	}
+	headerLen++ // srvIDLen slot
+	srvIDLen := int(frame[headerLen-1])
+	if srvIDLen < 0 || len(frame) < headerLen+srvIDLen {
+		return nil, ErrAsymmetricShortFrame
+	}
+	headerLen += srvIDLen
+	if len(frame) < headerLen+1 {
+		return nil, ErrAsymmetricShortFrame
+	}
+	rnbLen := int(frame[headerLen])
+	headerLen++
+	if rnbLen != crypto.DownstreamNonceBaseSize || len(frame) < headerLen+rnbLen {
+		return nil, fmt.Errorf("%w: downstream nonce base length", ErrProtocolVersionSignature)
+	}
+	return append([]byte(nil), frame[headerLen:headerLen+rnbLen]...), nil
 }
