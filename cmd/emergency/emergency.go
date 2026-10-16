@@ -47,6 +47,7 @@ var (
 	serverSecretFile     string
 	legacySingleServer   bool
 	authorizedServersCfg string
+	protocolV4           bool
 )
 
 // AuthorizedServersConfigFile is the on-disk JSON schema for the explicit
@@ -76,6 +77,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverID, "server-id", "", "Authoritative server cryptographic identity (mandatory in multi-server mode)")
 	serverCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing dedicated 32-byte server response secret (mandatory in multi-server mode)")
 	serverCmd.Flags().BoolVar(&legacySingleServer, "legacy-single-server", false, "Run in legacy single-server mode using PSK only (incompatible with multi-authoritative)")
+	serverCmd.Flags().BoolVar(&protocolV4, "protocol-v4", false, "Speak v4 (PAQD) framing with per-session random seed keying (requires dedicated per-server response secret)")
 	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (required if --bootstrap-config and --disable-bootstrap are not set)")
 	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
