@@ -201,14 +201,14 @@ func main() {
 
 	// Setup Recovery State Machine
 	dnsClient, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-		ResolverAddr:      *resolverAddr,
-		DomainSuffix:      *domainSuffix,
-		ClientID:          "c01",
-		PSK:               psk,
-		Timeout:           4 * time.Second,
-		MaxRetries:        2,
-		EDNSBufferSize:    transport.DefaultEDNSUDPPayloadSize,
-		AuthorizedServers: []string{"ns-de-01", "default"},
+		ResolverAddr:         *resolverAddr,
+		DomainSuffix:         *domainSuffix,
+		ClientID:             "c01",
+		PSK:                  psk,
+		Timeout:              4 * time.Second,
+		MaxRetries:           2,
+		EDNSBufferSize:       transport.DefaultEDNSUDPPayloadSize,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		log.Fatalf("Fatal: NewEmergencyDNSClient: %v", err)

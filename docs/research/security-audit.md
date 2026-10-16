@@ -416,3 +416,64 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   * Validated 2 DNS attempt records (Attempt 0: `TIMEOUT` via 8.8.8.8; Attempt 1: `SUCCESS` via 1.1.1.1 without contradictory error).
   * Production SOCKS5 on `127.0.0.1:1090`: `HEALTHY`, `"pong"` in 109.83 ms.
   * Audit Artifact: `docs/research/recovery_socks5_live_audit_phase17.json`.
+
+## 14. Phase 18 Audit: Mandatory Server Credentials, Shared-PSK Elimination, Session-Key Uniqueness & Trust Boundary Definition
+
+### 14.1 Complete Elimination of Shared-PSK Fallback in Multi-Authoritative Path
+- **Vulnerability Identified:** In Phase 17, `crypto.DeriveServerTrafficKeys` and `transport.VerifyFrameWithServerID` allowed `serverResponseSecret` to default to `c2sPSK` when `serverSecret` was nil or empty. This allowed a named server to accidentally operate using the client-to-server root PSK for response sealing, creating an impersonation hazard where any entity holding the shared upstream PSK could forge downstream responses.
+- **Architectural Remediation (Fail-Closed):**
+  1. Updated `crypto.DeriveServerTrafficKeys` to strictly require `len(serverSecret) == 32`. A nil or empty secret returns `ErrMissingResponseSecret`; a malformed length returns `ErrInvalidResponseSecret`. Implicit fallback to PSK was completely removed.
+  2. Isolated single-server legacy operation behind `crypto.DeriveLegacySingleServerTrafficKeys`, which is strictly confined to legacy single-server constructors (`NewServerLegacyAsymmetricSession`, `NewClientLegacyAsymmetricSession`).
+  3. In `transport.VerifyFrameWithServerID`, multi-server clients strictly reject frames missing valid server IDs or possessing missing/malformed response secrets, completely removing the `resSecret = c.psk` fallback.
+  4. Tested via `TestPhase18_MandatoryCredentialsAndImmutabilitySuite` and `TestDeriveServerTrafficKeys_MultiServerValidation`.
+
+### 14.2 Fail-Closed Constructor Validation & Immutability via Defensive Slice Cloning
+- **Credential Immutability:** Passing mutable byte slices to constructors creates a security hazard if the caller later modifies the slice in memory.
+- **Remediation:**
+  1. `NewServerAsymmetricSessionWithID` and `NewClientAsymmetricSessionWithServers` create independent byte slice clones (`append([]byte(nil), secret...)`) of all key material and server identities upon initialization.
+  2. Identity metadata and derived keys are bound atomically at construction time; mutable setters are prohibited.
+  3. Verified via `TestPhase18_MandatoryCredentialsAndImmutabilitySuite` Test 8: mutating caller slice memory post-construction leaves session cryptographic state unaltered.
+
+### 14.3 Startup Contract & Deployment Audits
+- **CLI Startup Hardening:**
+  1. Removed default `"ns-de-01"` from `--server-id`. Named servers require explicit `--server-id` and `--server-secret-file`.
+  2. Reserved server IDs (`"default"`, `"legacy"`) are rejected fail-closed for multi-server instances.
+  3. Servers attempting startup without `--server-secret-file` abort with exit code 1 prior to opening DNS listener sockets.
+  4. Legacy single-server operation requires explicit `--legacy-single-server` flag and logs a high-visibility warning that multi-authoritative guarantees are disabled.
+  5. Verified via `TestEmergencyServerStartup_MultiServerCredentialValidation` and empirical CLI test runs.
+- **Live Infrastructure Deployment Audit (Sanitized):**
+  * Iran VPS (`185.18.215.124`): `paqet.service` active; production SOCKS5 on `127.0.0.1:1090` verified healthy (`pong`); `/opt/paqet/emergency.key` permissions `0600`.
+  * Germany VPS (`77.37.65.2`): `paqet.service` active; `paqet-emergency.service` active running Phase 17 binary (`c950611e...`).
+  * Live Security Note: The active production daemon on Germany was deployed in Phase 17 without `--server-secret-file`, confirming that the production instance relies on legacy fallback until scheduled promotion to Phase 18 `v2.5.10-credreq`. Production services remain untouched to preserve operational continuity.
+
+### 14.4 Session Identifier & Nonce Uniqueness Invariants Across Process Lifetimes
+- **Key Derivation Schedule:**
+  * Upstream (c2s): `HKDF-Extract(salt="paqet-asym-<sessionID>", IKM=c2sPSK)`, Info: `"c2s"` -> `c2sKey` (32 bytes).
+  * Downstream (s2c): `HKDF-Extract(salt="paqet-asym-<sessionID>", IKM=serverSecret)`, Info: `"s2c:" + serverID` -> `s2cKey` (32 bytes).
+- **Nonce Domain Construction:**
+  * 12-byte AES-GCM nonce: `nonce[0:8] = BigEndian.PutUint64(sessionID)`, `nonce[8:12] = BigEndian.PutUint32(seq)`.
+  * Role differentiation: `nonce[0] ^= byte(role)` (`RoleClient = 1`, `RoleServer = 2`). Client and server nonce spaces are strictly disjoint.
+- **Uniqueness Invariants:**
+  1. *Concurrent Sessions:* 64-bit cryptographic entropy (`crypto/rand`) ensures negligible collision probability ($P \approx 2^{-32}$ birthday bound across billions of sessions).
+  2. *Retransmissions:* Server idempotency cache returns identical sealed ciphertext byte-for-byte; no new nonce or plaintext is encrypted under an existing sequence number.
+  3. *Cross-Server Retries:* Server A and Server B hold distinct 32-byte response secrets. Even if a retried query uses the same `sessionID` and sequence number, the derived AES-GCM keys are cryptographically disjoint, preventing multi-target nonce collisions.
+  4. *Sequence Exhaustion:* Atomic counter stops permanently at `MaxSafeSequenceNumber = 0xFFFFFF00` ($2^{32} - 256$), returning `ErrSequenceExhausted` and preventing sequence wraparound.
+  5. Verified via `TestPhase18_SessionUniquenessAndNonceSafety`.
+
+### 14.5 Symmetric vs Asymmetric Server Authentication: Formal Threat Model & Boundaries
+- **Scope & Trust Boundary:**
+  * In the present symmetric recovery control plane, the client holds the authorized mapping `{ServerID -> ResponseSecret}` to derive the AEAD decryption key for downstream frames.
+  * *Attacks Prevented by Per-Server Symmetric Secrets:*
+    1. Compromised or rogue authoritative nameservers holding the shared upstream PSK cannot forge responses or impersonate other authoritative servers.
+    2. Network eavesdroppers and recursive resolvers cannot decrypt requests, forge responses, or decrypt server payloads.
+    3. Untrusted third parties cannot manipulate AAD headers (`ServerID`, sequence, sessionID) without triggering AEAD tag failure.
+  * *Attacks Remaining In Scope for Malicious/Compromised Authorized Clients:*
+    1. Because authorized clients hold the 32-byte `ResponseSecret` for each server to verify AEAD tags, a compromised client possessing `ResponseSecret` could theoretically forge responses claiming that server identity to another client, or analyze traffic offline if it captures other sessions.
+    2. In the Paqet threat model, emergency recovery clients are trusted endpoints operated by the tunnel owner. For hostile multi-tenant environments where clients are untrusted, asymmetric digital signatures (e.g. Ed25519 with server private key and client-held public key verifying a canonical transcript) must be adopted. The current architecture strictly documents symmetric secrets as *per-server response credentials*, not *server-exclusive private keys*.
+
+### 14.6 Inter-Attempt Gap Accounting & Mathematical Timeline Reconciliation
+- **Telemetry Defect Resolved:** Phase 17 reported exchange durations with discrepancies between attempt totals and overall wall time due to uninstrumented inter-attempt backoff and resolver failover pauses.
+- **Remediation:**
+  1. Defined `DNSInterAttemptGap` tracking `StartMonotonicMs`, `EndMonotonicMs`, `DurationMs`, and `Reason`.
+  2. Implemented `DNSExchangeTimeline.Reconcile(toleranceMs)`: verifies that `TotalDurationMs == sum(Attempts) + sum(Gaps)` within numerical tolerance ($\le 2.0$ ms). Unaccounted intervals are calculated and audited fail-closed.
+  3. Tested via `TestDNSExchangeTimeline_ReconcileSuite`: verified single-attempt success, multi-attempt backoff reconciliation, and negative gap rejection.

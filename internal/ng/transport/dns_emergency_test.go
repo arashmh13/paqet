@@ -23,9 +23,10 @@ func TestEmergencyDNSRoundTripSmallAndFragmented(t *testing.T) {
 
 	// 1. Start Emergency DNS Server on loopback port
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			return &EmergencyResponse{
 				ID:        msg.ID,
@@ -44,14 +45,14 @@ func TestEmergencyDNSRoundTripSmallAndFragmented(t *testing.T) {
 
 	// 2. Initialize Emergency DNS Client
 	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      serverAddr,
-		DomainSuffix:      domainSuffix,
-		ClientID:          "c99",
-		PSK:               psk,
-		SessionID:         0x123456789ABCDEF0,
-		Timeout:           2 * time.Second,
-		MaxRetries:        2,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         serverAddr,
+		DomainSuffix:         domainSuffix,
+		ClientID:             "c99",
+		PSK:                  psk,
+		SessionID:            0x123456789ABCDEF0,
+		Timeout:              2 * time.Second,
+		MaxRetries:           2,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -109,9 +110,10 @@ func TestEmergencyDNSServerSecurityAndRefused(t *testing.T) {
 	psk := []byte("emergency-psk-32-bytes-super-key")
 
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
@@ -133,14 +135,14 @@ func TestEmergencyDNSServerSecurityAndRefused(t *testing.T) {
 
 	// 2. Client with wrong PSK dialing server -> Must fail authentication
 	badClient, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      serverAddr,
-		DomainSuffix:      domainSuffix,
-		ClientID:          "c99",
-		PSK:               []byte("WRONG-KEY-32-BYTES-MUST-NOT-WORK"),
-		SessionID:         0x99999999,
-		Timeout:           1 * time.Second,
-		MaxRetries:        0,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         serverAddr,
+		DomainSuffix:         domainSuffix,
+		ClientID:             "c99",
+		PSK:                  []byte("WRONG-KEY-32-BYTES-MUST-NOT-WORK"),
+		SessionID:            0x99999999,
+		Timeout:              1 * time.Second,
+		MaxRetries:           0,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -164,9 +166,10 @@ func TestUnauthenticatedSessionIDMemoryExhaustionProtection(t *testing.T) {
 	psk := []byte("emergency-psk-32-bytes-super-key")
 
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
@@ -213,9 +216,10 @@ func TestIdempotentDuplicateRetransmission(t *testing.T) {
 
 	var handlerInvocations int32
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&handlerInvocations, 1)
 			return &EmergencyResponse{
@@ -232,14 +236,14 @@ func TestIdempotentDuplicateRetransmission(t *testing.T) {
 	defer server.Stop()
 
 	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      server.Addr().String(),
-		DomainSuffix:      domainSuffix,
-		ClientID:          "c01",
-		PSK:               psk,
-		SessionID:         0xDEADBEEFCAFE0001,
-		Timeout:           2 * time.Second,
-		MaxRetries:        0,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         server.Addr().String(),
+		DomainSuffix:         domainSuffix,
+		ClientID:             "c01",
+		PSK:                  psk,
+		SessionID:            0xDEADBEEFCAFE0001,
+		Timeout:              2 * time.Second,
+		MaxRetries:           0,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -269,14 +273,14 @@ func TestIdempotentDuplicateRetransmission(t *testing.T) {
 	// We craft the duplicate by dialing the server with the exact frame from the first sequence
 	// Client session has advanced, so we create a duplicate client with same sequence to simulate network duplicate
 	dupClient, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      server.Addr().String(),
-		DomainSuffix:      domainSuffix,
-		ClientID:          "c01",
-		PSK:               psk,
-		SessionID:         0xDEADBEEFCAFE0001,
-		Timeout:           2 * time.Second,
-		MaxRetries:        0,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         server.Addr().String(),
+		DomainSuffix:         domainSuffix,
+		ClientID:             "c01",
+		PSK:                  psk,
+		SessionID:            0xDEADBEEFCAFE0001,
+		Timeout:              2 * time.Second,
+		MaxRetries:           0,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -302,9 +306,10 @@ func TestTCPPort53QueryHandling(t *testing.T) {
 	psk := []byte("emergency-psk-32-bytes-super-key")
 
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
@@ -394,10 +399,10 @@ func TestOversizedPayloadRejection(t *testing.T) {
 	psk := []byte("emergency-psk-32-bytes-super-key")
 
 	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      "127.0.0.1:53",
-		DomainSuffix:      domainSuffix,
-		PSK:               psk,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         "127.0.0.1:53",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -423,9 +428,10 @@ func TestReplyCacheFingerprintMismatchRejection(t *testing.T) {
 
 	var handlerInvocations int32
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&handlerInvocations, 1)
 			return &EmergencyResponse{
@@ -442,9 +448,9 @@ func TestReplyCacheFingerprintMismatchRejection(t *testing.T) {
 	defer server.Stop()
 
 	sessionID := uint64(0x9876543210ABCDEF)
-	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	clientConn, err := NewClientLegacyAsymmetricSession(sessionID, psk)
 	if err != nil {
-		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
+		t.Fatalf("NewClientLegacyAsymmetricSession failed: %v", err)
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", server.Addr().String())
@@ -559,9 +565,10 @@ func TestReplyCacheEvictionBoundary(t *testing.T) {
 	psk := []byte("emergency-psk-32-bytes-super-key")
 
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSServer failed: %v", err)
@@ -569,13 +576,13 @@ func TestReplyCacheEvictionBoundary(t *testing.T) {
 	defer server.Stop()
 
 	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      server.Addr().String(),
-		DomainSuffix:      domainSuffix,
-		PSK:               psk,
-		SessionID:         0x1122334455667788,
-		Timeout:           2 * time.Second,
-		MaxRetries:        0,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         server.Addr().String(),
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		SessionID:            0x1122334455667788,
+		Timeout:              2 * time.Second,
+		MaxRetries:           0,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -653,9 +660,10 @@ func TestConcurrentFirstPacketsSameSession(t *testing.T) {
 
 	var handlerInvocations int32
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&handlerInvocations, 1)
 			return &EmergencyResponse{
@@ -672,7 +680,7 @@ func TestConcurrentFirstPacketsSameSession(t *testing.T) {
 	defer server.Stop()
 
 	sessionID := uint64(0xFEDCBA9876543210)
-	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	clientConn, err := NewClientLegacyAsymmetricSession(sessionID, psk)
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
 	}
@@ -755,9 +763,10 @@ func TestConcurrentDuplicatesWithHandlerDelay(t *testing.T) {
 
 	var handlerInvocations int32
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&handlerInvocations, 1)
 			// Simulate slow handler (50ms) to ensure concurrent duplicates arrive mid-processing
@@ -776,7 +785,7 @@ func TestConcurrentDuplicatesWithHandlerDelay(t *testing.T) {
 	defer server.Stop()
 
 	sessionID := uint64(0x3344556677889900)
-	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	clientConn, err := NewClientLegacyAsymmetricSession(sessionID, psk)
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
 	}
@@ -839,9 +848,10 @@ func TestUnauthenticatedPacketCannotJoinInFlightWaiters(t *testing.T) {
 	var handlerInvocations int32
 
 	server, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: domainSuffix,
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         domainSuffix,
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&handlerInvocations, 1)
 			close(handlerEntered)
@@ -860,7 +870,7 @@ func TestUnauthenticatedPacketCannotJoinInFlightWaiters(t *testing.T) {
 	defer server.Stop()
 
 	sessionID := uint64(0x778899AABBCCDDEE)
-	clientConn, err := NewClientAsymmetricSession(sessionID, psk)
+	clientConn, err := NewClientLegacyAsymmetricSession(sessionID, psk)
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSession failed: %v", err)
 	}

@@ -172,13 +172,13 @@ func main() {
 			log.Printf("[EMERGENCY-DNS] Transmitting emergency signaling query to %s (domain: %s)...", *resolverAddr, *domainSuffix)
 
 			client, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-				ResolverAddr:      *resolverAddr,
-				DomainSuffix:      *domainSuffix,
-				PSK:               psk,
-				ClientID:          "c14",
-				Timeout:           3 * time.Second,
-				MaxRetries:        2,
-				AuthorizedServers: []string{"ns-de-01", "default"},
+				ResolverAddr:         *resolverAddr,
+				DomainSuffix:         *domainSuffix,
+				PSK:                  psk,
+				ClientID:             "c14",
+				Timeout:              3 * time.Second,
+				MaxRetries:           2,
+				IsLegacySingleServer: true,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("create emergency client: %w", err)

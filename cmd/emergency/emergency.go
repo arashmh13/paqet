@@ -45,6 +45,7 @@ var (
 	disableBootstrap    bool
 	serverID            string
 	serverSecretFile    string
+	legacySingleServer  bool
 )
 
 func init() {
@@ -56,8 +57,9 @@ func init() {
 	serverCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
-	serverCmd.Flags().StringVar(&serverID, "server-id", "ns-de-01", "Authoritative server cryptographic identity for multi-server domain separation")
-	serverCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing dedicated 32-byte server response secret")
+	serverCmd.Flags().StringVar(&serverID, "server-id", "", "Authoritative server cryptographic identity (mandatory in multi-server mode)")
+	serverCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing dedicated 32-byte server response secret (mandatory in multi-server mode)")
+	serverCmd.Flags().BoolVar(&legacySingleServer, "legacy-single-server", false, "Run in legacy single-server mode using PSK only (incompatible with multi-authoritative)")
 	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (required if --bootstrap-config and --disable-bootstrap are not set)")
 	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
@@ -71,7 +73,9 @@ func init() {
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	sendCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	sendCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
-	sendCmd.Flags().StringVar(&serverID, "server-id", "ns-de-01", "Expected authoritative server ID to authorize")
+	sendCmd.Flags().StringVar(&serverID, "server-id", "", "Expected authoritative server ID to authorize (mandatory in multi-server mode)")
+	sendCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing server response secret (mandatory in multi-server mode)")
+	sendCmd.Flags().BoolVar(&legacySingleServer, "legacy-single-server", false, "Run in legacy single-server mode using PSK only")
 	sendCmd.Flags().StringVar(&clientID, "client-id", "c01", "Client ID string (max 4 chars)")
 	sendCmd.Flags().StringVarP(&messageStr, "message", "m", "EMERGENCY_PING", "Application payload to transmit")
 	sendCmd.Flags().IntVar(&timeoutSec, "timeout", 5, "Timeout in seconds for response")
@@ -215,6 +219,52 @@ func setupBootstrapManager() (*transport.BootstrapManager, error) {
 	return transport.NewBootstrapManager(records, bootstrapMode, 1)
 }
 
+func validateServerStartupConfig(serverID, serverSecretFile string, legacyMode bool) ([]byte, error) {
+	if !legacyMode {
+		if serverID == "" {
+			return nil, errors.New("emergency server: --server-id is mandatory for multi-authoritative emergency server (implicit defaults removed for fail-closed safety)")
+		}
+		if serverID == "default" || serverID == "legacy" {
+			return nil, fmt.Errorf("emergency server: invalid server ID %q (cannot use default/legacy reserved ID)", serverID)
+		}
+		if err := transport.ValidateServerID(serverID); err != nil {
+			return nil, fmt.Errorf("emergency server: invalid server ID %q: %w", serverID, err)
+		}
+		if serverSecretFile == "" {
+			return nil, errors.New("emergency server: --server-secret-file is mandatory for multi-authoritative emergency server (shared PSK fallback prohibited)")
+		}
+		secret, err := parseKey("", serverSecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load server secret file %q: %w", serverSecretFile, err)
+		}
+		if len(secret) != 32 {
+			return nil, fmt.Errorf("emergency server: server secret in %q must be exactly 32 bytes, got %d", serverSecretFile, len(secret))
+		}
+		return secret, nil
+	}
+	return nil, nil
+}
+
+func validateClientStartupConfig(serverID, serverSecretFile string, legacyMode bool) ([]transport.AuthorizedServerEntry, error) {
+	if !legacyMode {
+		if serverID == "" {
+			return nil, errors.New("emergency client: --server-id is mandatory for multi-authoritative client")
+		}
+		if serverSecretFile == "" {
+			return nil, errors.New("emergency client: --server-secret-file is mandatory for multi-authoritative client (shared PSK fallback prohibited)")
+		}
+		secret, err := parseKey("", serverSecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load server secret file %q: %w", serverSecretFile, err)
+		}
+		if len(secret) != 32 {
+			return nil, fmt.Errorf("emergency client: server secret in %q must be exactly 32 bytes, got %d", serverSecretFile, len(secret))
+		}
+		return []transport.AuthorizedServerEntry{{ServerID: serverID, ResponseSecret: secret}}, nil
+	}
+	return nil, nil
+}
+
 var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Runs the authoritative emergency DNS daemon",
@@ -224,27 +274,30 @@ var serverCmd = &cobra.Command{
 			log.Fatalf("failed to load emergency key: %v", err)
 		}
 
+		serverSecret, err := validateServerStartupConfig(serverID, serverSecretFile, legacySingleServer)
+		if err != nil {
+			log.Fatalf("failed startup: %v", err)
+		}
+		if legacySingleServer {
+			log.Println("[EMERGENCY-SERVER] Running in legacy single-server mode (--legacy-single-server); multi-authoritative security guarantees are disabled")
+			if serverID == "" {
+				serverID = "legacy"
+			}
+		}
+
 		bm, err := setupBootstrapManager()
 		if err != nil {
 			log.Fatalf("failed to initialize bootstrap manager: %v", err)
 		}
 		bm.SetAuthoritativeServerID(serverID)
 
-		var serverSecret []byte
-		if serverSecretFile != "" {
-			var err error
-			serverSecret, err = parseKey("", serverSecretFile)
-			if err != nil {
-				log.Fatalf("failed to load server secret file: %v", err)
-			}
-		}
-
 		srv, err := transport.NewEmergencyDNSServer(transport.EmergencyDNSServerConfig{
-			ListenAddr:   listenAddr,
-			DomainSuffix: domainSuffix,
-			PSK:          psk,
-			ServerID:     serverID,
-			ServerSecret: serverSecret,
+			ListenAddr:           listenAddr,
+			DomainSuffix:         domainSuffix,
+			PSK:                  psk,
+			ServerID:             serverID,
+			ServerSecret:         serverSecret,
+			IsLegacySingleServer: legacySingleServer,
 			Handler: func(msg *transport.EmergencyMessage) (*transport.EmergencyResponse, error) {
 				// Privacy and Security: Log only metadata, never plaintext payload or key material
 				log.Printf("[EMERGENCY-SERVER] Authenticated message ID=%s Type=%s PayloadBytes=%d ClientID=%s Status=PROCESSED",
@@ -308,15 +361,35 @@ var sendCmd = &cobra.Command{
 			log.Fatalf("failed to load emergency key: %v", err)
 		}
 
-		client, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-			ResolverAddr:      resolverAddr,
-			DomainSuffix:      domainSuffix,
-			ClientID:          clientID,
-			PSK:               psk,
-			Timeout:           time.Duration(timeoutSec) * time.Second,
-			MaxRetries:        2,
-			AuthorizedServers: []string{serverID},
-		})
+		clientEntries, err := validateClientStartupConfig(serverID, serverSecretFile, legacySingleServer)
+		if err != nil {
+			log.Fatalf("failed startup: %v", err)
+		}
+
+		var clientCfg transport.EmergencyDNSClientConfig
+		if legacySingleServer {
+			clientCfg = transport.EmergencyDNSClientConfig{
+				ResolverAddr:         resolverAddr,
+				DomainSuffix:         domainSuffix,
+				ClientID:             clientID,
+				PSK:                  psk,
+				Timeout:              time.Duration(timeoutSec) * time.Second,
+				MaxRetries:           2,
+				IsLegacySingleServer: true,
+			}
+		} else {
+			clientCfg = transport.EmergencyDNSClientConfig{
+				ResolverAddr:     resolverAddr,
+				DomainSuffix:     domainSuffix,
+				ClientID:         clientID,
+				PSK:              psk,
+				Timeout:          time.Duration(timeoutSec) * time.Second,
+				MaxRetries:       2,
+				ServerIdentities: clientEntries,
+			}
+		}
+
+		client, err := transport.NewEmergencyDNSClient(clientCfg)
 		if err != nil {
 			log.Fatalf("failed to initialize emergency client: %v", err)
 		}

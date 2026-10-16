@@ -76,9 +76,9 @@ func TestAEADEncryptDecrypt(t *testing.T) {
 }
 
 func TestDeriveServerTrafficKeys(t *testing.T) {
-	c2sPSK := []byte("super-secret-password-1234567890123456")
-	secretA := []byte("server-a-response-secret-1111111")
-	secretB := []byte("server-b-response-secret-2222222")
+	c2sPSK := []byte("super-secret-password-1234567890")  // exactly 32 bytes
+	secretA := []byte("server-a-response-secret-1111111") // exactly 32 bytes
+	secretB := []byte("server-b-response-secret-2222222") // exactly 32 bytes
 	salt := []byte("session-salt-12345")
 
 	// Deriving for server A with secretA
@@ -119,5 +119,36 @@ func TestDeriveServerTrafficKeys(t *testing.T) {
 	}
 	if !bytes.Equal(genuineB, s2cB) {
 		t.Fatalf("Genuine derivation for Server B must match DeriveServerTrafficKeys")
+	}
+
+	// Missing response secret MUST fail closed (NO fallback to PSK!)
+	_, _, err = DeriveServerTrafficKeys(c2sPSK, nil, salt, "ns-de-01")
+	if err != ErrMissingResponseSecret {
+		t.Fatalf("expected ErrMissingResponseSecret for nil response secret, got %v", err)
+	}
+	_, _, err = DeriveServerTrafficKeys(c2sPSK, []byte(""), salt, "ns-de-01")
+	if err != ErrMissingResponseSecret {
+		t.Fatalf("expected ErrMissingResponseSecret for empty response secret, got %v", err)
+	}
+
+	// Short or malformed response secret MUST fail closed
+	_, _, err = DeriveServerTrafficKeys(c2sPSK, []byte("short-secret"), salt, "ns-de-01")
+	if err != ErrInvalidResponseSecret {
+		t.Fatalf("expected ErrInvalidResponseSecret for short response secret, got %v", err)
+	}
+
+	// Missing serverID in multi-server derivation MUST fail closed
+	_, _, err = DeriveServerTrafficKeys(c2sPSK, secretA, salt, "")
+	if err == nil {
+		t.Fatalf("expected error for empty serverID in multi-server derivation")
+	}
+
+	// DeriveLegacySingleServerTrafficKeys explicit legacy mode
+	legacyC2S, legacyS2C, err := DeriveLegacySingleServerTrafficKeys(c2sPSK, salt)
+	if err != nil {
+		t.Fatalf("DeriveLegacySingleServerTrafficKeys failed: %v", err)
+	}
+	if len(legacyC2S) != KeySize || len(legacyS2C) != KeySize {
+		t.Fatalf("invalid legacy key sizes")
 	}
 }

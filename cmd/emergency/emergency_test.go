@@ -223,3 +223,106 @@ func TestEmergencyServerStartup_JSONConfigFileDeterministicValidation(t *testing
 	}
 	t.Logf("PASS: Conflicting duplicate records rejected: %v", err)
 }
+
+func TestEmergencyServerStartup_MultiServerCredentialValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	validSecret := make([]byte, 32)
+	for i := range validSecret {
+		validSecret[i] = byte(i + 1)
+	}
+	validSecretPath := filepath.Join(tmpDir, "server_valid.key")
+	_ = os.WriteFile(validSecretPath, []byte(hex.EncodeToString(validSecret)), 0600)
+
+	shortSecretPath := filepath.Join(tmpDir, "server_short.key")
+	_ = os.WriteFile(shortSecretPath, []byte("short-secret"), 0600)
+
+	// 1. Missing server-id in multi-server mode fails
+	_, err := validateServerStartupConfig("", validSecretPath, false)
+	if err == nil {
+		t.Fatalf("expected startup failure for empty server-id in multi-server mode, got nil")
+	}
+	t.Logf("PASS: Missing server-id rejected: %v", err)
+
+	// 2. Reserved server-id "default" or "legacy" in multi-server mode fails
+	_, err = validateServerStartupConfig("default", validSecretPath, false)
+	if err == nil {
+		t.Fatalf("expected startup failure for reserved server-id 'default', got nil")
+	}
+	_, err = validateServerStartupConfig("legacy", validSecretPath, false)
+	if err == nil {
+		t.Fatalf("expected startup failure for reserved server-id 'legacy', got nil")
+	}
+	t.Logf("PASS: Reserved server-id rejected")
+
+	// 3. Missing server-secret-file in multi-server mode fails
+	_, err = validateServerStartupConfig("ns-de-01", "", false)
+	if err == nil {
+		t.Fatalf("expected startup failure for missing server-secret-file, got nil")
+	}
+	t.Logf("PASS: Missing server-secret-file rejected: %v", err)
+
+	// 4. Short server-secret-file fails
+	_, err = validateServerStartupConfig("ns-de-01", shortSecretPath, false)
+	if err == nil {
+		t.Fatalf("expected startup failure for short server secret, got nil")
+	}
+	t.Logf("PASS: Short server secret rejected: %v", err)
+
+	// 5. Valid server-id and server-secret-file succeeds
+	secret, err := validateServerStartupConfig("ns-de-01", validSecretPath, false)
+	if err != nil {
+		t.Fatalf("expected success for valid multi-server credentials, got: %v", err)
+	}
+	if len(secret) != 32 {
+		t.Fatalf("expected 32-byte secret, got %d", len(secret))
+	}
+	t.Logf("PASS: Valid multi-server credentials parsed successfully")
+
+	// 6. Explicit legacy single-server mode succeeds without secret file
+	legacySecret, err := validateServerStartupConfig("", "", true)
+	if err != nil {
+		t.Fatalf("expected success in legacy single-server mode, got: %v", err)
+	}
+	if legacySecret != nil {
+		t.Fatalf("expected nil secret in legacy single-server mode, got %v", legacySecret)
+	}
+	t.Logf("PASS: Explicit legacy mode validated safely")
+}
+
+func TestEmergencyClientStartup_MultiServerCredentialValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	validSecret := make([]byte, 32)
+	for i := range validSecret {
+		validSecret[i] = byte(i + 1)
+	}
+	validSecretPath := filepath.Join(tmpDir, "client_server_valid.key")
+	_ = os.WriteFile(validSecretPath, []byte(hex.EncodeToString(validSecret)), 0600)
+
+	// 1. Missing server-id in client fails
+	_, err := validateClientStartupConfig("", validSecretPath, false)
+	if err == nil {
+		t.Fatalf("expected client failure for empty server-id, got nil")
+	}
+
+	// 2. Missing server-secret-file in client fails
+	_, err = validateClientStartupConfig("ns-de-01", "", false)
+	if err == nil {
+		t.Fatalf("expected client failure for missing server-secret-file, got nil")
+	}
+
+	// 3. Valid credentials succeed
+	entries, err := validateClientStartupConfig("ns-de-01", validSecretPath, false)
+	if err != nil {
+		t.Fatalf("expected success for valid client credentials, got: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ServerID != "ns-de-01" || len(entries[0].ResponseSecret) != 32 {
+		t.Fatalf("unexpected client entries: %+v", entries)
+	}
+
+	// 4. Legacy single-server client succeeds without secret
+	entries, err = validateClientStartupConfig("", "", true)
+	if err != nil || entries != nil {
+		t.Fatalf("expected nil entries for legacy client, got %v (err: %v)", entries, err)
+	}
+	t.Logf("PASS: Client multi-server vs legacy credentials validated")
+}

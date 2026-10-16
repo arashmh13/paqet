@@ -197,7 +197,7 @@ func main() {
 		PerAttemptTimeout: 1500 * time.Millisecond,
 		MaxRetries:        3,
 		EDNSBufferSize:    transport.DefaultEDNSUDPPayloadSize,
-		AuthorizedServers: []string{*expectedServerID, "default"},
+		ServerIdentities:  []transport.AuthorizedServerEntry{{ServerID: *expectedServerID, ResponseSecret: psk}},
 	})
 	if err != nil {
 		log.Fatalf("Fatal: NewEmergencyDNSClient: %v", err)
@@ -510,12 +510,12 @@ func main() {
 	// Check 4: Unauthorized Rogue Server ID rejected fail-closed
 	adv4Start := time.Now()
 	rogueClient, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-		ResolverAddr:      *resolverAddr,
-		DomainSuffix:      *domainSuffix,
-		PSK:               psk,
-		Timeout:           1 * time.Second,
-		MaxRetries:        0,
-		AuthorizedServers: []string{"srv-unauthorized-99"}, // strictly unauthorized
+		ResolverAddr:     *resolverAddr,
+		DomainSuffix:     *domainSuffix,
+		PSK:              psk,
+		Timeout:          1 * time.Second,
+		MaxRetries:       0,
+		ServerIdentities: []transport.AuthorizedServerEntry{{ServerID: "srv-unauthorized-99", ResponseSecret: psk}},
 	})
 	var errRogue error
 	if err == nil {

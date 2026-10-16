@@ -429,3 +429,51 @@ Executed live on authorized infrastructure:
 - **Production SOCKS5 Proxy Verification:**
   * Target: `127.0.0.1:1090` (authenticated SOCKS5 `arash:arash`) -> `pong` in **109.83 ms** (`HEALTHY`).
 - **Evidentiary Artifact:** Logged to `docs/research/recovery_socks5_live_audit_phase17.json`.
+
+---
+
+## 11. Mandatory Server Credentials, Session Uniqueness & Timeline Reconciliation Suite (Phase 18)
+
+### 11.1 Mandatory Per-Server Credentials & Immutability Suite
+Executed via `internal/ng/transport/asymmetric_test.go` (`TestPhase18_MandatoryCredentialsAndImmutabilitySuite`):
+1. **Named server with missing response secret:** Returns `ErrMissingResponseSecret` fail-closed (nil or empty slice).
+2. **Named server with short/malformed response secret:** Returns `ErrInvalidResponseSecret` fail-closed (`len != 32`).
+3. **Client allowlist entry with nil secret:** Returns `ErrMissingResponseSecret` fail-closed.
+4. **Client allowlist entry with short secret:** Returns `ErrInvalidResponseSecret` fail-closed.
+5. **Two distinct server identities with own secrets:** Both Server A (`srv-de-01`) and Server B (`srv-nl-01`) successfully construct and verify independent frames.
+6. **Cross-server impersonation prevention:** Server A, possessing shared `c2sPSK` and its own `secretA`, attempts to seal a response claiming `srv-nl-01`. Client verifies with `secretB` and rejects the forged frame fail-closed with AEAD tag authentication error.
+7. **Prohibition of implicit shared-PSK fallback:** Server configured with shared PSK as response secret fails verification against client expecting dedicated `secretA`.
+8. **Defensive slice cloning:** Caller mutates response secret slice memory post-construction (`secret[0] ^= 0xFF`). Server and client continue communicating reliably using cloned key bytes.
+9. **Explicit legacy mode operation:** Legacy single-server session (`NewServerLegacyAsymmetricSession` + `NewClientLegacyAsymmetricSession`) operates successfully only when explicitly selected.
+10. **Prohibition of implicit legacy fallback:** Multi-server client strictly rejects legacy single-server frames.
+
+### 11.2 Session Uniqueness & Nonce Safety Across Process Lifetimes
+Executed via `internal/ng/transport/asymmetric_test.go` (`TestPhase18_SessionUniquenessAndNonceSafety`):
+1. **Role-Based Nonce Domain Separation:** 12-byte AEAD nonces for RoleClient (bit 0 inverted) and RoleServer (bit 1 inverted) never collide for identical session IDs and sequence numbers (`clientNonce != serverNonce`).
+2. **Cross-Server Failover Retry Safety:** Retrying a query with identical `sessionID` and `seq=1` to Server B yields completely different AEAD keys and ciphertexts, eliminating multi-target nonce collision risks.
+3. **Retransmission Idempotency:** Replayed requests return byte-identical cached ciphertexts; new nonces are not consumed.
+4. **Sequence Number Boundary Enforcement:** Counter stops at `MaxSafeSequenceNumber = 0xFFFFFF00` with `ErrSequenceExhausted` and never wraps to 0.
+
+### 11.3 Cross-Server Key Rotation & Revocation Test Suite
+Executed via `internal/ng/transport/dns_redundancy_test.go` (`TestPhase18_CrossServerKeyRotationAndRevocationSuite`):
+1. Verified Server A and Server B decrypt upstream requests using shared `c2sPSK`.
+2. Verified Server A emits responses valid only for `srv-de-01` and Server B emits responses valid only for `srv-nl-01`.
+3. Verified key rotation: Server A restarts with rotated secret `secretA2`.
+4. Stale client holding `secretA1` is rejected fail-closed.
+5. Updated client holding `secretA2` decrypts and authenticates rotated response seamlessly.
+
+### 11.4 Inter-Attempt Gap Accounting & Mathematical Timeline Reconciliation
+Executed via `internal/ng/transport/dns_attempt_diagnostic_test.go` (`TestDNSExchangeTimeline_ReconcileSuite`):
+1. **Single-Attempt Zero Gap:** Total 120.0 ms == Attempt 120.0 ms + Gap 0.0 ms -> `UnaccountedMs = 0.000 ms`.
+2. **Multi-Attempt Resolver Failover:** Total 1715.0 ms == Attempt 0 (1500.0 ms timeout) + Gap (75.0 ms backoff) + Attempt 1 (140.0 ms success) -> `UnaccountedMs = 0.000 ms`.
+3. **Overhead Anomaly Detection:** Injected 85.0 ms unaccounted overhead detected and rejected fail-closed.
+4. **Negative Gap Rejection:** Negative interval (-50.0 ms) rejected fail-closed.
+
+### 11.5 CLI Startup Contract Negative Verification
+Verified via standalone binary `./bin/paqet-ng emergency server`:
+1. Omitted `--server-id`: Aborts with `emergency server: --server-id is mandatory for multi-authoritative emergency server`.
+2. Omitted `--server-secret-file`: Aborts with `emergency server: --server-secret-file is mandatory for multi-authoritative emergency server`.
+3. Short secret (10 bytes): Aborts with `invalid key length 10: must decode to 32 bytes`.
+4. Explicit `--legacy-single-server`: Logs warning `Running in legacy single-server mode; multi-authoritative security guarantees are disabled`.
+5. Missing bootstrap config: Aborts fail-closed.
+6. Zero listener sockets opened prior to validation.

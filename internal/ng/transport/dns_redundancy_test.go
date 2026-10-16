@@ -18,6 +18,8 @@ func TestDualAuthoritativeServerCrossServerRetriesAndReplay(t *testing.T) {
 
 	var serverAInvocations int32
 	var serverBInvocations int32
+	secretA := []byte("secret-a-response-32-bytes-long!")
+	secretB := []byte("secret-b-response-32-bytes-long!")
 
 	// 1. Spawn Server A with independent state and ServerID "srv-de-01"
 	serverA, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
@@ -25,6 +27,7 @@ func TestDualAuthoritativeServerCrossServerRetriesAndReplay(t *testing.T) {
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-de-01",
+		ServerSecret: secretA,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&serverAInvocations, 1)
 			return &EmergencyResponse{
@@ -46,6 +49,7 @@ func TestDualAuthoritativeServerCrossServerRetriesAndReplay(t *testing.T) {
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-nl-01",
+		ServerSecret: secretB,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			atomic.AddInt32(&serverBInvocations, 1)
 			return &EmergencyResponse{
@@ -63,8 +67,8 @@ func TestDualAuthoritativeServerCrossServerRetriesAndReplay(t *testing.T) {
 
 	sessionID := uint64(0x5555666677778888)
 	clientConn, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
-		{ServerID: "srv-de-01"},
-		{ServerID: "srv-nl-01"},
+		{ServerID: "srv-de-01", ResponseSecret: secretA},
+		{ServerID: "srv-nl-01", ResponseSecret: secretB},
 	})
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSessionWithServers failed: %v", err)
@@ -204,6 +208,9 @@ func TestDualAuthoritativeServerCrossServerRetriesAndReplay(t *testing.T) {
 func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.T) {
 	domainSuffix := "tunnel.multiauth.local"
 	psk := []byte("emergency-psk-32-bytes-super-key")
+	secretA := []byte("secret-a-response-32-bytes-long!")
+	secretB := []byte("secret-b-response-32-bytes-long!")
+	secretC := []byte("secret-c-response-32-bytes-long!")
 
 	// 1. Spawn Server A with ServerID "srv-de-01"
 	serverA, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
@@ -211,6 +218,7 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-de-01",
+		ServerSecret: secretA,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			return &EmergencyResponse{
 				ID:        msg.ID,
@@ -232,6 +240,7 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-nl-01",
+		ServerSecret: secretB,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			return &EmergencyResponse{
 				ID:        msg.ID,
@@ -253,6 +262,7 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-rogue-01",
+		ServerSecret: secretC,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			return &EmergencyResponse{
 				ID:        msg.ID,
@@ -271,8 +281,8 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 	sessionID := uint64(0xAABBCCDDEEFF0011)
 	// Client authorizes ONLY srv-de-01 and srv-nl-01
 	clientConn, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
-		{ServerID: "srv-de-01"},
-		{ServerID: "srv-nl-01"},
+		{ServerID: "srv-de-01", ResponseSecret: secretA},
+		{ServerID: "srv-nl-01", ResponseSecret: secretB},
 	})
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSessionWithServers failed: %v", err)
@@ -360,8 +370,8 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 
 	// Cryptographic Nonce/Key Collision Invariant Check:
 	// Verify that ansA and ansB ciphertexts used completely distinct keys and cannot be cross-decrypted!
-	serverAKey, _ := crypto.DeriveServerResponseKey(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)), "srv-de-01")
-	serverBKey, _ := crypto.DeriveServerResponseKey(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)), "srv-nl-01")
+	serverAKey, _ := crypto.DeriveServerResponseKey(secretA, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)), "srv-de-01")
+	serverBKey, _ := crypto.DeriveServerResponseKey(secretB, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)), "srv-nl-01")
 	if string(serverAKey) == string(serverBKey) {
 		t.Fatalf("CRITICAL SECURITY DEFECT: Server A and Server B derived identical s2c keys!")
 	}
@@ -444,6 +454,8 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 func TestMultiAuthoritative_FailoverAndServerRestart(t *testing.T) {
 	domainSuffix := "tunnel.restart.local"
 	psk := []byte("emergency-psk-32-bytes-super-key")
+	secretA := []byte("secret-a-response-32-bytes-long!")
+	secretB := []byte("secret-b-response-32-bytes-long!")
 
 	// 1. Server A and Server B running
 	serverA, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
@@ -451,6 +463,7 @@ func TestMultiAuthoritative_FailoverAndServerRestart(t *testing.T) {
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-de-01",
+		ServerSecret: secretA,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			return &EmergencyResponse{
 				ID:        msg.ID,
@@ -470,6 +483,7 @@ func TestMultiAuthoritative_FailoverAndServerRestart(t *testing.T) {
 		DomainSuffix: domainSuffix,
 		PSK:          psk,
 		ServerID:     "srv-nl-01",
+		ServerSecret: secretB,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			return &EmergencyResponse{
 				ID:        msg.ID,
@@ -492,7 +506,10 @@ func TestMultiAuthoritative_FailoverAndServerRestart(t *testing.T) {
 		Timeout:           3 * time.Second,
 		PerAttemptTimeout: 500 * time.Millisecond,
 		MaxRetries:        2,
-		AuthorizedServers: []string{"srv-de-01", "srv-nl-01"},
+		ServerIdentities: []AuthorizedServerEntry{
+			{ServerID: "srv-de-01", ResponseSecret: secretA},
+			{ServerID: "srv-nl-01", ResponseSecret: secretB},
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
@@ -670,4 +687,179 @@ func TestPhase17_TwoAuthoritativeReadinessSuite(t *testing.T) {
 		t.Fatalf("Expected fail-closed rejection for revoked server srv-nl-01, got nil")
 	}
 	t.Logf("PASS: Revoked server rejected fail-closed: %v", err)
+}
+
+func TestPhase18_CrossServerKeyRotationAndRevocationSuite(t *testing.T) {
+	domainSuffix := "tunnel.phase18.test"
+	c2sPSK := []byte("c2s-shared-root-key-32-bytes-lon")
+	secretA1 := []byte("server-a-secret-1111111111111111")
+	secretA2 := []byte("server-a-secret-2222222222222222") // rotated secret for Server A
+	secretB := []byte("server-b-secret-3333333333333333")
+
+	// 1. Missing secret on server must fail construction
+	_, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          c2sPSK,
+		ServerID:     "srv-de-01",
+		ServerSecret: nil, // prohibited!
+	})
+	if err == nil {
+		t.Fatalf("Expected error for nil ServerSecret, got nil")
+	}
+
+	// 2. Start Server A with secretA1
+	serverA, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          c2sPSK,
+		ServerID:     "srv-de-01",
+		ServerSecret: secretA1,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				ServerID:  "srv-de-01",
+				Reply:     []byte("ORIGINAL_SECRET_A1_REPLY"),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start serverA failed: %v", err)
+	}
+	defer serverA.Stop()
+
+	// 3. Start Server B with secretB
+	serverB, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          c2sPSK,
+		ServerID:     "srv-nl-01",
+		ServerSecret: secretB,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				ServerID:  "srv-nl-01",
+				Reply:     []byte("SERVER_B_REPLY"),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start serverB failed: %v", err)
+	}
+	defer serverB.Stop()
+
+	// 4. Client configured with secretA1 and secretB
+	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
+		Resolvers:         []string{serverA.Addr().String(), serverB.Addr().String()},
+		DomainSuffix:      domainSuffix,
+		ClientID:          "c18",
+		PSK:               c2sPSK,
+		SessionID:         0x1800180018001800,
+		Timeout:           2 * time.Second,
+		PerAttemptTimeout: 500 * time.Millisecond,
+		MaxRetries:        1,
+		ServerIdentities: []AuthorizedServerEntry{
+			{ServerID: "srv-de-01", ResponseSecret: secretA1},
+			{ServerID: "srv-nl-01", ResponseSecret: secretB},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Client creation failed: %v", err)
+	}
+
+	// 5. Successful query to Server A
+	respA, _, err := client.Exchange(context.Background(), &EmergencyMessage{
+		ID:        "msg-a1",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("test A"),
+		Timestamp: time.Now().Unix(),
+	})
+	if err != nil || string(respA.Reply) != "ORIGINAL_SECRET_A1_REPLY" {
+		t.Fatalf("Exchange with secretA1 failed: resp=%+v, err=%v", respA, err)
+	}
+
+	// 6. Simulate Server A Key Rotation:
+	// Server A restarts with rotated secretA2
+	serverA.Stop()
+	serverA_v2, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   serverA.Addr().String(),
+		DomainSuffix: domainSuffix,
+		PSK:          c2sPSK,
+		ServerID:     "srv-de-01",
+		ServerSecret: secretA2,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				ServerID:  "srv-de-01",
+				Reply:     []byte("ROTATED_SECRET_A2_REPLY"),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Restart serverA with secretA2 failed: %v", err)
+	}
+	defer serverA_v2.Stop()
+
+	// 7. Old client (holding secretA1) querying serverA_v2 must fail authentication fail-closed!
+	// It must NOT silently fall back to PSK.
+	oldClient, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
+		Resolvers:         []string{serverA_v2.Addr().String()},
+		DomainSuffix:      domainSuffix,
+		ClientID:          "c18",
+		PSK:               c2sPSK,
+		SessionID:         0x1800180018001801,
+		Timeout:           1 * time.Second,
+		PerAttemptTimeout: 500 * time.Millisecond,
+		MaxRetries:        0,
+		ServerIdentities: []AuthorizedServerEntry{
+			{ServerID: "srv-de-01", ResponseSecret: secretA1}, // STALE SECRET!
+		},
+	})
+	if err != nil {
+		t.Fatalf("oldClient creation failed: %v", err)
+	}
+	_, _, err = oldClient.Exchange(context.Background(), &EmergencyMessage{
+		ID:        "msg-stale",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("test stale"),
+		Timestamp: time.Now().Unix(),
+	})
+	if err == nil {
+		t.Fatalf("CRITICAL SECURITY DEFECT: Client with stale secretA1 verified response sealed with secretA2!")
+	}
+	t.Logf("PASS: Stale key safely rejected fail-closed: %v", err)
+
+	// 8. Rotated client (holding secretA2) querying serverA_v2 must succeed!
+	rotatedClient, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
+		Resolvers:         []string{serverA_v2.Addr().String()},
+		DomainSuffix:      domainSuffix,
+		ClientID:          "c18",
+		PSK:               c2sPSK,
+		SessionID:         0x1800180018001802,
+		Timeout:           2 * time.Second,
+		PerAttemptTimeout: 500 * time.Millisecond,
+		MaxRetries:        0,
+		ServerIdentities: []AuthorizedServerEntry{
+			{ServerID: "srv-de-01", ResponseSecret: secretA2}, // UPDATED ROTATED SECRET!
+		},
+	})
+	if err != nil {
+		t.Fatalf("rotatedClient creation failed: %v", err)
+	}
+	respA2, _, err := rotatedClient.Exchange(context.Background(), &EmergencyMessage{
+		ID:        "msg-a2",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("test rotated"),
+		Timestamp: time.Now().Unix(),
+	})
+	if err != nil || string(respA2.Reply) != "ROTATED_SECRET_A2_REPLY" {
+		t.Fatalf("Rotated client exchange failed: resp=%+v, err=%v", respA2, err)
+	}
+	t.Logf("PASS: Key rotation succeeded seamlessly with dedicated response secret")
 }

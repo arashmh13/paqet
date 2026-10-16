@@ -261,9 +261,10 @@ func TestEDNS0_TCPPort53FallbackOnTruncation(t *testing.T) {
 	}
 
 	srv, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
-		ListenAddr:   "127.0.0.1:0",
-		DomainSuffix: "edns.test",
-		PSK:          psk,
+		ListenAddr:           "127.0.0.1:0",
+		DomainSuffix:         "edns.test",
+		PSK:                  psk,
+		IsLegacySingleServer: true,
 		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
 			bResp, err := bm.GenerateResponse(msg, "aead-stream")
 			if err != nil {
@@ -290,13 +291,13 @@ func TestEDNS0_TCPPort53FallbackOnTruncation(t *testing.T) {
 
 	// Create client with conservative 1232-byte EDNS buffer
 	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:      addrStr,
-		DomainSuffix:      "edns.test",
-		ClientID:          "c01",
-		PSK:               psk,
-		Timeout:           1 * time.Second,
-		EDNSBufferSize:    1232,
-		AuthorizedServers: []string{"ns-de-01"},
+		ResolverAddr:         addrStr,
+		DomainSuffix:         "edns.test",
+		ClientID:             "c01",
+		PSK:                  psk,
+		Timeout:              1 * time.Second,
+		EDNSBufferSize:       1232,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)

@@ -154,3 +154,16 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 - **Dedicated Per-Server Response Secrets:** In Phase 17, server-specific response secrets were established to eliminate shared-PSK impersonation. Multi-authoritative clients must be provisioned with the authorized mapping `ServerID -> ResponseSecret`. An authoritative server that is not provisioned with a dedicated secret cannot authenticate v3 responses to multi-authoritative clients.
 - **Session Sequence Counter Exhaustion:** To protect AES-GCM nonce uniqueness across the entire key lifetime, each asymmetric session enforces a hard stop at sequence $2^{32}-16$ (`0xFFFFFFF0`). When sequence space is exhausted, further transmissions fail with `ErrSequenceExhausted` fail-closed. Long-lived streaming over asymmetric channels must re-key or establish a new session before sequence exhaustion.
 - **Single-IP Infrastructure Dependency (Secondary NS Blocked):** Although the multi-authoritative cryptographic architecture is fully verified and proven mathematically sound, actual deployment of a secondary public nameserver (`ns2...`) remains externally blocked pending acquisition of an independent cloud VPS on a non-Hetzner autonomous system. All live endpoints currently share `77.37.65.2`.
+
+---
+
+## 18. Mandatory Server Credentials, Shared-PSK Elimination & Symmetric Trust Scope (Phase 18)
+
+- **Mandatory Dedicated Response Secrets:** In Phase 18, all implicit fallbacks from server response secrets to client-to-server PSK were eliminated. Any multi-authoritative named server attempting to start without an explicit 32-byte secret file (`--server-secret-file`) aborts fail-closed prior to opening network sockets.
+- **Legacy Single-Server Isolation:** Backward compatibility for PSK-only standalone deployments is restricted to `--legacy-single-server`. Legacy single-server mode is not eligible for multi-authoritative deployment, cannot verify v3 multi-server responses, and emits high-visibility startup warnings.
+- **Symmetric Authentication Scope & Trust Boundaries:**
+  1. *Protected Against:* Network eavesdroppers, middlebox injectors, rogue authoritative servers holding shared upstream credentials, and recursive DNS manipulation.
+  2. *Unprotected Against:* Compromised authorized clients that already possess the server's 32-byte `ResponseSecret`. Because symmetric AEAD verification requires the client to hold the key, a malicious authorized client can construct valid responses for that server identity.
+  3. *Threat Model Boundary:* In Paqet-NG, recovery plane clients are single-tenant owner-controlled endpoints. In untrusted multi-tenant environments, asymmetric digital signatures (Ed25519) must be implemented.
+- **Inter-Attempt Timeline Accounting:** Logical DNS exchanges must account for both individual attempt durations and intervening resolver switch / backoff gaps. Unaccounted intervals exceeding tolerance ($\le 2.0$ ms) are flagged as timing contradictions.
+- **Secondary Authoritative Infrastructure Prerequisite:** Live multi-authoritative testing is verified via local loopback instances (`srv-de-01` and `srv-nl-01`). Deploying an independent public `ns2` nameserver remains externally blocked until a second cloud VPS in a distinct BGP autonomous system is acquired.

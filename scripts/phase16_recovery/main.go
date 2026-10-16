@@ -194,16 +194,16 @@ func main() {
 	}
 
 	dnsClient, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-		ResolverAddr:      *resolverAddr,
-		Resolvers:         resolvers,
-		DomainSuffix:      *domainSuffix,
-		ClientID:          "c01",
-		PSK:               psk,
-		Timeout:           6 * time.Second,
-		PerAttemptTimeout: 1500 * time.Millisecond,
-		MaxRetries:        3,
-		EDNSBufferSize:    transport.DefaultEDNSUDPPayloadSize,
-		AuthorizedServers: []string{*expectedServerID, "default"},
+		ResolverAddr:         *resolverAddr,
+		Resolvers:            resolvers,
+		DomainSuffix:         *domainSuffix,
+		ClientID:             "c01",
+		PSK:                  psk,
+		Timeout:              6 * time.Second,
+		PerAttemptTimeout:    1500 * time.Millisecond,
+		MaxRetries:           3,
+		EDNSBufferSize:       transport.DefaultEDNSUDPPayloadSize,
+		IsLegacySingleServer: true,
 	})
 	if err != nil {
 		log.Fatalf("Fatal: NewEmergencyDNSClient: %v", err)

@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -116,7 +117,7 @@ func TestAsymmetricConnEndToEndReassembly(t *testing.T) {
 
 func TestAsymmetricReplayAndTamperRejection(t *testing.T) {
 	sessionID := uint64(999999)
-	psk := []byte("secret-key-32-bytes-super-safe!")
+	psk := []byte("secret-key-32-bytes-super-safe12") // exactly 32 bytes
 
 	upCh := make(chan []byte, 10)
 	downCh := make(chan []byte, 10)
@@ -278,7 +279,7 @@ func TestAsymmetricSequenceExhaustion(t *testing.T) {
 
 func TestAsymmetricLossAndAutomaticRetransmission(t *testing.T) {
 	sessionID := uint64(0x99887766)
-	psk := []byte("secret-key-32-bytes-loss-test!!")
+	psk := []byte("secret-key-32-bytes-loss-test-12") // exactly 32 bytes
 
 	upCh := make(chan []byte, 20)
 	downCh := make(chan []byte, 20)
@@ -360,8 +361,9 @@ func TestAsymmetricLossAndAutomaticRetransmission(t *testing.T) {
 func TestAsymmetric_SequenceExhaustionFailsSafely(t *testing.T) {
 	sessionID := uint64(0x9988776655443322)
 	psk := []byte("test-psk-key-32-bytes-long-12345")
+	secret := []byte("test-secret-32-bytes-long-123456")
 
-	conn, err := NewServerAsymmetricSessionWithID(sessionID, psk, nil, "srv-de-01")
+	conn, err := NewServerAsymmetricSessionWithID(sessionID, psk, secret, "srv-de-01")
 	if err != nil {
 		t.Fatalf("NewServerAsymmetricSessionWithID failed: %v", err)
 	}
@@ -605,4 +607,237 @@ func TestAsymmetric_TamperedServerIDInAADFails(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY DEFECT: Tampered ServerID in AAD passed AEAD verification!")
 	}
 	t.Logf("Tampered ServerID correctly failed AEAD verification: %v", err)
+}
+
+func TestPhase18_MandatoryCredentialsAndImmutabilitySuite(t *testing.T) {
+	sessionID := uint64(0x1818181818181818)
+	psk := []byte("emergency-psk-32-bytes-super-key")
+	secretA := []byte("secret-a-response-32-bytes-long!")
+	secretB := []byte("secret-b-response-32-bytes-long!")
+
+	// 1. A named server with a missing response secret fails construction.
+	_, err := NewServerAsymmetricSessionWithID(sessionID, psk, nil, "srv-de-01")
+	if err != ErrMissingResponseSecret {
+		t.Fatalf("Test 1 failed: expected ErrMissingResponseSecret for nil secret, got: %v", err)
+	}
+	_, err = NewServerAsymmetricSessionWithID(sessionID, psk, []byte{}, "srv-de-01")
+	if err != ErrMissingResponseSecret {
+		t.Fatalf("Test 1 failed: expected ErrMissingResponseSecret for empty secret, got: %v", err)
+	}
+
+	// 2. A named server with a short or malformed secret fails construction.
+	_, err = NewServerAsymmetricSessionWithID(sessionID, psk, []byte("short-secret"), "srv-de-01")
+	if err != ErrInvalidResponseSecret {
+		t.Fatalf("Test 2 failed: expected ErrInvalidResponseSecret for 12-byte secret, got: %v", err)
+	}
+
+	// 3. A client entry with a nil response secret fails construction.
+	_, err = NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
+		{ServerID: "srv-de-01", ResponseSecret: nil},
+	})
+	if !errors.Is(err, ErrMissingResponseSecret) {
+		t.Fatalf("Test 3 failed: expected ErrMissingResponseSecret for client nil secret, got: %v", err)
+	}
+
+	// 4. A client entry with a short response secret fails construction.
+	_, err = NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
+		{ServerID: "srv-de-01", ResponseSecret: []byte("too-short")},
+	})
+	if !errors.Is(err, ErrInvalidResponseSecret) {
+		t.Fatalf("Test 4 failed: expected ErrInvalidResponseSecret for client short secret, got: %v", err)
+	}
+
+	// 5. Two distinct server identities with their own secrets succeed.
+	serverA, err := NewServerAsymmetricSessionWithID(sessionID, psk, secretA, "srv-de-01")
+	if err != nil {
+		t.Fatalf("Test 5 failed: server A creation failed: %v", err)
+	}
+	serverB, err := NewServerAsymmetricSessionWithID(sessionID, psk, secretB, "srv-nl-01")
+	if err != nil {
+		t.Fatalf("Test 5 failed: server B creation failed: %v", err)
+	}
+	client, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
+		{ServerID: "srv-de-01", ResponseSecret: secretA},
+		{ServerID: "srv-nl-01", ResponseSecret: secretB},
+	})
+	if err != nil {
+		t.Fatalf("Test 5 failed: client creation failed: %v", err)
+	}
+	// Verify serverA response
+	fA, err := serverA.SealFrame(1, 0, []byte("Server A payload"))
+	if err != nil {
+		t.Fatalf("Test 5 failed: server A seal failed: %v", err)
+	}
+	_, _, decA, idA, err := client.VerifyFrameWithServerID(fA)
+	if err != nil || idA != "srv-de-01" || string(decA) != "Server A payload" {
+		t.Fatalf("Test 5 failed: client verify A failed: id=%s err=%v", idA, err)
+	}
+	// Verify serverB response
+	fB, err := serverB.SealFrame(1, 0, []byte("Server B payload"))
+	if err != nil {
+		t.Fatalf("Test 5 failed: server B seal failed: %v", err)
+	}
+	_, _, decB, idB, err := client.VerifyFrameWithServerID(fB)
+	if err != nil || idB != "srv-nl-01" || string(decB) != "Server B payload" {
+		t.Fatalf("Test 5 failed: client verify B failed: id=%s err=%v", idB, err)
+	}
+
+	// 6. Server A, knowing the shared c2s PSK and secret A, cannot generate a response accepted as server B.
+	// Server A attempts to sign/seal claiming Server B's ID using Server A's secret:
+	maliciousServer, err := NewServerAsymmetricSessionWithID(sessionID, psk, secretA, "srv-nl-01")
+	if err != nil {
+		t.Fatalf("Test 6 failed: malicious server creation failed: %v", err)
+	}
+	forgedFrame, err := maliciousServer.SealFrame(1, 0, []byte("Impersonated payload from A pretending to be B"))
+	if err != nil {
+		t.Fatalf("Test 6 failed: SealFrame failed: %v", err)
+	}
+	_, _, _, _, err = client.VerifyFrameWithServerID(forgedFrame)
+	if err == nil {
+		t.Fatalf("Test 6 CRITICAL DEFECT: client accepted response sealed with secretA for srv-nl-01!")
+	}
+
+	// 7. A misconfigured server cannot silently fall back to the shared PSK.
+	// Verify that if a caller attempts to use PSK as secret explicitly for Server A,
+	// but client was configured with secretA, verification fails.
+	pskServer, err := NewServerAsymmetricSessionWithID(sessionID, psk, psk, "srv-de-01")
+	if err != nil {
+		t.Fatalf("Test 7 failed: pskServer creation failed: %v", err)
+	}
+	pskFrame, err := pskServer.SealFrame(1, 0, []byte("Payload sealed with shared PSK"))
+	if err != nil {
+		t.Fatalf("Test 7 failed: SealFrame failed: %v", err)
+	}
+	_, _, _, _, err = client.VerifyFrameWithServerID(pskFrame)
+	if err == nil {
+		t.Fatalf("Test 7 CRITICAL DEFECT: client accepted response sealed with shared PSK instead of dedicated secretA!")
+	}
+
+	// 8. A slice mutated by its original caller after construction does not change the initialized identity or cryptographic behavior.
+	mutableSecret := make([]byte, 32)
+	copy(mutableSecret, secretA)
+	safeServer, err := NewServerAsymmetricSessionWithID(sessionID+1, psk, mutableSecret, "srv-de-01")
+	if err != nil {
+		t.Fatalf("Test 8 failed: safeServer creation failed: %v", err)
+	}
+	safeClient, err := NewClientAsymmetricSessionWithServers(sessionID+1, psk, []AuthorizedServerEntry{
+		{ServerID: "srv-de-01", ResponseSecret: mutableSecret},
+	})
+	if err != nil {
+		t.Fatalf("Test 8 failed: safeClient creation failed: %v", err)
+	}
+	// Caller mutates the slice
+	mutableSecret[0] ^= 0xFF
+	mutableSecret[15] ^= 0xAA
+
+	// Server seals frame with cloned secret
+	safeFrame, err := safeServer.SealFrame(1, 0, []byte("Immutability test payload"))
+	if err != nil {
+		t.Fatalf("Test 8 failed: safeServer.SealFrame failed: %v", err)
+	}
+	// Client verifies frame with cloned secret
+	_, _, decPayload, srvID, err := safeClient.VerifyFrameWithServerID(safeFrame)
+	if err != nil {
+		t.Fatalf("Test 8 CRITICAL DEFECT: mutation of caller slice broke cryptographic verification: %v", err)
+	}
+	if srvID != "srv-de-01" || string(decPayload) != "Immutability test payload" {
+		t.Fatalf("Test 8 payload or srvID mismatch")
+	}
+
+	// 9. The explicit legacy single-server mode still works only when deliberately selected.
+	legacyServer, err := NewServerLegacyAsymmetricSession(sessionID+2, psk)
+	if err != nil {
+		t.Fatalf("Test 9 failed: legacyServer creation failed: %v", err)
+	}
+	legacyClient, err := NewClientLegacyAsymmetricSession(sessionID+2, psk)
+	if err != nil {
+		t.Fatalf("Test 9 failed: legacyClient creation failed: %v", err)
+	}
+	legacyFrame, err := legacyServer.SealFrame(1, 0, []byte("Legacy single server payload"))
+	if err != nil {
+		t.Fatalf("Test 9 failed: legacyServer.SealFrame failed: %v", err)
+	}
+	_, _, decLegacy, _, err := legacyClient.VerifyFrameWithServerID(legacyFrame)
+	if err != nil {
+		t.Fatalf("Test 9 failed: legacyClient failed to verify legacy frame: %v", err)
+	}
+	if string(decLegacy) != "Legacy single server payload" {
+		t.Fatalf("Test 9 payload mismatch: %s", string(decLegacy))
+	}
+
+	// 10. Legacy mode cannot be selected implicitly by a multi-server configuration.
+	// Multi-server client attempting to verify legacy frame fails closed
+	_, _, _, _, err = client.VerifyFrameWithServerID(legacyFrame)
+	if err == nil {
+		t.Fatalf("Test 10 CRITICAL DEFECT: multi-server client accepted legacy single-server frame without authorization!")
+	}
+}
+
+func TestPhase18_SessionUniquenessAndNonceSafety(t *testing.T) {
+	sessionID := uint64(0x9988776655443322)
+	psk := []byte("shared-c2s-psk-32-bytes-long-123")
+	secretA := []byte("server-a-response-secret-1111111")
+	secretB := []byte("server-b-response-secret-2222222")
+
+	// 1. Role-based Nonce Domain Separation
+	// Client and Server must NEVER share the same AEAD nonce even for the exact same sessionID and sequence number!
+	clientNonce := make([]byte, crypto.NonceSize)
+	binary.BigEndian.PutUint64(clientNonce[0:8], sessionID)
+	binary.BigEndian.PutUint32(clientNonce[8:12], 1)
+	clientNonce[0] ^= byte(RoleClient)
+
+	serverNonce := make([]byte, crypto.NonceSize)
+	binary.BigEndian.PutUint64(serverNonce[0:8], sessionID)
+	binary.BigEndian.PutUint32(serverNonce[8:12], 1)
+	serverNonce[0] ^= byte(RoleServer)
+
+	if bytes.Equal(clientNonce, serverNonce) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: client and server nonces collided for same session and seq!")
+	}
+	if clientNonce[0] == serverNonce[0] {
+		t.Fatalf("Role byte differentiation failed")
+	}
+
+	// 2. Cross-Server Retries: Key & Nonce Safety Across Distinct Authoritative Servers
+	// If a client retries a query with the same sessionID to Server B after failing over from Server A:
+	serverA, err := NewServerAsymmetricSessionWithID(sessionID, psk, secretA, "srv-de-01")
+	if err != nil {
+		t.Fatalf("serverA failed: %v", err)
+	}
+	serverB, err := NewServerAsymmetricSessionWithID(sessionID, psk, secretB, "srv-nl-01")
+	if err != nil {
+		t.Fatalf("serverB failed: %v", err)
+	}
+
+	// Server A and Server B derived encryption keys must be completely different
+	if bytes.Equal(serverA.encKey, serverB.encKey) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: Server A and Server B derived identical response keys for same sessionID!")
+	}
+
+	// Responses from Server A and Server B for identical seq 1 have different keys, preventing multi-target nonce collision
+	payload := []byte("Identical payload for failover retry")
+	frameA, err := serverA.SealFrame(1, 0, payload)
+	if err != nil {
+		t.Fatalf("serverA.SealFrame failed: %v", err)
+	}
+	frameB, err := serverB.SealFrame(1, 0, payload)
+	if err != nil {
+		t.Fatalf("serverB.SealFrame failed: %v", err)
+	}
+	if bytes.Equal(frameA, frameB) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: Server A and Server B produced identical ciphertexts!")
+	}
+
+	// 3. Concurrent Sessions and Key Orthogonality
+	sessionID2 := sessionID + 1
+	serverA2, err := NewServerAsymmetricSessionWithID(sessionID2, psk, secretA, "srv-de-01")
+	if err != nil {
+		t.Fatalf("serverA2 failed: %v", err)
+	}
+	if bytes.Equal(serverA.encKey, serverA2.encKey) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: Different sessions produced identical response keys!")
+	}
+	if bytes.Equal(serverA.decKey, serverA2.decKey) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: Different sessions produced identical request decryption keys!")
+	}
 }

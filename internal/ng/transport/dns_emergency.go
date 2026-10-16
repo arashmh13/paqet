@@ -458,12 +458,13 @@ type EmergencyResponse struct {
 
 // EmergencyDNSServerConfig configures the authoritative DNS emergency service.
 type EmergencyDNSServerConfig struct {
-	ListenAddr   string
-	DomainSuffix string
-	PSK          []byte
-	ServerID     string // Unique cryptographic identity of this authoritative server instance (e.g. "ns-de-01")
-	ServerSecret []byte // Dedicated 32-byte response secret (if nil, defaults to PSK for single-server standalone)
-	Handler      func(msg *EmergencyMessage) (*EmergencyResponse, error)
+	ListenAddr           string
+	DomainSuffix         string
+	PSK                  []byte
+	ServerID             string // Unique cryptographic identity of this authoritative server instance (e.g. "ns-de-01")
+	ServerSecret         []byte // Dedicated 32-byte response secret (mandatory in multi-server mode)
+	IsLegacySingleServer bool   // If true, enables legacy single-server mode using PSK only
+	Handler              func(msg *EmergencyMessage) (*EmergencyResponse, error)
 }
 
 type cachedReplyEntry struct {
@@ -552,14 +553,27 @@ func NewEmergencyDNSServer(cfg EmergencyDNSServerConfig) (*EmergencyDNSServer, e
 	if len(cfg.PSK) != 32 {
 		return nil, errors.New("emergency dns: PSK must be exactly 32 bytes")
 	}
-	if cfg.ServerID == "" {
-		cfg.ServerID = "ns-de-01"
-	}
-	if err := ValidateServerID(cfg.ServerID); err != nil {
-		return nil, fmt.Errorf("emergency dns: invalid server ID %q: %w", cfg.ServerID, err)
-	}
-	if len(cfg.ServerSecret) > 0 && len(cfg.ServerSecret) != 32 {
-		return nil, errors.New("emergency dns: ServerSecret must be exactly 32 bytes")
+
+	if !cfg.IsLegacySingleServer {
+		if cfg.ServerID == "" {
+			return nil, errors.New("emergency dns: server ID must be explicitly configured (no implicit default)")
+		}
+		if cfg.ServerID == "default" || cfg.ServerID == "legacy" {
+			return nil, fmt.Errorf("emergency dns: production server cannot use default/legacy server ID %q", cfg.ServerID)
+		}
+		if err := ValidateServerID(cfg.ServerID); err != nil {
+			return nil, fmt.Errorf("emergency dns: invalid server ID %q: %w", cfg.ServerID, err)
+		}
+		if len(cfg.ServerSecret) == 0 {
+			return nil, ErrMissingResponseSecret
+		}
+		if len(cfg.ServerSecret) != 32 {
+			return nil, ErrInvalidResponseSecret
+		}
+	} else {
+		if cfg.ServerID == "" {
+			cfg.ServerID = "legacy"
+		}
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
@@ -991,7 +1005,13 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 	reqDigest [32]byte,
 ) []byte {
 	// 1. Ephemeral unpersisted session for candidate validation
-	candidateConn, err := NewServerAsymmetricSessionWithID(sessionID, s.cfg.PSK, s.cfg.ServerSecret, s.cfg.ServerID)
+	var candidateConn *AsymmetricConn
+	var err error
+	if s.cfg.IsLegacySingleServer {
+		candidateConn, err = NewServerLegacyAsymmetricSession(sessionID, s.cfg.PSK)
+	} else {
+		candidateConn, err = NewServerAsymmetricSessionWithID(sessionID, s.cfg.PSK, s.cfg.ServerSecret, s.cfg.ServerID)
+	}
 	if err != nil {
 		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
 	}
@@ -1183,21 +1203,83 @@ func (r *DNSQueryAttemptRecord) Validate() error {
 	return nil
 }
 
+// DNSInterAttemptGap tracks timing and reason for pauses between consecutive resolver query attempts.
+type DNSInterAttemptGap struct {
+	FromAttemptIndex int     `json:"from_attempt_index"`
+	ToAttemptIndex   int     `json:"to_attempt_index"`
+	StartMonotonicMs float64 `json:"start_monotonic_ms"`
+	EndMonotonicMs   float64 `json:"end_monotonic_ms"`
+	DurationMs       float64 `json:"duration_ms"`
+	Reason           string  `json:"reason"`
+}
+
+// DNSExchangeTimeline tracks the complete end-to-end breakdown of a logical DNS query exchange.
+type DNSExchangeTimeline struct {
+	StartMonotonicMs float64                 `json:"start_monotonic_ms"`
+	EndMonotonicMs   float64                 `json:"end_monotonic_ms"`
+	TotalDurationMs  float64                 `json:"total_duration_ms"`
+	Attempts         []DNSQueryAttemptRecord `json:"attempts"`
+	Gaps             []DNSInterAttemptGap    `json:"inter_attempt_gaps"`
+	UnaccountedMs    float64                 `json:"unaccounted_ms"`
+}
+
+// Reconcile verifies that total logical exchange duration matches component attempts and gaps within tolerance.
+func (t *DNSExchangeTimeline) Reconcile(toleranceMs float64) error {
+	if t.TotalDurationMs < 0 || t.StartMonotonicMs < 0 || t.EndMonotonicMs < 0 {
+		return fmt.Errorf("timeline has negative timing values")
+	}
+	if t.EndMonotonicMs < t.StartMonotonicMs {
+		return fmt.Errorf("timeline end (%f) < start (%f)", t.EndMonotonicMs, t.StartMonotonicMs)
+	}
+
+	var sumAttempts float64
+	for i, att := range t.Attempts {
+		if err := att.Validate(); err != nil {
+			return fmt.Errorf("attempt %d validation failed: %w", i, err)
+		}
+		sumAttempts += att.DurationMs
+	}
+
+	var sumGaps float64
+	for i, gap := range t.Gaps {
+		if gap.DurationMs < 0 {
+			return fmt.Errorf("gap %d has negative duration %f", i, gap.DurationMs)
+		}
+		if gap.EndMonotonicMs < gap.StartMonotonicMs {
+			return fmt.Errorf("gap %d end (%f) < start (%f)", i, gap.EndMonotonicMs, gap.StartMonotonicMs)
+		}
+		sumGaps += gap.DurationMs
+	}
+
+	totalComponents := sumAttempts + sumGaps
+	unaccounted := t.TotalDurationMs - totalComponents
+	t.UnaccountedMs = unaccounted
+
+	if toleranceMs <= 0 {
+		toleranceMs = 2.0
+	}
+	if unaccounted < -toleranceMs || unaccounted > toleranceMs {
+		return fmt.Errorf("timeline reconciliation failed: total (%f ms) != components (attempts: %f + gaps: %f = %f ms), unaccounted=%f ms exceeds tolerance %f ms",
+			t.TotalDurationMs, sumAttempts, sumGaps, totalComponents, unaccounted, toleranceMs)
+	}
+	return nil
+}
+
 // EmergencyDNSClientConfig configures the emergency DNS client.
 type EmergencyDNSClientConfig struct {
-	ResolverAddr      string   // e.g. "8.8.8.8:53"
-	Resolvers         []string // Candidate resolvers for sequential failover (e.g. ["8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"])
-	DomainSuffix      string   // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
-	ClientID          string
-	PSK               []byte
-	SessionID         uint64
-	Timeout           time.Duration // Total timeout across all attempts
-	PerAttemptTimeout time.Duration // Timeout for an individual attempt (default 1500ms)
-	MaxRetries        int
-	EDNSBufferSize    uint16                  // Advertised UDP buffer size in OPT RR (default 1232)
-	AuthorizedServers []string                // Simple whitelist of server IDs (uses PSK for response verification)
-	ServerIdentities  []AuthorizedServerEntry // Explicit per-server response secrets
-	AllowLegacyV2     bool                    // Reject legacy v2 frames if false
+	ResolverAddr         string   // e.g. "8.8.8.8:53"
+	Resolvers            []string // Candidate resolvers for sequential failover (e.g. ["8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"])
+	DomainSuffix         string   // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
+	ClientID             string
+	PSK                  []byte
+	SessionID            uint64
+	Timeout              time.Duration // Total timeout across all attempts
+	PerAttemptTimeout    time.Duration // Timeout for an individual attempt (default 1500ms)
+	MaxRetries           int
+	EDNSBufferSize       uint16                  // Advertised UDP buffer size in OPT RR (default 1232)
+	ServerIdentities     []AuthorizedServerEntry // Explicit per-server response secrets (mandatory in multi-server mode)
+	IsLegacySingleServer bool                    // If true, enables legacy single-server mode using PSK only
+	AllowLegacyV2        bool                    // Reject legacy v2 frames if false
 }
 
 // EmergencyDNSClient sends authenticated application messages over public recursive DNS and verifies responses.
@@ -1206,6 +1288,7 @@ type EmergencyDNSClient struct {
 	session  *AsymmetricConn
 	mu       sync.Mutex
 	attempts []DNSQueryAttemptRecord
+	timeline DNSExchangeTimeline
 }
 
 // LastExchangeAttempts returns a copy of the query attempts recorded during the last Exchange call.
@@ -1215,6 +1298,29 @@ func (c *EmergencyDNSClient) LastExchangeAttempts() []DNSQueryAttemptRecord {
 	res := make([]DNSQueryAttemptRecord, len(c.attempts))
 	copy(res, c.attempts)
 	return res
+}
+
+// LastExchangeTimeline returns the detailed timeline breakdown of the last Exchange call.
+func (c *EmergencyDNSClient) LastExchangeTimeline() DNSExchangeTimeline {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.timeline
+}
+
+func (c *EmergencyDNSClient) recordTimeline(start, end time.Time, totalDur time.Duration, attempts []DNSQueryAttemptRecord, gaps []DNSInterAttemptGap) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.attempts = append([]DNSQueryAttemptRecord(nil), attempts...)
+	totalDurMs := float64(totalDur.Microseconds()) / 1000.0
+	tl := DNSExchangeTimeline{
+		StartMonotonicMs: 0.0,
+		EndMonotonicMs:   float64(end.Sub(start).Microseconds()) / 1000.0,
+		TotalDurationMs:  totalDurMs,
+		Attempts:         append([]DNSQueryAttemptRecord(nil), attempts...),
+		Gaps:             append([]DNSInterAttemptGap(nil), gaps...),
+	}
+	_ = tl.Reconcile(2.0)
+	c.timeline = tl
 }
 
 // NewEmergencyDNSClient initializes an emergency client for a given session.
@@ -1247,23 +1353,21 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 		cfg.EDNSBufferSize = DefaultEDNSUDPPayloadSize
 	}
 
-	var entries []AuthorizedServerEntry
-	if len(cfg.ServerIdentities) > 0 {
-		entries = cfg.ServerIdentities
-	} else if len(cfg.AuthorizedServers) > 0 {
-		for _, s := range cfg.AuthorizedServers {
-			entries = append(entries, AuthorizedServerEntry{
-				ServerID:       s,
-				ResponseSecret: nil, // uses PSK
-			})
+	var sess *AsymmetricConn
+	var err error
+	if cfg.IsLegacySingleServer {
+		sess, err = NewClientLegacyAsymmetricSession(cfg.SessionID, cfg.PSK)
+		if err != nil {
+			return nil, err
 		}
 	} else {
-		return nil, ErrEmptyServerAllowlist
-	}
-
-	sess, err := NewClientAsymmetricSessionWithServers(cfg.SessionID, cfg.PSK, entries)
-	if err != nil {
-		return nil, err
+		if len(cfg.ServerIdentities) == 0 {
+			return nil, ErrEmptyServerAllowlist
+		}
+		sess, err = NewClientAsymmetricSessionWithServers(cfg.SessionID, cfg.PSK, cfg.ServerIdentities)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if cfg.AllowLegacyV2 {
 		sess.SetAllowLegacyV2ForTest(true)
@@ -1315,16 +1419,16 @@ func (c *EmergencyDNSClient) Exchange(ctx context.Context, msg *EmergencyMessage
 		resolvers = []string{c.cfg.ResolverAddr}
 	}
 
-	c.mu.Lock()
-	c.attempts = nil
-	c.mu.Unlock()
-
 	startOverall := time.Now()
+	var attempts []DNSQueryAttemptRecord
+	var gaps []DNSInterAttemptGap
 
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return nil, 0, ctx.Err()
+			totalDur := time.Since(startOverall)
+			c.recordTimeline(startOverall, time.Now(), totalDur, attempts, gaps)
+			return nil, totalDur, ctx.Err()
 		default:
 		}
 
@@ -1345,27 +1449,41 @@ func (c *EmergencyDNSClient) Exchange(ctx context.Context, msg *EmergencyMessage
 		attemptCtx, cancelAttempt := context.WithTimeout(ctx, perTimeout)
 		resp, attemptRec, err := c.attemptExchangeWithRecord(attemptCtx, attempt, resolverUDP, resolverStr, curOffset, totalParts, frame, chunkSize, msg.ID, startOverall, perTimeout)
 		cancelAttempt()
+		attemptEnd := time.Now()
 
-		c.mu.Lock()
-		c.attempts = append(c.attempts, attemptRec)
-		c.mu.Unlock()
+		attempts = append(attempts, attemptRec)
 
 		if err == nil && resp != nil {
-			return resp, time.Since(startOverall), nil
+			totalDur := time.Since(startOverall)
+			c.recordTimeline(startOverall, time.Now(), totalDur, attempts, gaps)
+			return resp, totalDur, nil
 		}
 
 		if attempt < c.cfg.MaxRetries {
-			// Fast sequential fallback with 50-100ms jitter
+			gapStart := attemptEnd
 			backoff := 50*time.Millisecond + time.Duration(cryptoRandUint64()%50)*time.Millisecond
 			select {
 			case <-ctx.Done():
-				return nil, 0, ctx.Err()
+				totalDur := time.Since(startOverall)
+				c.recordTimeline(startOverall, time.Now(), totalDur, attempts, gaps)
+				return nil, totalDur, ctx.Err()
 			case <-time.After(backoff):
 			}
+			gapEnd := time.Now()
+			gaps = append(gaps, DNSInterAttemptGap{
+				FromAttemptIndex: attempt,
+				ToAttemptIndex:   attempt + 1,
+				StartMonotonicMs: float64(gapStart.Sub(startOverall).Microseconds()) / 1000.0,
+				EndMonotonicMs:   float64(gapEnd.Sub(startOverall).Microseconds()) / 1000.0,
+				DurationMs:       float64(gapEnd.Sub(gapStart).Microseconds()) / 1000.0,
+				Reason:           "retry_backoff_and_resolver_failover",
+			})
 		}
 	}
 
-	return nil, time.Since(startOverall), fmt.Errorf("emergency exchange timed out after %d retries across resolvers %v", c.cfg.MaxRetries, resolvers)
+	totalDur := time.Since(startOverall)
+	c.recordTimeline(startOverall, time.Now(), totalDur, attempts, gaps)
+	return nil, totalDur, fmt.Errorf("emergency exchange timed out after %d retries across resolvers %v", c.cfg.MaxRetries, resolvers)
 }
 
 func (c *EmergencyDNSClient) attemptExchange(
@@ -1457,6 +1575,7 @@ func (c *EmergencyDNSClient) attemptExchangeWithRecord(
 		select {
 		case <-ctx.Done():
 			rec.Status = "CANCELED"
+			rec.Error = ctx.Err().Error()
 			rec.DurationMs = float64(time.Since(attemptStart).Microseconds()) / 1000.0
 			rec.RcvdAtMonotonicMs = float64(time.Since(startOverall).Microseconds()) / 1000.0
 			return nil, rec, ctx.Err()
@@ -1536,6 +1655,7 @@ func (c *EmergencyDNSClient) attemptExchangeWithRecord(
 	}
 
 	rec.Status = "TIMEOUT"
+	rec.Error = "timeout waiting for valid response"
 	rec.DurationMs = float64(time.Since(attemptStart).Microseconds()) / 1000.0
 	rec.RcvdAtMonotonicMs = float64(time.Since(startOverall).Microseconds()) / 1000.0
 	return nil, rec, errors.New("timeout waiting for valid response")

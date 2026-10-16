@@ -55,6 +55,8 @@ var (
 	ErrInvalidServerID          = errors.New("asymmetric: invalid server ID format")
 	ErrEmptyServerAllowlist     = errors.New("asymmetric: authorized servers allowlist cannot be empty (fail-closed)")
 	ErrLegacyProtocolDisabled   = errors.New("asymmetric: legacy v2 protocol frames are disabled by policy (v3 required)")
+	ErrMissingResponseSecret    = errors.New("asymmetric: dedicated per-server response secret is required (shared PSK fallback prohibited)")
+	ErrInvalidResponseSecret    = errors.New("asymmetric: response secret must be exactly 32 bytes")
 )
 
 type unackedFrame struct {
@@ -112,19 +114,20 @@ func ValidateServerID(id string) error {
 
 // AsymmetricConn implements net.Conn over directionally decoupled upstream and downstream transports.
 type AsymmetricConn struct {
-	sessionID         uint64
-	role              Role
-	serverID          string            // Cryptographic server ID (immutable once derived)
-	serverSecret      []byte            // Dedicated server response secret (immutable)
-	authorizedServers map[string][]byte // Client-side map: serverID -> 32-byte response secret (immutable)
-	allowLegacyV2     bool              // If false, rejects 0x50415141 frames (fail-closed)
-	mtu               int
-	psk               []byte
-	encKey            []byte
-	decKey            []byte
-	sendSeq           atomic.Uint32
-	lastAckRcv        atomic.Uint32
-	nextRecv          atomic.Uint32
+	sessionID            uint64
+	role                 Role
+	serverID             string            // Cryptographic server ID (immutable once derived)
+	serverSecret         []byte            // Dedicated server response secret (immutable)
+	authorizedServers    map[string][]byte // Client-side map: serverID -> 32-byte response secret (immutable)
+	allowLegacyV2        bool              // If false, rejects 0x50415141 frames (fail-closed)
+	isLegacySingleServer bool              // If true, operates in legacy single-server mode using PSK only
+	mtu                  int
+	psk                  []byte
+	encKey               []byte
+	decKey               []byte
+	sendSeq              atomic.Uint32
+	lastAckRcv           atomic.Uint32
+	nextRecv             atomic.Uint32
 
 	sender       UpstreamSender
 	receiver     DownstreamReceiver
@@ -165,8 +168,12 @@ func NewClientAsymmetricConn(
 	if mtu <= 0 {
 		mtu = DefaultAsymmetricMTU
 	}
+	if len(psk) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
+	}
 
-	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, nil, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)), "default")
+	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
+	c2s, s2c, err := crypto.DeriveLegacySingleServerTrafficKeys(psk, salt)
 	if err != nil {
 		return nil, fmt.Errorf("derive keys: %w", err)
 	}
@@ -175,26 +182,26 @@ func NewClientAsymmetricConn(
 	pipeR, pipeW := io.Pipe()
 
 	conn := &AsymmetricConn{
-		sessionID:         sessionID,
-		role:              RoleClient,
-		mtu:               mtu,
-		psk:               psk,
-		encKey:            c2s, // client encrypts with c2s
-		decKey:            s2c, // client decrypts with s2c
-		authorizedServers: map[string][]byte{"default": psk, "ns-de-01": psk},
-		allowLegacyV2:     true,
-		sender:            sender,
-		receiver:          receiver,
-		replay:            replay.NewFilter(30 * time.Second),
-		pipeR:             pipeR,
-		pipeW:             pipeW,
-		reorder:           make(map[uint32][]byte),
-		unacked:           make(map[uint32]*unackedFrame),
-		rto:               DefaultRTO,
-		localAddr:         localAddr,
-		remoteAddr:        remoteAddr,
-		ctx:               ctx,
-		cancel:            cancel,
+		sessionID:            sessionID,
+		role:                 RoleClient,
+		mtu:                  mtu,
+		psk:                  psk,
+		encKey:               c2s, // client encrypts with c2s
+		decKey:               s2c, // client decrypts with s2c
+		allowLegacyV2:        true,
+		isLegacySingleServer: true,
+		sender:               sender,
+		receiver:             receiver,
+		replay:               replay.NewFilter(30 * time.Second),
+		pipeR:                pipeR,
+		pipeW:                pipeW,
+		reorder:              make(map[uint32][]byte),
+		unacked:              make(map[uint32]*unackedFrame),
+		rto:                  DefaultRTO,
+		localAddr:            localAddr,
+		remoteAddr:           remoteAddr,
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 
 	go conn.recvLoop()
@@ -335,108 +342,176 @@ func (c *AsymmetricConn) ServerID() string {
 	return c.serverID
 }
 
-// NewServerAsymmetricSession creates an AsymmetricConn configured as RoleServer for a given session.
-// Uses PSK as both c2s decryption and s2c encryption secret (single-server standalone mode).
+// NewServerAsymmetricSession creates an AsymmetricConn configured as RoleServer for explicit single-server legacy mode.
+// For multi-authoritative deployments, use NewServerAsymmetricSessionWithID with dedicated credentials.
 func NewServerAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
-	return NewServerAsymmetricSessionWithID(sessionID, psk, nil, "default")
+	return NewServerLegacyAsymmetricSession(sessionID, psk)
 }
 
-// NewServerAsymmetricSessionWithID creates an AsymmetricConn configured as RoleServer with a specific immutable ServerID
-// and an optional dedicated response secret.
-// serverResponseSecret: unique per-server 32-byte secret; if nil, uses psk for single-server standalone mode.
-func NewServerAsymmetricSessionWithID(sessionID uint64, psk []byte, serverResponseSecret []byte, serverID string) (*AsymmetricConn, error) {
+// NewServerLegacyAsymmetricSession creates an AsymmetricConn for explicit single-server legacy operation using PSK only.
+// This mode is visibly separate and cannot be selected implicitly by a multi-authoritative configuration.
+func NewServerLegacyAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
+	if len(psk) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
+	}
+	pskClone := append([]byte(nil), psk...)
+	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
+	c2s, s2c, err := crypto.DeriveLegacySingleServerTrafficKeys(pskClone, salt)
+	if err != nil {
+		return nil, fmt.Errorf("derive legacy server keys: %w", err)
+	}
+
+	return &AsymmetricConn{
+		sessionID:            sessionID,
+		role:                 RoleServer,
+		serverID:             "legacy",
+		serverSecret:         pskClone,
+		psk:                  pskClone,
+		encKey:               s2c,
+		decKey:               c2s,
+		allowLegacyV2:        true,
+		isLegacySingleServer: true,
+		replay:               replay.NewFilter(30 * time.Second),
+	}, nil
+}
+
+// NewServerAsymmetricSessionWithID creates an AsymmetricConn configured as RoleServer for multi-authoritative operation
+// with an explicit, immutable ServerID and a mandatory dedicated 32-byte response secret.
+// No fallback to PSK is permitted.
+func NewServerAsymmetricSessionWithID(sessionID uint64, c2sPSK []byte, serverResponseSecret []byte, serverID string) (*AsymmetricConn, error) {
 	if serverID == "" {
 		return nil, fmt.Errorf("server session requires non-empty serverID")
 	}
-	if serverID != "default" {
-		if err := ValidateServerID(serverID); err != nil {
-			return nil, err
-		}
+	if serverID == "default" || serverID == "legacy" {
+		return nil, fmt.Errorf("server session cannot use reserved ID %q in multi-server mode", serverID)
 	}
+	if err := ValidateServerID(serverID); err != nil {
+		return nil, err
+	}
+	if len(c2sPSK) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
+	}
+	if len(serverResponseSecret) == 0 {
+		return nil, ErrMissingResponseSecret
+	}
+	if len(serverResponseSecret) != crypto.KeySize {
+		return nil, ErrInvalidResponseSecret
+	}
+
+	// Defensive copy of secret slices to prevent caller mutations after construction
+	pskClone := append([]byte(nil), c2sPSK...)
+	secretClone := append([]byte(nil), serverResponseSecret...)
+
 	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
-	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, serverResponseSecret, salt, serverID)
+	c2s, s2c, err := crypto.DeriveServerTrafficKeys(pskClone, secretClone, salt, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("derive server keys: %w", err)
 	}
 
 	return &AsymmetricConn{
-		sessionID:    sessionID,
-		role:         RoleServer,
-		serverID:     serverID,
-		serverSecret: serverResponseSecret,
-		psk:          psk,
-		encKey:       s2c, // server encrypts with s2c bound to serverResponseSecret + serverID
-		decKey:       c2s, // server decrypts with c2s
-		replay:       replay.NewFilter(30 * time.Second),
+		sessionID:            sessionID,
+		role:                 RoleServer,
+		serverID:             serverID,
+		serverSecret:         secretClone,
+		psk:                  pskClone,
+		encKey:               s2c, // server encrypts with s2c bound to serverResponseSecret + serverID
+		decKey:               c2s, // server decrypts with c2s
+		allowLegacyV2:        false,
+		isLegacySingleServer: false,
+		replay:               replay.NewFilter(30 * time.Second),
 	}, nil
 }
 
 // AuthorizedServerEntry describes an authorized server for the client-side verification map.
 type AuthorizedServerEntry struct {
 	ServerID       string
-	ResponseSecret []byte // 32-byte server-specific response secret
+	ResponseSecret []byte // 32-byte server-specific response secret (mandatory)
 }
 
-// NewClientAsymmetricSession creates an AsymmetricConn configured as RoleClient for a given session.
-// Uses PSK as both c2s encryption and s2c decryption secret (single-server standalone mode).
+// NewClientAsymmetricSession creates an AsymmetricConn configured as RoleClient for explicit single-server legacy mode.
+// For multi-authoritative deployments, use NewClientAsymmetricSessionWithServers.
 func NewClientAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
+	return NewClientLegacyAsymmetricSession(sessionID, psk)
+}
+
+// NewClientLegacyAsymmetricSession creates an AsymmetricConn configured as RoleClient for explicit single-server legacy operation.
+func NewClientLegacyAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
+	if len(psk) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
+	}
+	pskClone := append([]byte(nil), psk...)
 	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
-	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, nil, salt, "default")
+	c2s, s2c, err := crypto.DeriveLegacySingleServerTrafficKeys(pskClone, salt)
 	if err != nil {
-		return nil, fmt.Errorf("derive client keys: %w", err)
+		return nil, fmt.Errorf("derive legacy client keys: %w", err)
 	}
 
 	return &AsymmetricConn{
-		sessionID:         sessionID,
-		role:              RoleClient,
-		psk:               psk,
-		encKey:            c2s,
-		decKey:            s2c,
-		authorizedServers: map[string][]byte{"default": psk, "ns-de-01": psk},
-		allowLegacyV2:     true, // single-server mode allows legacy
-		replay:            replay.NewFilter(30 * time.Second),
+		sessionID:            sessionID,
+		role:                 RoleClient,
+		serverID:             "legacy",
+		psk:                  pskClone,
+		encKey:               c2s,
+		decKey:               s2c,
+		authorizedServers:    map[string][]byte{"legacy": pskClone, "default": pskClone},
+		allowLegacyV2:        true,
+		isLegacySingleServer: true,
+		replay:               replay.NewFilter(30 * time.Second),
 	}, nil
 }
 
 // NewClientAsymmetricSessionWithServers creates an AsymmetricConn configured as RoleClient with an explicit,
-// nonempty set of authorized server identities and their corresponding response secrets.
+// nonempty set of authorized server identities and their corresponding dedicated 32-byte response secrets.
 // The client will ONLY accept v3 responses from servers in this authorized set. Legacy v2 frames are rejected.
-func NewClientAsymmetricSessionWithServers(sessionID uint64, psk []byte, servers []AuthorizedServerEntry) (*AsymmetricConn, error) {
+func NewClientAsymmetricSessionWithServers(sessionID uint64, c2sPSK []byte, servers []AuthorizedServerEntry) (*AsymmetricConn, error) {
 	if len(servers) == 0 {
 		return nil, ErrEmptyServerAllowlist
 	}
-
-	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
-	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, nil, salt, "default")
-	if err != nil {
-		return nil, fmt.Errorf("derive client keys: %w", err)
+	if len(c2sPSK) != crypto.KeySize {
+		return nil, crypto.ErrInvalidKey
 	}
 
+	pskClone := append([]byte(nil), c2sPSK...)
 	authMap := make(map[string][]byte)
 	for _, s := range servers {
 		if s.ServerID == "" {
 			return nil, fmt.Errorf("authorized server entry has empty serverID")
 		}
-		if s.ServerID != "default" {
-			if err := ValidateServerID(s.ServerID); err != nil {
-				return nil, err
-			}
+		if s.ServerID == "default" || s.ServerID == "legacy" {
+			return nil, fmt.Errorf("authorized server cannot use reserved ID %q", s.ServerID)
+		}
+		if err := ValidateServerID(s.ServerID); err != nil {
+			return nil, err
+		}
+		if len(s.ResponseSecret) == 0 {
+			return nil, fmt.Errorf("server %q: %w", s.ServerID, ErrMissingResponseSecret)
+		}
+		if len(s.ResponseSecret) != crypto.KeySize {
+			return nil, fmt.Errorf("server %q: %w", s.ServerID, ErrInvalidResponseSecret)
 		}
 		if _, dup := authMap[s.ServerID]; dup {
 			return nil, fmt.Errorf("duplicate authorized server ID %q (fail-closed)", s.ServerID)
 		}
-		authMap[s.ServerID] = s.ResponseSecret // nil = use PSK for backward-compat single-server
+		// Defensive copy of secret slice to prevent caller mutations after construction
+		secretClone := append([]byte(nil), s.ResponseSecret...)
+		authMap[s.ServerID] = secretClone
+	}
+
+	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
+	c2s, _, err := crypto.DeriveServerTrafficKeys(pskClone, servers[0].ResponseSecret, salt, servers[0].ServerID)
+	if err != nil {
+		return nil, fmt.Errorf("derive client c2s key: %w", err)
 	}
 
 	return &AsymmetricConn{
-		sessionID:         sessionID,
-		role:              RoleClient,
-		psk:               psk,
-		encKey:            c2s,
-		decKey:            s2c,
-		authorizedServers: authMap,
-		allowLegacyV2:     false, // multi-server mode disables legacy v2
-		replay:            replay.NewFilter(30 * time.Second),
+		sessionID:            sessionID,
+		role:                 RoleClient,
+		psk:                  pskClone,
+		encKey:               c2s,
+		authorizedServers:    authMap,
+		allowLegacyV2:        false,
+		isLegacySingleServer: false,
+		replay:               replay.NewFilter(30 * time.Second),
 	}, nil
 }
 
@@ -446,7 +521,7 @@ func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, e
 		return nil, ErrSequenceExhausted
 	}
 	var header []byte
-	if c.serverID != "" || c.role == RoleServer {
+	if c.role == RoleServer {
 		srvID := c.serverID
 		if srvID == "" {
 			srvID = "default"
@@ -550,51 +625,40 @@ func (c *AsymmetricConn) VerifyFrameWithServerID(frame []byte) (seq, ack uint32,
 	var decKey []byte
 	if c.role == RoleClient {
 		if magic == AsymmetricMagicV3 {
-			if serverID == "" {
-				return 0, 0, nil, "", fmt.Errorf("%w: server response missing server ID", ErrInvalidServerID)
-			}
-			if err := ValidateServerID(serverID); err != nil {
-				return 0, 0, nil, serverID, err
-			}
-			// Multi-authoritative client policy check: nonempty allowlist required
-			if len(c.authorizedServers) == 0 {
-				return 0, 0, nil, serverID, ErrEmptyServerAllowlist
-			}
-			secret, ok := c.authorizedServers[serverID]
-			if !ok {
-				return 0, 0, nil, serverID, fmt.Errorf("server %q is not authorized by client policy (fail-closed)", serverID)
-			}
-			resSecret := secret
-			if len(resSecret) == 0 {
-				resSecret = c.psk
-			}
-			salt := []byte(fmt.Sprintf("paqet-asym-%d", c.sessionID))
-			sKey, err := crypto.DeriveServerResponseKey(resSecret, salt, serverID)
-			if err != nil {
-				return 0, 0, nil, serverID, fmt.Errorf("derive server response key: %w", err)
-			}
-			decKey = sKey
-		} else if magic == AsymmetricMagic {
-			// Legacy v2 frame
-			if len(c.authorizedServers) > 0 {
-				secret, ok := c.authorizedServers["legacy"]
-				if !ok {
-					secret, ok = c.authorizedServers["default"]
+			if c.isLegacySingleServer {
+				// Single-server legacy client decodes using pre-shared key
+				decKey = c.decKey
+			} else {
+				if serverID == "" {
+					return 0, 0, nil, "", fmt.Errorf("%w: server response missing server ID", ErrInvalidServerID)
 				}
-				if !ok {
-					return 0, 0, nil, "", fmt.Errorf("legacy v2 frames not authorized by client policy (fail-closed)")
+				if err := ValidateServerID(serverID); err != nil {
+					return 0, 0, nil, serverID, err
 				}
-				resSecret := secret
-				if len(resSecret) == 0 {
-					resSecret = c.psk
+				// Multi-authoritative client policy check: nonempty allowlist required
+				if len(c.authorizedServers) == 0 {
+					return 0, 0, nil, serverID, ErrEmptyServerAllowlist
+				}
+				secret, ok := c.authorizedServers[serverID]
+				if !ok {
+					return 0, 0, nil, serverID, fmt.Errorf("server %q is not authorized by client policy (fail-closed)", serverID)
+				}
+				if len(secret) != crypto.KeySize {
+					return 0, 0, nil, serverID, fmt.Errorf("server %q has invalid response secret length (fail-closed)", serverID)
 				}
 				salt := []byte(fmt.Sprintf("paqet-asym-%d", c.sessionID))
-				c2s, s2c, _ := crypto.DeriveKeys(resSecret, salt)
-				decKey = s2c
-				_ = c2s
-			} else {
-				decKey = c.decKey
+				sKey, err := crypto.DeriveServerResponseKey(secret, salt, serverID)
+				if err != nil {
+					return 0, 0, nil, serverID, fmt.Errorf("derive server response key: %w", err)
+				}
+				decKey = sKey
 			}
+		} else if magic == AsymmetricMagic {
+			// Legacy v2 frame: strictly rejected on multi-server clients
+			if !c.allowLegacyV2 || !c.isLegacySingleServer {
+				return 0, 0, nil, "", ErrLegacyProtocolDisabled
+			}
+			decKey = c.decKey
 		}
 	} else {
 		decKey = c.decKey
