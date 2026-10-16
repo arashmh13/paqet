@@ -354,3 +354,65 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   5. Per-Server Replay Filtering: The client maintains separate replay windows (`c.serverReplay[serverID]`), allowing independent servers to maintain their own sequence counters without causing false replay rejections on the client.
   6. Client Authorization Whitelist (`AuthorizedServers`): Client verifies that the answering `serverID` is authorized by its configuration policy, rejecting rogue server responses fail-closed.
   7. Adversarially verified via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` and `TestMultiAuthoritative_FailoverAndServerRestart`.
+
+---
+
+## 13. Authenticated Server Identity, Fail-Closed Authorization & AEAD Lifecycle Safety (Phase 17)
+
+### 13.1 Cryptographic Per-Server Response Secrets (Elimination of Shared-PSK Impersonation)
+- **Prior Architectural Defect:** In Phase 16, server response keys were derived from HKDF context incorporating `ServerID`, but using the root shared PSK (`IKM = PSK`). Any server instance holding the shared PSK could compute the response key for *any* `ServerID` merely by passing that string into HKDF. A malicious or compromised server could thus forge responses claiming another server's identity.
+- **Cryptographic Trust Model Redesign:**
+  1. Decoupled upstream query decryption from downstream response authentication:
+     $$\text{PRK}_{\text{c2s}} = \text{HKDF-Extract}(\text{SHA-256}, \text{IKM}=\text{c2sPSK}, \text{salt}=\text{sessionID})$$
+     $$\text{c2sKey} = \text{HKDF-Expand}(\text{PRK}_{\text{c2s}}, \text{info}=\text{"paqet-ng-v3-c2s"}, L=32)$$
+     $$\text{PRK}_{\text{s2c}} = \text{HKDF-Extract}(\text{SHA-256}, \text{IKM}=\text{ServerResponseSecret}, \text{salt}=\text{sessionID})$$
+     $$\text{s2cKey} = \text{HKDF-Expand}(\text{PRK}_{\text{s2c}}, \text{info}=\text{"paqet-ng-v3-s2c:"} \mathbin{\Vert} \text{ServerID}, L=32)$$
+  2. Each authoritative server instance is provisioned with its own distinct 32-byte response secret (`ServerSecret`), held exclusively by that node.
+  3. The client maintains an authorized server map (`map[string][]byte`): `ServerID -> ResponseSecret`.
+  4. Server A (holding `secretA`) cannot derive Server B's response key (`s2cKey`), even if it knows Server B's `ServerID` and the shared `c2sPSK`.
+  5. Verified via `TestAsymmetric_DistinctServerSecretsPreventImpersonation`: a rogue server attempting to forge Server B's response fails AEAD message authentication tag verification on the client.
+
+### 13.2 Immutable Server Identity & Canonical Validation
+- **Prior Defect:** `AsymmetricConn.SetServerID()` allowed mutating server identity after key initialization, which could decouple header identity from the active encryption key.
+- **Remediation:**
+  1. Removed `SetServerID()` and `SetAuthorizedServers()` setter methods entirely.
+  2. Server identity and keys are derived atomically and immutably at session construction (`NewServerAsymmetricSessionWithID`).
+  3. Implemented `ValidateServerID()`: enforces canonical identity format (3–64 characters, lowercase alphanumeric, `-`, `.`, `_`). Malformed identities fail startup fail-closed.
+  4. Duplicate server IDs in client authorization policies are rejected at configuration time.
+
+### 13.3 Mandatory Nonempty Authorization Policy & Legacy v2 Fail-Closed Rejection
+- **Prior Defect:** Clients with empty authorization allowlists silently accepted any server ID, and legacy v2 frames followed a separate code path that bypassed server ID validation.
+- **Remediation:**
+  1. Multi-authoritative clients strictly require a nonempty authorization allowlist. Empty or nil allowlists return `ErrEmptyServerAllowlist` fail-closed.
+  2. Multi-authoritative sessions disable legacy v2 frames (`allowLegacyV2 = false`). Any legacy v2 frame (`0x50415141`) presented to a v3 client is rejected with `ErrLegacyProtocolDisabled`.
+  3. Verified via `TestAsymmetric_MandatoryNonemptyAllowlist` and `TestAsymmetric_LegacyV2FramesRejectedByDefault`.
+
+### 13.4 32-bit Sequence Exhaustion & AEAD Lifecycle Nonce Safety
+- **Prior Hazard:** Nonces are constructed using big-endian 32-bit sequence numbers. An atomic increment (`sendSeq.Add(1)`) on an active or long-running session could overflow from $2^{32}-1$ to 0, causing catastrophic nonce reuse under the same AEAD key.
+- **Remediation:**
+  1. Established `MaxSafeSequenceNumber = 0xFFFFFFF0` ($2^{32} - 16$).
+  2. In `NextSendSeq()`: atomically inspects sequence counter. If counter reaches or exceeds `MaxSafeSequenceNumber`, it stops cleanly and returns `ErrSequenceExhausted`. It never wraps around to 0.
+  3. In `sealFrame()`: checks `seq >= MaxSafeSequenceNumber` and rejects frame sealing with `ErrSequenceExhausted`.
+  4. Tested via `TestAsymmetric_SequenceExhaustionFailsSafely`: verified counter halts at boundary without overflow or wraparound.
+
+### 13.5 DNS Attempt Instrumentation Remediation
+- **Prior Telemetry Defect:** In Phase 16, `recovery_socks5_live_audit_phase16.json` recorded attempt 0 as `SUCCESS` while simultaneously retaining `error = "invalid txt response format"`.
+- **Root Cause & Remediation:**
+  1. A transient parsing error inside a packet reception loop populated `rec.Error`. When a valid packet was subsequently received within the same attempt, `rec.Status` was set to `SUCCESS`, but `rec.Error` was not reset to `""`.
+  2. Defined distinct terminal statuses: `DNSAttemptStatusSuccess`, `DNSAttemptStatusTimeout`, `DNSAttemptStatusTruncatedTCP`, `DNSAttemptStatusProtocolFail`, `DNSAttemptStatusParseFail`, `DNSAttemptStatusAuthFail`, `DNSAttemptStatusAppValidationFail`, `DNSAttemptStatusCanceled`.
+  3. In both UDP and TCP exchange loops: `rec.Error = ""` explicitly reset upon matching `expectedMsgID`.
+  4. Implemented `(r *DNSQueryAttemptRecord) Validate()`: rejects contradictory SUCCESS records with non-empty error fields, missing authentication, missing ServerID, negative intervals, or non-monotonic timestamps.
+  5. Tested via `TestDNSQueryAttemptRecord_Validation`.
+
+### 13.6 Two-Authoritative Cross-Server Readiness Verification
+- Verified via `TestPhase17_TwoAuthoritativeReadinessSuite`:
+  * Dual independent servers Server A (`srv-de-01`) and Server B (`srv-nl-01`) running with distinct secrets.
+  * Legitimate query to Server A verified.
+  * Server A stopped; client automatically fails over to Server B, decrypts authenticated reply, and verifies `ServerID = srv-nl-01`.
+  * Key revocation tested: removing Server B from client allowlist causes immediate fail-closed rejection.
+- Live Verified Across Iran ⇄ Germany:
+  * Measured monotonic failover: failure detection 38.95 ms, hysteresis 60.78 ms, signaling dispatch 0.41 ms, DNS exchange 1926.29 ms, validation dispatch 0.21 ms, candidate validation 177.03 ms, state activation 0.08 ms, post-activation app RTT 87.22 ms; total failover duration 2291.58 ms.
+  * Unaccounted overhead: **0.000 ms** (exact mathematical identity).
+  * Validated 2 DNS attempt records (Attempt 0: `TIMEOUT` via 8.8.8.8; Attempt 1: `SUCCESS` via 1.1.1.1 without contradictory error).
+  * Production SOCKS5 on `127.0.0.1:1090`: `HEALTHY`, `"pong"` in 109.83 ms.
+  * Audit Artifact: `docs/research/recovery_socks5_live_audit_phase17.json`.

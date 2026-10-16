@@ -49,12 +49,12 @@ func DeriveKeys(psk []byte, salt []byte) ([]byte, []byte, error) {
 }
 
 // DeriveServerTrafficKeys derives server-specific directional keys using HKDF (RFC 5869)
-// with explicit domain separation incorporating the server's cryptographic identity (serverID).
-// PRK = HKDF-Extract(sha256, IKM=psk, salt=salt)
-// c2sKey = HKDF-Expand(PRK, info="paqet-ng-v3-c2s", L=32)
-// s2cKey = HKDF-Expand(PRK, info="paqet-ng-v3-s2c:" + serverID, L=32)
-func DeriveServerTrafficKeys(psk []byte, salt []byte, serverID string) ([]byte, []byte, error) {
-	if len(psk) == 0 {
+// with explicit domain separation.
+// c2sKey is derived from c2sPSK (shared root secret allowing authorized servers to decrypt queries).
+// s2cKey is derived from serverResponseSecret (unique per-server response secret held exclusively by serverID).
+// If serverResponseSecret is empty, it falls back to c2sPSK for single-server standalone operation.
+func DeriveServerTrafficKeys(c2sPSK []byte, serverResponseSecret []byte, salt []byte, serverID string) ([]byte, []byte, error) {
+	if len(c2sPSK) == 0 {
 		return nil, nil, ErrInvalidKey
 	}
 	if len(salt) == 0 {
@@ -64,14 +64,18 @@ func DeriveServerTrafficKeys(psk []byte, salt []byte, serverID string) ([]byte, 
 		serverID = "default"
 	}
 
-	c2sExtractor := hkdf.New(sha256.New, psk, salt, []byte("paqet-ng-v3-c2s"))
+	c2sExtractor := hkdf.New(sha256.New, c2sPSK, salt, []byte("paqet-ng-v3-c2s"))
 	c2s := make([]byte, KeySize)
 	if _, err := io.ReadFull(c2sExtractor, c2s); err != nil {
 		return nil, nil, fmt.Errorf("crypto: failed to derive c2s v3 key: %w", err)
 	}
 
+	resSecret := serverResponseSecret
+	if len(resSecret) == 0 {
+		resSecret = c2sPSK
+	}
 	s2cInfo := []byte(fmt.Sprintf("paqet-ng-v3-s2c:%s", serverID))
-	s2cExtractor := hkdf.New(sha256.New, psk, salt, s2cInfo)
+	s2cExtractor := hkdf.New(sha256.New, resSecret, salt, s2cInfo)
 	s2c := make([]byte, KeySize)
 	if _, err := io.ReadFull(s2cExtractor, s2c); err != nil {
 		return nil, nil, fmt.Errorf("crypto: failed to derive s2c v3 key: %w", err)
@@ -80,9 +84,9 @@ func DeriveServerTrafficKeys(psk []byte, salt []byte, serverID string) ([]byte, 
 	return c2s, s2c, nil
 }
 
-// DeriveServerResponseKey derives only the server-to-client response key for a specific serverID.
-func DeriveServerResponseKey(psk []byte, salt []byte, serverID string) ([]byte, error) {
-	if len(psk) == 0 {
+// DeriveServerResponseKey derives only the server-to-client response key from serverResponseSecret and serverID.
+func DeriveServerResponseKey(serverResponseSecret []byte, salt []byte, serverID string) ([]byte, error) {
+	if len(serverResponseSecret) == 0 {
 		return nil, ErrInvalidKey
 	}
 	if len(salt) == 0 {
@@ -93,7 +97,7 @@ func DeriveServerResponseKey(psk []byte, salt []byte, serverID string) ([]byte, 
 	}
 
 	s2cInfo := []byte(fmt.Sprintf("paqet-ng-v3-s2c:%s", serverID))
-	extractor := hkdf.New(sha256.New, psk, salt, s2cInfo)
+	extractor := hkdf.New(sha256.New, serverResponseSecret, salt, s2cInfo)
 	s2c := make([]byte, KeySize)
 	if _, err := io.ReadFull(extractor, s2c); err != nil {
 		return nil, fmt.Errorf("crypto: failed to derive s2c v3 key for server %s: %w", serverID, err)

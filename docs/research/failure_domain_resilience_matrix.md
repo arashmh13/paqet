@@ -41,6 +41,8 @@ This document defines an explicit, empirically grounded resilience matrix classi
 | **FD-17** | **Emergency PSK Conflation** | Emergency server started without candidate identity flags | Implicit fallback removed; daemon fails startup | Tested via `TestEmergencyServerStartup_AEADWithoutKeyOrPinFails` & live CLI verification | **FAIL-CLOSED SAFE** |
 | **FD-18** | **Cross-Server Nonce Reuse in Multi-Authoritative** | Two independent authoritative servers answer same session/seq | Server-specific HKDF response keys (`s2cKey` bound to `ServerID`) prevent key/nonce collision | Tested via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` | **PROVEN & VERIFIED** |
 | **FD-19** | **Unauthorized Rogue Server Injection** | Unlisted server sharing root PSK attempts to serve bootstrap | Client enforces `AuthorizedServers` whitelist in `VerifyFrameWithServerID`; rejects rogue reply | Tested via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` | **FAIL-CLOSED SAFE** |
+| **FD-20** | **Shared-PSK Server Impersonation** | Server A (holding `secretA`) attempts to forge Server B's response | Distinct 32-byte response secrets per server; client AEAD authentication tag verification fails | Tested via `TestAsymmetric_DistinctServerSecretsPreventImpersonation` & `TestPhase17_TwoAuthoritativeReadinessSuite` | **FAIL-CLOSED SAFE** |
+| **FD-21** | **32-Bit Sequence Overflow Nonce Lifecycle** | Long-running session approaches $2^{32}-1$ sequence counter | Counter halted at `MaxSafeSequenceNumber` (`0xFFFFFFF0`); halts session cleanly with `ErrSequenceExhausted` | Tested via `TestAsymmetric_SequenceExhaustionFailsSafely`; zero overflow/wraparound | **FAIL-CLOSED SAFE** |
 
 ---
 

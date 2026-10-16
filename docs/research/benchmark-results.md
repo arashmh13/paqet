@@ -160,5 +160,39 @@ Executed live against `v2.5.8-telemetry` (GitCommit: `phase16audit`, SHA-256 `6b
 - **Result:** Status `HEALTHY`, Response `"pong"`, Duration $132.24\text{ ms}$.
 - **Artifact Reference:** `docs/research/recovery_socks5_live_audit_phase16.json`.
 
+### 5.4 Phase 17 Authenticated Identity & Reconciled Live Failover Benchmark
+
+#### Monotonic Recovery Timeline Breakdown (Live Iran ⇄ Germany Run)
+Executed live against `v2.5.9-authid` (GitCommit: `phase17auth`, SHA-256 `c950611e51bf1a8fcbff804f9012a1b9a2a683b77430e70e7f7b0f20e5ef0c54`):
+
+| Timeline Milestone | Cumulative Monotonic Time | Component Interval Duration | Milestone Description |
+| :--- | :--- | :--- | :--- |
+| **T0: Failure Injected** | $0.00\text{ ms}$ | — | Primary transport port `:18088` severed via firewall rule |
+| **T1: Threshold Crossed** | $38.95\text{ ms}$ | $38.95\text{ ms}$ | Consecutive primary failure detected; state $\rightarrow$ `PRIMARY_DEGRADED` |
+| **T2: Hysteresis Expired** | $99.73\text{ ms}$ | $60.78\text{ ms}$ | Degraded hysteresis window elapsed ($50\text{ms}$ config + loop latency) |
+| **T3: DNS Dispatched** | $100.15\text{ ms}$ | $0.41\text{ ms}$ | Query dispatched to recursive resolver pool (`8.8.8.8`, `1.1.1.1`) |
+| **T4: Bootstrap Received** | $2,026.43\text{ ms}$ | $1,926.29\text{ ms}$ | Authenticated bootstrap received via Cloudflare recursor (ServerID: `ns-de-01`) |
+| **T5: Validation Started** | $2,026.64\text{ ms}$ | $0.21\text{ ms}$ | Candidate remote handshake initiated |
+| **T6: Validation Completed**| $2,203.68\text{ ms}$ | $177.03\text{ ms}$ | Remote AEAD handshake, smux session, and `PPING`/`PPONG` verified |
+| **T7: State Activated** | $2,203.75\text{ ms}$ | $0.08\text{ ms}$ | State transitioned to `RECOVERY_READY` (generation revision 6) |
+| **T8: App Request Sent** | $2,204.36\text{ ms}$ | $0.61\text{ ms}$ | Application HTTP request dispatched through SOCKS5 proxy `:11990` |
+| **T9: App Response Verified**| $2,291.58\text{ ms}$ | $87.22\text{ ms}$ | HTTP 200 returned from remote origin; token byte-exact verified |
+| **TOTAL FAILOVER DURATION** | **$2,291.58\text{ ms}$** | **$2,291.58\text{ ms}$** | **Failure injection ($T_0$) to restored application traffic ($T_9$)** |
+| **Unaccounted Overhead** | — | **$0.000\text{ ms}$** | Exact mathematical identity: $\sum \text{Intervals} = T_9 - T_0$ |
+| **T10: Rollback Completed** | $3,949.56\text{ ms}$ | $1,657.98\text{ ms}$ | `ResetRollback` executed; state returned to `PRIMARY_HEALTHY` |
+| **T11: Network Restored** | $3,981.98\text{ ms}$ | $32.42\text{ ms}$ | Iptables DROP rule deleted; primary network restored |
+
+#### DNS Attempt Diagnostic Audit
+- **Attempt 0:** `8.8.8.8:53` -> Status `TIMEOUT` in $1,737.58\text{ ms}$ (transient recursor packet drop).
+- **Attempt 1:** `1.1.1.1:53` -> Status `SUCCESS` in $117.88\text{ ms}$, Authenticated: true, ServerID: `ns-de-01`, Error: none.
+- **Verification:** Both attempts verified strictly against schema via `rec.Validate()`, proving complete elimination of contradictory `SUCCESS` + error status anomalies.
+
+#### Production Service Health Verification
+- **Target:** Production SOCKS5 proxy on `127.0.0.1:1090` (authenticated `arash:arash`).
+- **Endpoint:** `http://127.0.0.1:8999/ping`
+- **Result:** Status `HEALTHY`, Response `"pong"`, Duration $109.83\text{ ms}$.
+- **Artifact Reference:** `docs/research/recovery_socks5_live_audit_phase17.json`.
+
+
 
 

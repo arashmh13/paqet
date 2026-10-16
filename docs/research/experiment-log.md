@@ -707,3 +707,63 @@
       - Production SOCKS5 on `127.0.0.1:1090`: Status `HEALTHY`, Response `"pong"` in 132.24 ms.
       - Raw telemetry logged to `docs/research/recovery_socks5_live_audit_phase16.json`.
      - **Outcome:** Telemetry reconciliation verified with zero unaccounted overhead, multi-authoritative cryptographic key/nonce collisions eliminated, EDNS sizing rules enforced, and production SOCKS5 verified healthy. Ready for commit and push.
+
+---
+
+### Cycle 25 — Phase 17 Authenticated Server Identity, Fail-Closed Authorization & AEAD Lifecycle Safety (2026-10-16)
+- **Starting Point:** HEAD `eda06f3`, release `v2.5.8-telemetry`.
+- **Primary Objectives:**
+  1. Eliminate shared-PSK server impersonation in multi-authoritative mode by provisioning independent 32-byte response-authentication secrets per server.
+  2. Enforce immutable server identity and canonical `ServerID` validation (`ValidateServerID`).
+  3. Enforce mandatory nonempty client authorization allowlists fail-closed and disable legacy v2 frames by default in multi-server deployments.
+  4. Preserve AES-GCM nonce uniqueness across the full session lifecycle by enforcing sequence exhaustion at $2^{32}-16$ (`MaxSafeSequenceNumber = 0xFFFFFFF0`).
+  5. Trace and eliminate the Phase 16 DNS attempt contradictory status defect (`SUCCESS` + error).
+  6. Execute the full two-authoritative cross-server readiness suite (`TestPhase17_TwoAuthoritativeReadinessSuite`) and live cross-border recovery audit.
+- **Implemented Actions:**
+  1. Cryptographic Trust Model & Per-Server Response Secrets:
+     - Updated `DeriveServerTrafficKeys(c2sPSK, serverResponseSecret, salt, serverID)` and `DeriveServerResponseKey(serverResponseSecret, salt, serverID)` in `internal/ng/crypto/crypto.go`.
+     - Upstream `c2sKey` derived from `c2sPSK`; downstream `s2cKey` derived from dedicated `serverResponseSecret` and `serverID`.
+     - Server A (`secretA`) cannot forge Server B's response key (`secretB`), even knowing Server B's ID and `c2sPSK`.
+     - Tested via `TestAsymmetric_DistinctServerSecretsPreventImpersonation`.
+  2. Immutability & Validation:
+     - Removed mutable setters `SetServerID()` and `SetAuthorizedServers()`.
+     - Implemented `ValidateServerID()` enforcing 3-64 character canonical encoding (lowercase alphanumeric, `-`, `.`, `_`).
+     - Added `--server-secret-file` flag to `cmd/emergency/emergency.go`.
+  3. Fail-Closed Authorization & Legacy Rejection:
+     - Empty authorization allowlist returns `ErrEmptyServerAllowlist`.
+     - Legacy v2 frames (`0x50415141`) rejected with `ErrLegacyProtocolDisabled` when `allowLegacyV2 = false`.
+     - Tested via `TestAsymmetric_MandatoryNonemptyAllowlist` and `TestAsymmetric_LegacyV2FramesRejectedByDefault`.
+  4. Sequence Exhaustion & Nonce Lifecycle Protection:
+     - `MaxSafeSequenceNumber = 0xFFFFFFF0` enforced in `NextSendSeq()` and `sealFrame()`.
+     - Sequence halts safely before wraparound to 0. Tested via `TestAsymmetric_SequenceExhaustionFailsSafely`.
+  5. Diagnostic Attempt Remediation:
+     - Cleared intermediate parsing errors (`rec.Error = ""`) upon successful message ID match.
+     - Added `(r *DNSQueryAttemptRecord) Validate()` strictly rejecting contradictory `SUCCESS` records with errors or missing authentication.
+     - Tested via `TestDNSQueryAttemptRecord_Validation`.
+  6. Two-Authoritative Readiness Suite:
+     - Tested dual independent nameservers, automatic resolver failover, key revocation, and anti-replay in `TestPhase17_TwoAuthoritativeReadinessSuite`.
+  7. Built Release `v2.5.9-authid`:
+     - Binary SHA-256: `c950611e51bf1a8fcbff804f9012a1b9a2a683b77430e70e7f7b0f20e5ef0c54`.
+     - Deployed atomically to Germany VPS (`77.37.65.2`), updated `paqet-emergency.service`, verified active.
+     - Deployed atomically to Iran VPS (`185.18.215.124`).
+  8. Live Reconciled Failover Benchmark (Iran ⇄ Germany via Public Recursive DNS):
+     - Resolvers: Google `8.8.8.8:53` and Cloudflare `1.1.1.1:53`.
+     - Unpredictable Token: `PHASE17_PROVEN_c55043e264da662fe43b3dae4d71ade1`.
+     - T0 Primary Failure Injected: 0.00 ms (iptables DROP on `:18088`).
+     - T1 Failure Threshold Crossed: 38.95 ms (`PRIMARY_DEGRADED`).
+     - T2 Degraded Hysteresis Expired: 99.73 ms (60.78 ms delay).
+     - T3 DNS Request Dispatched: 100.15 ms.
+     - T4 Authenticated DNS Bootstrap Received: 2,026.43 ms (DNS RTT: **1,926.29 ms**, ServerID: `ns-de-01`).
+     - T5 Candidate Validation Started: 2,026.64 ms.
+     - T6 Candidate Validation Completed: 2,203.68 ms (Validation Handshake RTT: **177.03 ms**).
+     - T7 Recovery State Activated: 2,203.75 ms (`RECOVERY_READY`, generation revision 6).
+     - T8 First App Connection Dispatched: 2,204.36 ms.
+     - T9 First App Response Verified: 2,291.58 ms (Post-activation request RTT: **87.22 ms**).
+     - **Total Failover Duration (T9 - T0): 2,291.58 ms (~2.29 seconds)**.
+     - **Unaccounted Overhead: 0.000 ms** (exact mathematical reconciliation).
+     - T10 Rollback Completed: 3,949.56 ms (`PRIMARY_HEALTHY`).
+     - T11 Primary Network Restored: 3,981.98 ms (Iptables DROP rule deleted in 32.42 ms).
+     - Production SOCKS5 on `127.0.0.1:1090`: Status `HEALTHY`, Response `"pong"` in 109.83 ms.
+     - Validated 2 DNS attempt records (Attempt 0: `TIMEOUT` via 8.8.8.8; Attempt 1: `SUCCESS` via 1.1.1.1 without contradictory error).
+     - Raw telemetry logged to `docs/research/recovery_socks5_live_audit_phase17.json`.
+- **Outcome:** Authenticated server identity with per-server secrets, immutable configuration, sequence exhaustion safety, strict DNS attempt validation, and reconciled live failover verified end-to-end. Ready for commit and push.

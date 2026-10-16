@@ -62,7 +62,10 @@ func TestDualAuthoritativeServerCrossServerRetriesAndReplay(t *testing.T) {
 	defer serverB.Stop()
 
 	sessionID := uint64(0x5555666677778888)
-	clientConn, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []string{"srv-de-01", "srv-nl-01"})
+	clientConn, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
+		{ServerID: "srv-de-01"},
+		{ServerID: "srv-nl-01"},
+	})
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSessionWithServers failed: %v", err)
 	}
@@ -267,7 +270,10 @@ func TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation(t *testing.
 
 	sessionID := uint64(0xAABBCCDDEEFF0011)
 	// Client authorizes ONLY srv-de-01 and srv-nl-01
-	clientConn, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []string{"srv-de-01", "srv-nl-01"})
+	clientConn, err := NewClientAsymmetricSessionWithServers(sessionID, psk, []AuthorizedServerEntry{
+		{ServerID: "srv-de-01"},
+		{ServerID: "srv-nl-01"},
+	})
 	if err != nil {
 		t.Fatalf("NewClientAsymmetricSessionWithServers failed: %v", err)
 	}
@@ -536,4 +542,132 @@ func TestMultiAuthoritative_FailoverAndServerRestart(t *testing.T) {
 	}
 	t.Logf("PASS: Attempt telemetry recorded %d attempts during failover (Attempt 0: %s, Attempt 1: %s)",
 		len(attempts), attempts[0].Status, attempts[1].Status)
+}
+
+func TestPhase17_TwoAuthoritativeReadinessSuite(t *testing.T) {
+	domainSuffix := "tunnel.phase17.test"
+	c2sPSK := []byte("c2s-shared-root-key-32-bytes-lon")
+	secretA := []byte("server-a-secret-32-bytes-long-11")
+	secretB := []byte("server-b-secret-32-bytes-long-22")
+
+	// 1. Initialize Server A (srv-de-01) with secretA
+	serverA, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          c2sPSK,
+		ServerID:     "srv-de-01",
+		ServerSecret: secretA,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				ServerID:  "srv-de-01",
+				Reply:     []byte("REPLY_FROM_A"),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start Server A failed: %v", err)
+	}
+	defer serverA.Stop()
+
+	// 2. Initialize Server B (srv-nl-01) with secretB
+	serverB, err := NewEmergencyDNSServer(EmergencyDNSServerConfig{
+		ListenAddr:   "127.0.0.1:0",
+		DomainSuffix: domainSuffix,
+		PSK:          c2sPSK,
+		ServerID:     "srv-nl-01",
+		ServerSecret: secretB,
+		Handler: func(msg *EmergencyMessage) (*EmergencyResponse, error) {
+			return &EmergencyResponse{
+				ID:        msg.ID,
+				Status:    "OK",
+				ServerID:  "srv-nl-01",
+				Reply:     []byte("REPLY_FROM_B"),
+				Timestamp: time.Now().Unix(),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start Server B failed: %v", err)
+	}
+	defer serverB.Stop()
+
+	// 3. Client configured with explicit per-server identities
+	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
+		Resolvers:         []string{serverA.Addr().String(), serverB.Addr().String()},
+		DomainSuffix:      domainSuffix,
+		ClientID:          "c17",
+		PSK:               c2sPSK,
+		SessionID:         0x1717171717171717,
+		Timeout:           3 * time.Second,
+		PerAttemptTimeout: 800 * time.Millisecond,
+		MaxRetries:        2,
+		ServerIdentities: []AuthorizedServerEntry{
+			{ServerID: "srv-de-01", ResponseSecret: secretA},
+			{ServerID: "srv-nl-01", ResponseSecret: secretB},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
+	}
+
+	// 4. Test normal request to Server A
+	respA, _, err := client.Exchange(context.Background(), &EmergencyMessage{
+		ID:        "msg-p17-001",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("Payload for A"),
+		Timestamp: time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("Exchange to Server A failed: %v", err)
+	}
+	if string(respA.Reply) != "REPLY_FROM_A" || respA.ServerID != "srv-de-01" {
+		t.Fatalf("Unexpected response from A: %+v", respA)
+	}
+	t.Logf("PASS: Verified authenticated reply from Server A with ServerID srv-de-01")
+
+	// 5. Test Server A failure and automatic retry/failover to Server B
+	serverA.Stop()
+	respB, _, err := client.Exchange(context.Background(), &EmergencyMessage{
+		ID:        "msg-p17-002",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("Payload for B"),
+		Timestamp: time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("Exchange failover to Server B failed: %v", err)
+	}
+	if string(respB.Reply) != "REPLY_FROM_B" || respB.ServerID != "srv-nl-01" {
+		t.Fatalf("Unexpected response from B: %+v", respB)
+	}
+	t.Logf("PASS: Verified clean failover to Server B with ServerID srv-nl-01")
+
+	// 6. Test Key Revocation: Revoke Server B's secret from client, verify fail-closed
+	revokedClient, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
+		Resolvers:    []string{serverB.Addr().String()},
+		DomainSuffix: domainSuffix,
+		ClientID:     "c17",
+		PSK:          c2sPSK,
+		SessionID:    0x1717171717171718,
+		Timeout:      1 * time.Second,
+		MaxRetries:   0,
+		ServerIdentities: []AuthorizedServerEntry{
+			{ServerID: "srv-de-01", ResponseSecret: secretA}, // srv-nl-01 revoked!
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmergencyDNSClient with revoked server failed: %v", err)
+	}
+	_, _, err = revokedClient.Exchange(context.Background(), &EmergencyMessage{
+		ID:        "msg-p17-revoked",
+		Type:      MsgTypeAlert,
+		Payload:   []byte("Test revoked"),
+		Timestamp: time.Now().Unix(),
+	})
+	if err == nil {
+		t.Fatalf("Expected fail-closed rejection for revoked server srv-nl-01, got nil")
+	}
+	t.Logf("PASS: Revoked server rejected fail-closed: %v", err)
 }

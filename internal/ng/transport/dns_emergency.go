@@ -462,6 +462,7 @@ type EmergencyDNSServerConfig struct {
 	DomainSuffix string
 	PSK          []byte
 	ServerID     string // Unique cryptographic identity of this authoritative server instance (e.g. "ns-de-01")
+	ServerSecret []byte // Dedicated 32-byte response secret (if nil, defaults to PSK for single-server standalone)
 	Handler      func(msg *EmergencyMessage) (*EmergencyResponse, error)
 }
 
@@ -553,6 +554,12 @@ func NewEmergencyDNSServer(cfg EmergencyDNSServerConfig) (*EmergencyDNSServer, e
 	}
 	if cfg.ServerID == "" {
 		cfg.ServerID = "ns-de-01"
+	}
+	if err := ValidateServerID(cfg.ServerID); err != nil {
+		return nil, fmt.Errorf("emergency dns: invalid server ID %q: %w", cfg.ServerID, err)
+	}
+	if len(cfg.ServerSecret) > 0 && len(cfg.ServerSecret) != 32 {
+		return nil, errors.New("emergency dns: ServerSecret must be exactly 32 bytes")
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
@@ -954,7 +961,11 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 
 	// 6. Seal response and cache it under session lock
 	entry.mu.Lock()
-	respSeq := entry.conn.NextSendSeq()
+	respSeq, err := entry.conn.NextSendSeq()
+	if err != nil {
+		entry.mu.Unlock()
+		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+	}
 	respFrame, err := entry.conn.sealFrame(respSeq, seq, respPlaintext)
 	if err != nil {
 		entry.mu.Unlock()
@@ -980,7 +991,7 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 	reqDigest [32]byte,
 ) []byte {
 	// 1. Ephemeral unpersisted session for candidate validation
-	candidateConn, err := NewServerAsymmetricSessionWithID(sessionID, s.cfg.PSK, s.cfg.ServerID)
+	candidateConn, err := NewServerAsymmetricSessionWithID(sessionID, s.cfg.PSK, s.cfg.ServerSecret, s.cfg.ServerID)
 	if err != nil {
 		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
 	}
@@ -1099,7 +1110,11 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 
 	// 6. Seal response and cache it
 	entry.mu.Lock()
-	respSeq := entry.conn.NextSendSeq()
+	respSeq, err := entry.conn.NextSendSeq()
+	if err != nil {
+		entry.mu.Unlock()
+		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
+	}
 	respFrame, err := entry.conn.sealFrame(respSeq, seq, respPlaintext)
 	if err != nil {
 		entry.mu.Unlock()
@@ -1117,6 +1132,18 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 	return dnsRespPacket
 }
 
+// Distinct terminal attempt statuses for DNS diagnostic records
+const (
+	DNSAttemptStatusSuccess           = "SUCCESS"
+	DNSAttemptStatusTimeout           = "TIMEOUT"
+	DNSAttemptStatusTruncatedTCP      = "TRUNCATED_FALLBACK_TCP"
+	DNSAttemptStatusProtocolFail      = "PROTOCOL_FAIL"
+	DNSAttemptStatusParseFail         = "PARSE_FAIL"
+	DNSAttemptStatusAuthFail          = "AUTH_FAIL"
+	DNSAttemptStatusAppValidationFail = "APP_VALIDATION_FAIL"
+	DNSAttemptStatusCanceled          = "CANCELED"
+)
+
 // DNSQueryAttemptRecord tracks detailed metrics and outcomes for each query attempt.
 type DNSQueryAttemptRecord struct {
 	AttemptIndex      int     `json:"attempt_index"`
@@ -1130,8 +1157,30 @@ type DNSQueryAttemptRecord struct {
 	Truncated         bool    `json:"truncated"`
 	Authenticated     bool    `json:"authenticated"`
 	ServerID          string  `json:"server_id"`
-	Status            string  `json:"status"` // "SUCCESS", "TIMEOUT", "TRUNCATED_FALLBACK_TCP", "AUTH_FAIL", "DROP"
+	Status            string  `json:"status"` // One of DNSAttemptStatus*
 	Error             string  `json:"error,omitempty"`
+}
+
+// Validate ensures attempt record has consistent status, error, and monotonic timing.
+func (r *DNSQueryAttemptRecord) Validate() error {
+	if r.Status == DNSAttemptStatusSuccess {
+		if r.Error != "" {
+			return fmt.Errorf("contradictory status: SUCCESS attempt has non-empty error %q", r.Error)
+		}
+		if !r.Authenticated {
+			return fmt.Errorf("contradictory status: SUCCESS attempt must be authenticated")
+		}
+		if r.ServerID == "" {
+			return fmt.Errorf("contradictory status: SUCCESS attempt must have authenticated server_id")
+		}
+	}
+	if r.SentAtMonotonicMs < 0 || r.RcvdAtMonotonicMs < 0 || r.DurationMs < 0 {
+		return fmt.Errorf("invalid negative timing values in attempt record")
+	}
+	if r.RcvdAtMonotonicMs > 0 && r.RcvdAtMonotonicMs < r.SentAtMonotonicMs {
+		return fmt.Errorf("non-monotonic attempt timing: rcvd (%f) < sent (%f)", r.RcvdAtMonotonicMs, r.SentAtMonotonicMs)
+	}
+	return nil
 }
 
 // EmergencyDNSClientConfig configures the emergency DNS client.
@@ -1145,8 +1194,10 @@ type EmergencyDNSClientConfig struct {
 	Timeout           time.Duration // Total timeout across all attempts
 	PerAttemptTimeout time.Duration // Timeout for an individual attempt (default 1500ms)
 	MaxRetries        int
-	EDNSBufferSize    uint16   // Advertised UDP buffer size in OPT RR (default 1232)
-	AuthorizedServers []string // Whitelist of authorized server IDs (fail closed if server ID not in list)
+	EDNSBufferSize    uint16                  // Advertised UDP buffer size in OPT RR (default 1232)
+	AuthorizedServers []string                // Simple whitelist of server IDs (uses PSK for response verification)
+	ServerIdentities  []AuthorizedServerEntry // Explicit per-server response secrets
+	AllowLegacyV2     bool                    // Reject legacy v2 frames if false
 }
 
 // EmergencyDNSClient sends authenticated application messages over public recursive DNS and verifies responses.
@@ -1196,9 +1247,26 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 		cfg.EDNSBufferSize = DefaultEDNSUDPPayloadSize
 	}
 
-	sess, err := NewClientAsymmetricSessionWithServers(cfg.SessionID, cfg.PSK, cfg.AuthorizedServers)
+	var entries []AuthorizedServerEntry
+	if len(cfg.ServerIdentities) > 0 {
+		entries = cfg.ServerIdentities
+	} else if len(cfg.AuthorizedServers) > 0 {
+		for _, s := range cfg.AuthorizedServers {
+			entries = append(entries, AuthorizedServerEntry{
+				ServerID:       s,
+				ResponseSecret: nil, // uses PSK
+			})
+		}
+	} else {
+		return nil, ErrEmptyServerAllowlist
+	}
+
+	sess, err := NewClientAsymmetricSessionWithServers(cfg.SessionID, cfg.PSK, entries)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.AllowLegacyV2 {
+		sess.SetAllowLegacyV2ForTest(true)
 	}
 
 	return &EmergencyDNSClient{
@@ -1224,7 +1292,10 @@ func (c *EmergencyDNSClient) Exchange(ctx context.Context, msg *EmergencyMessage
 		return nil, 0, fmt.Errorf("marshal message: %w", err)
 	}
 
-	seq := c.session.NextSendSeq()
+	seq, err := c.session.NextSendSeq()
+	if err != nil {
+		return nil, 0, fmt.Errorf("emergency client sequence exhausted: %w", err)
+	}
 	frame, err := c.session.sealFrame(seq, 0, reqBytes)
 	if err != nil {
 		return nil, 0, fmt.Errorf("seal frame: %w", err)
@@ -1458,6 +1529,7 @@ func (c *EmergencyDNSClient) attemptExchangeWithRecord(
 			rec.Status = "SUCCESS"
 			rec.Authenticated = true
 			rec.ServerID = serverID
+			rec.Error = "" // Explicitly clear any transient intermediate errors
 			resp.ServerID = serverID
 			return &resp, rec, nil
 		}
@@ -1574,6 +1646,7 @@ func (c *EmergencyDNSClient) attemptTCPExchangeWithRecord(
 		rec.Status = "SUCCESS"
 		rec.Authenticated = true
 		rec.ServerID = serverID
+		rec.Error = "" // Explicitly clear any transient intermediate errors
 		resp.ServerID = serverID
 		return &resp, rec, nil
 	}

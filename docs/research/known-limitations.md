@@ -146,3 +146,11 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 ## 16. Multi-Authoritative Control Plane Statelessness Requirement
 
 - **Multipart Incompatibility Across Uncoordinated Nameservers:** While single-datagram emergency messages ($\le 64\text{ bytes}$) operate seamlessly across independent authoritative nameservers, multi-packet fragmented messages require in-memory reassembly buffers that are local to each server instance. If resolver load-balancing splits fragments across two independent servers, neither server can complete reassembly. Therefore, multi-authoritative emergency DNS is strictly constrained to single-query messages ($\le 64\text{ bytes}$). General-purpose data tunnels cannot span uncoordinated multi-authoritative servers without a shared state coordination bus.
+
+---
+
+## 17. Multi-Authoritative Server Identity & Session Key Lifecycle Limits (Phase 17)
+
+- **Dedicated Per-Server Response Secrets:** In Phase 17, server-specific response secrets were established to eliminate shared-PSK impersonation. Multi-authoritative clients must be provisioned with the authorized mapping `ServerID -> ResponseSecret`. An authoritative server that is not provisioned with a dedicated secret cannot authenticate v3 responses to multi-authoritative clients.
+- **Session Sequence Counter Exhaustion:** To protect AES-GCM nonce uniqueness across the entire key lifetime, each asymmetric session enforces a hard stop at sequence $2^{32}-16$ (`0xFFFFFFF0`). When sequence space is exhausted, further transmissions fail with `ErrSequenceExhausted` fail-closed. Long-lived streaming over asymmetric channels must re-key or establish a new session before sequence exhaustion.
+- **Single-IP Infrastructure Dependency (Secondary NS Blocked):** Although the multi-authoritative cryptographic architecture is fully verified and proven mathematically sound, actual deployment of a secondary public nameserver (`ns2...`) remains externally blocked pending acquisition of an independent cloud VPS on a non-Hetzner autonomous system. All live endpoints currently share `77.37.65.2`.

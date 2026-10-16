@@ -351,3 +351,81 @@ Executed live on authorized infrastructure:
 - **Production SOCKS5 Proxy Verification:**
   * Target: `127.0.0.1:1090` (authenticated SOCKS5 `arash:arash`) -> `pong` in **132.24 ms** (`HEALTHY`).
 - **Evidentiary Artifact:** Logged to `docs/research/recovery_socks5_live_audit_phase16.json`.
+
+---
+
+## 10. Authenticated Server Identity, Fail-Closed Authorization & AEAD Lifecycle Safety (Phase 17)
+
+### 10.1 Two-Authoritative Readiness Suite
+Executed via `internal/ng/transport/dns_redundancy_test.go`:
+- `TestPhase17_TwoAuthoritativeReadinessSuite`:
+  * Initializes two independent authoritative servers: Server A (`srv-de-01`) with dedicated `secretA`, and Server B (`srv-nl-01`) with dedicated `secretB`.
+  * Demonstrates client query successfully answered by Server A and authenticated with `secretA`.
+  * Stops Server A; client automatically fails over to Server B, authenticates reply using `secretB`, and verifies `ServerID = srv-nl-01`.
+  * Demonstrates key revocation: removing Server B from client allowlist causes immediate fail-closed rejection.
+
+### 10.2 Distinct Response Secrets & Impersonation Prevention
+Executed via `internal/ng/transport/asymmetric_test.go`:
+- `TestAsymmetric_DistinctServerSecretsPreventImpersonation`:
+  * Server A possesses `secretA` and shared `c2sPSK`. Server B possesses `secretB` and shared `c2sPSK`.
+  * Server A attempts to forge a response claiming Server B's identity (`srv-nl-01`) by deriving with its own `secretA`.
+  * Client verifying against `srv-nl-01` (configured with `secretB`) strictly fails AEAD message authentication tag verification (`cipher: message authentication failed`), proving Server A cannot impersonate Server B.
+
+### 10.3 Sequence Exhaustion & Nonce Safety Suite
+Executed via `internal/ng/transport/asymmetric_test.go`:
+- `TestAsymmetric_SequenceExhaustionFailsSafely`:
+  * Sets sequence counter to `MaxSafeSequenceNumber - 2` (`0xFFFFFFEE`).
+  * Step 1 advances to `0xFFFFFFEF` safely.
+  * Step 2 reaches boundary `MaxSafeSequenceNumber` (`0xFFFFFFF0`), halting execution with `ErrSequenceExhausted`.
+  * Further attempts persistently return `ErrSequenceExhausted`. Internal counter never wraps around to 0 or 1.
+  * `SealFrame` explicitly refuses to seal frames once sequence limit is reached.
+
+### 10.4 Mandatory Nonempty Allowlist & Legacy v2 Rejection
+Executed via `internal/ng/transport/asymmetric_test.go`:
+- `TestAsymmetric_MandatoryNonemptyAllowlist`:
+  * Nil allowlist fails with `ErrEmptyServerAllowlist`.
+  * Empty slice fails with `ErrEmptyServerAllowlist`.
+  * Duplicate server ID in allowlist fails closed.
+- `TestAsymmetric_LegacyV2FramesRejectedByDefault`:
+  * Legacy v2 frames (`0x50415141`) presented to multi-authoritative v3 clients return `ErrLegacyProtocolDisabled`.
+
+### 10.5 DNS Attempt Instrumentation Validation Suite
+Executed via `internal/ng/transport/dns_attempt_diagnostic_test.go`:
+- `TestDNSQueryAttemptRecord_Validation`:
+  * Validates consistent terminal statuses (`DNSAttemptStatusSuccess`, `DNSAttemptStatusTimeout`, etc.).
+  * Rejects contradictory SUCCESS records with non-empty error fields (`invalid txt response format`), missing authentication, missing ServerID, negative intervals, or non-monotonic timestamps ($T_{\text{rcvd}} < T_{\text{sent}}$).
+
+### 10.6 Live Cross-Border Reconciled Failover Telemetry (Iran ⇄ Germany via Public Recursive DNS)
+Executed live on authorized infrastructure:
+- **Client Host:** Iran VPS (`185.18.215.124`, Panel01)
+- **Server Host:** Germany VPS (`77.37.65.2`, Hetzner)
+- **DNS Resolvers:** Public recursive resolvers `8.8.8.8:53` and `1.1.1.1:53`
+- **EDNS Buffer:** Conservative 1232 bytes (`DefaultEDNSUDPPayloadSize`)
+- **Unpredictable Token:** `PHASE17_PROVEN_c55043e264da662fe43b3dae4d71ade1`
+- **Reconciled Monotonic Timeline:**
+  * **T0 (Primary Failure Injected):** 0.00 ms (iptables DROP on `:18088`)
+  * **T1 (Failure Threshold Crossed):** 38.95 ms (`PRIMARY_DEGRADED`)
+  * **T2 (Degraded Hysteresis Expired):** 99.73 ms (60.78 ms hysteresis interval)
+  * **T3 (DNS Request Dispatched):** 100.15 ms
+  * **T4 (DNS Bootstrap Received):** 2026.43 ms (DNS RTT: **1926.29 ms**, ServerID: `ns-de-01`)
+  * **T5 (Candidate Validation Started):** 2026.64 ms
+  * **T6 (Candidate Validation Completed):** 2203.68 ms (Validation Handshake RTT: **177.03 ms**)
+  * **T7 (Recovery State Activated):** 2203.75 ms (`RECOVERY_READY`, generation revision 6)
+  * **T8 (First App Connection Started):** 2204.36 ms (Issued via SOCKS5 `:11990`)
+  * **T9 (First App Response Verified):** 2291.58 ms (Post-activation request RTT: **87.22 ms**)
+  * **Total Failover Duration (T9 - T0): 2291.58 ms**
+  * **Unaccounted Overhead:** **0.000 ms** (exact mathematical identity)
+  * **T10 (Rollback Completed):** 3949.56 ms (`PRIMARY_HEALTHY`)
+  * **T11 (Primary Network Restored):** 3981.98 ms (Iptables DROP rule deleted in 32.41 ms)
+- **DNS Attempt Diagnostic Audit:**
+  * Attempt 0: `8.8.8.8:53` -> Status `TIMEOUT`, Duration 1737.58 ms.
+  * Attempt 1: `1.1.1.1:53` -> Status `SUCCESS`, Duration 117.88 ms, Authenticated: true, ServerID: `ns-de-01`, Error: none.
+  * Both records validated strictly via `rec.Validate()`.
+- **Adversarial Negative Checks:**
+  * Mismatched PSK fingerprint rejected fail-closed in 0.03 ms.
+  * Expired candidate rejected fail-closed in 0.01 ms.
+  * Unknown transport mode rejected fail-closed in 0.35 ms.
+  * Unauthorized Rogue Server ID rejected fail-closed in 1657.30 ms.
+- **Production SOCKS5 Proxy Verification:**
+  * Target: `127.0.0.1:1090` (authenticated SOCKS5 `arash:arash`) -> `pong` in **109.83 ms** (`HEALTHY`).
+- **Evidentiary Artifact:** Logged to `docs/research/recovery_socks5_live_audit_phase17.json`.

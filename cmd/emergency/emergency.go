@@ -44,6 +44,7 @@ var (
 	bootstrapConfigFile string
 	disableBootstrap    bool
 	serverID            string
+	serverSecretFile    string
 )
 
 func init() {
@@ -56,6 +57,7 @@ func init() {
 	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
 	serverCmd.Flags().StringVar(&serverID, "server-id", "ns-de-01", "Authoritative server cryptographic identity for multi-server domain separation")
+	serverCmd.Flags().StringVar(&serverSecretFile, "server-secret-file", "", "Path to file containing dedicated 32-byte server response secret")
 	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (required if --bootstrap-config and --disable-bootstrap are not set)")
 	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
@@ -69,6 +71,7 @@ func init() {
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	sendCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	sendCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
+	sendCmd.Flags().StringVar(&serverID, "server-id", "ns-de-01", "Expected authoritative server ID to authorize")
 	sendCmd.Flags().StringVar(&clientID, "client-id", "c01", "Client ID string (max 4 chars)")
 	sendCmd.Flags().StringVarP(&messageStr, "message", "m", "EMERGENCY_PING", "Application payload to transmit")
 	sendCmd.Flags().IntVar(&timeoutSec, "timeout", 5, "Timeout in seconds for response")
@@ -227,11 +230,21 @@ var serverCmd = &cobra.Command{
 		}
 		bm.SetAuthoritativeServerID(serverID)
 
+		var serverSecret []byte
+		if serverSecretFile != "" {
+			var err error
+			serverSecret, err = parseKey("", serverSecretFile)
+			if err != nil {
+				log.Fatalf("failed to load server secret file: %v", err)
+			}
+		}
+
 		srv, err := transport.NewEmergencyDNSServer(transport.EmergencyDNSServerConfig{
 			ListenAddr:   listenAddr,
 			DomainSuffix: domainSuffix,
 			PSK:          psk,
 			ServerID:     serverID,
+			ServerSecret: serverSecret,
 			Handler: func(msg *transport.EmergencyMessage) (*transport.EmergencyResponse, error) {
 				// Privacy and Security: Log only metadata, never plaintext payload or key material
 				log.Printf("[EMERGENCY-SERVER] Authenticated message ID=%s Type=%s PayloadBytes=%d ClientID=%s Status=PROCESSED",
@@ -296,12 +309,13 @@ var sendCmd = &cobra.Command{
 		}
 
 		client, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-			ResolverAddr: resolverAddr,
-			DomainSuffix: domainSuffix,
-			ClientID:     clientID,
-			PSK:          psk,
-			Timeout:      time.Duration(timeoutSec) * time.Second,
-			MaxRetries:   2,
+			ResolverAddr:      resolverAddr,
+			DomainSuffix:      domainSuffix,
+			ClientID:          clientID,
+			PSK:               psk,
+			Timeout:           time.Duration(timeoutSec) * time.Second,
+			MaxRetries:        2,
+			AuthorizedServers: []string{serverID},
 		})
 		if err != nil {
 			log.Fatalf("failed to initialize emergency client: %v", err)

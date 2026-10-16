@@ -76,17 +76,19 @@ func TestAEADEncryptDecrypt(t *testing.T) {
 }
 
 func TestDeriveServerTrafficKeys(t *testing.T) {
-	psk := []byte("super-secret-password-1234567890123456")
+	c2sPSK := []byte("super-secret-password-1234567890123456")
+	secretA := []byte("server-a-response-secret-1111111")
+	secretB := []byte("server-b-response-secret-2222222")
 	salt := []byte("session-salt-12345")
 
-	// Deriving for server A
-	c2sA, s2cA, err := DeriveServerTrafficKeys(psk, salt, "ns-de-01")
+	// Deriving for server A with secretA
+	c2sA, s2cA, err := DeriveServerTrafficKeys(c2sPSK, secretA, salt, "ns-de-01")
 	if err != nil {
 		t.Fatalf("DeriveServerTrafficKeys ns-de-01 failed: %v", err)
 	}
 
-	// Deriving for server B
-	c2sB, s2cB, err := DeriveServerTrafficKeys(psk, salt, "ns2-nl-01")
+	// Deriving for server B with secretB
+	c2sB, s2cB, err := DeriveServerTrafficKeys(c2sPSK, secretB, salt, "ns2-nl-01")
 	if err != nil {
 		t.Fatalf("DeriveServerTrafficKeys ns2-nl-01 failed: %v", err)
 	}
@@ -96,17 +98,26 @@ func TestDeriveServerTrafficKeys(t *testing.T) {
 		t.Fatalf("client-to-server keys must be identical across server instances")
 	}
 
-	// s2c keys (server-to-client) MUST be distinct to prevent cross-server key/nonce reuse
+	// s2c keys (server-to-client) MUST be distinct
 	if bytes.Equal(s2cA, s2cB) {
 		t.Fatalf("server-to-client response keys for distinct server IDs must be distinct")
 	}
 
-	// Single derivation check
-	s2cOnlyA, err := DeriveServerResponseKey(psk, salt, "ns-de-01")
+	// Security Invariant: Server A (holding secretA) attempting to derive Server B's key CANNOT match Server B
+	forgedB, err := DeriveServerResponseKey(secretA, salt, "ns2-nl-01")
 	if err != nil {
 		t.Fatalf("DeriveServerResponseKey failed: %v", err)
 	}
-	if !bytes.Equal(s2cA, s2cOnlyA) {
-		t.Fatalf("DeriveServerResponseKey must match DeriveServerTrafficKeys for identical serverID")
+	if bytes.Equal(forgedB, s2cB) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: Server A forged Server B's response key!")
+	}
+
+	// Genuine derivation for Server B
+	genuineB, err := DeriveServerResponseKey(secretB, salt, "ns2-nl-01")
+	if err != nil {
+		t.Fatalf("DeriveServerResponseKey failed: %v", err)
+	}
+	if !bytes.Equal(genuineB, s2cB) {
+		t.Fatalf("Genuine derivation for Server B must match DeriveServerTrafficKeys")
 	}
 }

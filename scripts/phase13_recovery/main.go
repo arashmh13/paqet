@@ -143,10 +143,11 @@ func main() {
 
 			// Build emergency query client
 			client, err := transport.NewEmergencyDNSClient(transport.EmergencyDNSClientConfig{
-				ResolverAddr: *dnsServerAddr,
-				DomainSuffix: *domainSuffix,
-				PSK:          psk,
-				ClientID:     "c13",
+				ResolverAddr:      *dnsServerAddr,
+				DomainSuffix:      *domainSuffix,
+				PSK:               psk,
+				ClientID:          "c13",
+				AuthorizedServers: []string{"ns-de-01", "default"},
 			})
 			if err != nil {
 				return nil, fmt.Errorf("create emergency client: %w", err)

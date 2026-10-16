@@ -290,12 +290,13 @@ func TestEDNS0_TCPPort53FallbackOnTruncation(t *testing.T) {
 
 	// Create client with conservative 1232-byte EDNS buffer
 	client, err := NewEmergencyDNSClient(EmergencyDNSClientConfig{
-		ResolverAddr:   addrStr,
-		DomainSuffix:   "edns.test",
-		ClientID:       "c01",
-		PSK:            psk,
-		Timeout:        1 * time.Second,
-		EDNSBufferSize: 1232,
+		ResolverAddr:      addrStr,
+		DomainSuffix:      "edns.test",
+		ClientID:          "c01",
+		PSK:               psk,
+		Timeout:           1 * time.Second,
+		EDNSBufferSize:    1232,
+		AuthorizedServers: []string{"ns-de-01"},
 	})
 	if err != nil {
 		t.Fatalf("NewEmergencyDNSClient failed: %v", err)
