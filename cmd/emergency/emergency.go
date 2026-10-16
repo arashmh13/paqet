@@ -441,6 +441,7 @@ var serverCmd = &cobra.Command{
 			ServerID:             serverID,
 			ServerSecret:         serverSecret,
 			IsLegacySingleServer: legacySingleServer,
+			ProtocolV4:           protocolV4,
 			Handler: func(msg *transport.EmergencyMessage) (*transport.EmergencyResponse, error) {
 				// Privacy and Security: Log only metadata, never plaintext payload or key material
 				log.Printf("[EMERGENCY-SERVER] Authenticated message ID=%s Type=%s PayloadBytes=%d ClientID=%s Status=PROCESSED",
