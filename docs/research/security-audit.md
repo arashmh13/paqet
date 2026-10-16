@@ -197,3 +197,50 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
 - **Tested & Proven:**
   * Automated regression test: `TestSOCKS5_LiveApplicationRecoveryFlow` (`go test -race`).
   * Live cross-border test: Iran VPS (`185.18.215.124`) to Germany VPS (`77.37.65.2`), dedicated isolated SOCKS5 port `11990`, remote HTTP origin `18999`, byte-exact matching of unpredictable token `PHASE13_VERIFIED_d801ccd52db40996f515b68b3155e6cf` in 175.47ms while production SOCKS5 on `1090` remained completely unaffected.
+
+---
+
+## 10. Complete Transport Authentication, Configurable Mode-Aware Bootstrap & Connection Identity Tracking (Phase 14)
+
+### 10.1 Explicit, Versioned Endpoint Identity Model
+- **Prior Semantic Ambiguity:** Earlier bootstrap models stored key fingerprints in a field named `ServerPubKey`. This created dangerous ambiguity: symmetric PSK fingerprints were labeled as public keys, and the validator lacked explicit identity scheme tagging across `aead-stream`, `tls-outer`, and `raw-kcp`.
+- **Version 2 Explicit Identity Architecture:**
+  1. `EndpointIdentityType` defines three explicit types:
+     * `IdentityTypePSKID` (`"psk-id"`): Identifies AEAD or Raw-KCP endpoints via the SHA-256 fingerprint of the shared symmetric key.
+     * `IdentityTypeCertPin` (`"cert-pin"`): Identifies TLS endpoints via the SHA-256 fingerprint of the server's leaf X.509 certificate.
+     * `IdentityTypePubKeyPin` (`"pubkey-pin"`): Identifies TLS or asymmetric endpoints via the SHA-256 fingerprint of the server's public key.
+  2. Mode-Specific Enforcement:
+     * `ModeTLSStream` strictly requires `IdentityTypeCertPin` or `IdentityTypePubKeyPin`. Attempting to pair TLS with `psk-id` fails closed.
+     * `ModeAEADStream` and `ModeRawKCP` strictly require `IdentityTypePSKID`. Attempting to pair AEAD or Raw-KCP with `cert-pin` fails closed.
+  3. `BootstrapEndpointData` and `RecoveryEndpointSnapshot` preserve `IdentityType`, `IdentityValue`, `RecoveryGen`, and `RequestID`.
+
+### 10.2 Genuine Raw-KCP Candidate Handshake Validation
+- **Prior Defect:** In early iterations, `ModeRawKCP` candidate validation merely compared the configured local key fingerprint without establishing a network connection or authenticating the remote server.
+- **Remediation & Handshake Requirements:**
+  1. `BuildCandidateValidator` now requires `RawKCPDialer` for `ModeRawKCP`.
+  2. The validator dials the candidate address and completes an actual raw-KCP packet handshake.
+  3. Establishes an smux stream over the connection.
+  4. Writes `protocol.PPING` and requires `protocol.PPONG` within a strict context deadline.
+  5. Deterministically closes temporary socket resources.
+  6. Verified across 8 negative and positive adversarial tests (`TestRawKCPCandidateValidation_AllNegativeAndPositiveCases`): no listening server, plain TCP on port, wrong key, pin mismatch, invalid protocol response, cancellation/timeout, and post-validation failure.
+
+### 10.3 Mode-Aware, Configurable Bootstrap Management
+- **Prior Hard-Coding:** The authoritative emergency DNS server previously hard-coded the Germany server IP (`77.37.65.2`) and derived identity values solely from the emergency PSK.
+- **Remediation:**
+  1. Introduced `BootstrapManager` and `BootstrapEndpointRecord` in `dns_emergency.go`.
+  2. Supports explicit candidate configuration via `--bootstrap-config`, `--bootstrap-ip`, `--bootstrap-cert`, `--bootstrap-key-file`, and `--bootstrap-pin`.
+  3. `computeCertFingerprint` extracts genuine leaf certificate SHA-256 digests from PEM certificates at startup.
+  4. Fails fast at startup if a requested mode lacks required identity credentials (e.g. TLS without certificate or pin).
+  5. When responding to `bootstrap_request`, maps the requested mode to the authorized record and binds response to `RecoveryGen` and `RequestID`.
+  6. Leaves `ServerPubKey` empty when `IdentityValue` is present, saving 80+ bytes and keeping DNS replies compact for single-datagram recursive DNS traversal.
+
+### 10.4 Typed Connection Identity Tracking & Elimination of Implicit Fallback
+- **Prior Defect:** `timed_conn.go` previously checked only `snapshot.Addr()`. A mode or generation change at the same IP:port was ignored. Furthermore, candidate dial errors fell through to the primary transport selection.
+- **Remediation:**
+  1. Added `ConnectionIdentity` tracking `RemoteAddr`, `TransportMode`, `Generation`, `IdentityType`, `IdentityValue`, and `IsRecovery`.
+  2. `desiredIdentity()` dynamically computes the expected connection parameters based on recovery state and snapshot generation.
+  3. `newConn()` detects any mismatch (`!currentIdentity.Matches(desired)`) and recreates the connection.
+  4. Eliminated implicit fallback: candidate dial errors report failure to `RecoveryStateMachine` and immediately return an actionable error. Dials never fall through to the primary transport during `RECOVERY_READY`.
+  5. Bounded `newStrm` retry loop (max 5 retries with exponential backoff) with strict context deadline handling.
+  6. Audited `sendTCPF`: disabled on candidate connections and guarded against execution on dying sockets.
+  7. Tested live across Iran ⇄ Germany using public recursive resolver `8.8.8.8:53` with byte-exact token match (`PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd`). Production SOCKS5 healthy.

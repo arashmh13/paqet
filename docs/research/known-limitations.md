@@ -113,3 +113,11 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 - **Demonstrated Scope (Phase 13):** The recovery state machine, candidate validator, and client tunnel pool dynamically route **new connection requests** through the authenticated recovery candidate when the primary transport fails.
 - **What It Does NOT Do:** It does **not** transparently migrate in-flight established TCP byte-streams that were actively transferring data at the instant of transport failure without stream reset. Active TCP connections interrupted mid-flight return EOF/reset to the local application, and the application's subsequent request seamlessly traverses the activated recovery candidate.
 - **Operational Reality:** Seamless in-flight stream migration requires end-to-end transport-layer connection splicing or user-space session reconstruction (e.g. MPTCP or QUIC connection migration), which is not part of standard SOCKS5 streaming. Applications using standard retry logic (browsers, cURL, background sync) recover automatically.
+
+---
+
+## 14. Single-IP Destination Failure Domain vs. Multi-Cloud Diversity
+
+- **Empirical Scope (Phase 14):** In Phase 14, failover between primary (`77.37.65.2:18088`) and candidate (`77.37.65.2:18089`) was proven across the international border under targeted port-level blocking.
+- **Explicit Boundary:** Because both the primary transport, candidate transport, and authoritative emergency DNS daemon are hosted on `77.37.65.2` (Hetzner AS24940), this test proves **port-level and process-level failover resilience**, not IP-level or ASN-level survival.
+- **Unverified Invariant:** If the censor blocks destination IP `77.37.65.2` entirely, both the proxy data plane and emergency control plane are severed. Survival of IP blocking requires deploying candidate endpoints and a secondary authoritative nameserver (`ns2...`) on an independent cloud provider and distinct BGP autonomous system (see `docs/research/failure_domain_resilience_matrix.md`). Do not claim IP-block survival until independent cloud infrastructure is provisioned.

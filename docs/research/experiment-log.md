@@ -547,3 +547,53 @@
      - Step G Restoration: Iptables test rule deleted in **10.47 ms**. Production SOCKS5 proxy on `127.0.0.1:1090` remained completely unaffected throughout test (`pong`).
      - Documented in `docs/research/recovery_socks5_live_audit.json`.
 - **Outcome:** Evidentiary gap completely closed. Structured recovery snapshot architecture, authenticating candidate validation, and real SOCKS5 failover proven across international censorship boundary. Production services healthy and rollback-ready.
+
+---
+
+## Cycle 22: Phase 14 Transport Authentication Completeness, Failover Consistency & Failure-Domain Resilience
+- **Objective:** Eliminate ambiguous identity semantics; enforce mode-aware identity types (`psk-id`, `cert-pin`, `pubkey-pin`); implement actual remote raw-KCP candidate handshake validation with stream creation and protocol ping/pong verification; build mode-aware, configurable `BootstrapManager` eliminating hardcoded IPs; track typed `ConnectionIdentity` in client tunnel pool; eliminate implicit fallback on candidate failure; prove live application recovery via public recursive DNS (`8.8.8.8:53`) across the international border; establish failure-domain resilience matrix.
+- **Actions:**
+  1. Explicit Versioned Identity Model (`BootstrapEndpointData` & `RecoveryEndpointSnapshot`):
+     - Defined `EndpointIdentityType`: `IdentityTypePSKID` (`"psk-id"`), `IdentityTypeCertPin` (`"cert-pin"`), and `IdentityTypePubKeyPin` (`"pubkey-pin"`).
+     - Separated mode-specific validation: `ModeTLSStream` requires certificate or public-key pin; `ModeAEADStream` and `ModeRawKCP` require PSK key identifier. Mismatched pairings fail closed.
+     - Preserved `IdentityType`, `IdentityValue`, `RecoveryGen`, and `RequestID` across snapshots.
+     - Enforced `ValidUntil <= now.Unix()` as strictly expired.
+  2. Genuine Remote Raw-KCP Candidate Handshake Validation:
+     - Updated `BuildCandidateValidator` with `RawKCPDialer`. Dials candidate, opens smux stream, sends `protocol.PPING`, and verifies `protocol.PPONG` within context deadline.
+     - Deterministically closes temporary socket resources.
+     - Tested across 8 negative and positive cases (`TestRawKCPCandidateValidation_AllNegativeAndPositiveCases`).
+  3. Configurable Mode-Aware Bootstrap Generation:
+     - Introduced `BootstrapManager` and `BootstrapEndpointRecord` in `dns_emergency.go`.
+     - Supports `--bootstrap-config`, `--bootstrap-ip`, `--bootstrap-cert`, `--bootstrap-key-file`, `--bootstrap-pin`.
+     - Validates candidate records at startup; fails fast if TLS lacks certificate or pin.
+     - Leaves `ServerPubKey` empty when `IdentityValue` is present, saving 80+ bytes to ensure single-packet DNS responses.
+  4. Client Connection Identity Tracking & Elimination of Implicit Fallback:
+     - Added `ConnectionIdentity` to `timed_conn.go` tracking `RemoteAddr`, `TransportMode`, `Generation`, `IdentityType`, `IdentityValue`, and `IsRecovery`.
+     - `desiredIdentity()` computes expected connection attributes; `newConn()` detects any change and recreates the connection.
+     - Candidate dial errors report failure to `RecoveryStateMachine` and return errors immediately without falling through to primary.
+     - Bounded `newStrm` retry loop (5 attempts with exponential backoff) respecting context cancellation.
+     - Guarded `sendTCPF` against execution on candidate connections or dying sockets.
+  5. RFC 6891 EDNS0 Support for Large Recursive DNS Responses:
+     - Added EDNS0 OPT pseudo-RR (4096-byte UDP buffer) to `BuildDNSQuery`.
+     - Mirrored EDNS0 OPT RR in `BuildDNSTXTResponse` when query contains `ARCOUNT > 0`.
+     - Allows public recursive resolvers (Google `8.8.8.8`) to return full responses without truncation or drops.
+  6. Failure-Domain Resilience Matrix (`docs/research/failure_domain_resilience_matrix.md`):
+     - Defined technical demarcation between port-level failover, transport mode switching, destination-IP blocking, and ASN/provider censorship.
+     - Documented single-IP Hetzner host SPOF and preconditions for secondary authoritative nameserver (`ns2...`).
+  7. Built Release `v2.5.6-complete`:
+     - WSL build: SHA-256 `d4043086e3883dd7bacc76fa5d9e0e2efc5f79794559790dfbc262174110b5af`.
+     - Deployed binary to Germany VPS; updated `paqet-emergency.service` and verified active.
+  8. Live Cross-Border SOCKS5 Recovery via Public Recursive DNS (Iran ⇄ Germany):
+     - Client Host: Iran VPS (`185.18.215.124`, Panel01); Server Host: Germany VPS (`77.37.65.2`, Hetzner).
+     - Local Proxy: `127.0.0.1:11990`; Remote Origin: `127.0.0.1:18999`; Resolver: Google `8.8.8.8:53`.
+     - Unpredictable Token: `PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd`.
+     - Step A Baseline: SOCKS5 request through primary `:18088` returned token in **86.61 ms** (match verified).
+     - Step B Failure: Applied `iptables -I OUTPUT -p tcp -d 77.37.65.2 --dport 18088 -j DROP` in **7.04 ms**. Primary request failed (`Client.Timeout`). Transition to `PRIMARY_DEGRADED`.
+     - Step C Signaling: Emergency DNS query sent via Google recursor `8.8.8.8:53`. Authenticated bootstrap reply received in **132.39 ms** (`ID=msg-4d01a2d30123c909ac99b329570b67da`, status `OK`, replyBytes `302`). Parsed candidate `77.37.65.2:18089` (`mode: aead-stream`, `type: psk-id`, `val: SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d`, `gen: 1`).
+     - Step D Validation: Candidate validation handshake executed in **175.11 ms**. Remote AEAD key derivation, smux session, and protocol `PPING`/`PPONG` verified. State transitioned to `RECOVERY_READY` with generation revision 6.
+     - Step E Recovery: Real application HTTP request through SOCKS5 `:11990` dynamically detected identity mismatch and routed connection to candidate `77.37.65.2:18089`. HTTP 200 returned in **179.16 ms**, matching token `PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd` byte-exact!
+     - Step F Adverse Checks: Mismatched fingerprint rejected (0.02ms); expired bootstrap rejected (0.01ms); incompatible TLS + PSK ID rejected (0.01ms).
+     - Step G Rollback: `ResetRollback` cleared active snapshot in **0.00 ms**; restored `PRIMARY_HEALTHY`.
+     - Step H Restoration: Iptables test rule deleted in **6.04 ms**. Production SOCKS5 on `127.0.0.1:1090` returned `pong` (healthy throughout).
+     - Documented in `docs/research/recovery_socks5_live_audit_phase14.json`.
+- **Outcome:** Complete transport authentication, failover consistency, connection identity tracking, and live public recursive DNS recovery verified end-to-end. Production services healthy and rollback-ready.

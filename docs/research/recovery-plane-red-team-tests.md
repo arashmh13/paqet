@@ -174,3 +174,62 @@ Executed live on authorized infrastructure:
   7. **Step G Restoration:** Iptables rule deleted in **10.47 ms**; test services stopped.
   8. **Production SOCKS5 Health:** Checked `127.0.0.1:1090` -> returned `pong` (HTTP 200, unmodified and fully operational throughout).
 - **Evidentiary Proof:** Complete JSON audit trail logged to `docs/research/recovery_socks5_live_audit.json`.
+
+---
+
+## 7. Phase 14 Complete Transport Authentication, Failover Consistency & Public Recursive DNS Verification
+
+### 7.1 Comprehensive Raw-KCP Candidate Handshake Negative Suite
+Executed via `TestRawKCPCandidateValidation_AllNegativeAndPositiveCases`:
+1. **Case 1 (No Listening Server):** Dialer returns connection refused -> fails closed with `ErrCandidateValidation`.
+2. **Case 2 (Plain TCP Server on Port):** Non-KCP stream dropped -> fails closed with `ErrCandidateValidation`.
+3. **Case 3 (Server With Wrong Key):** Handshake packet decryption / auth error -> fails closed with `ErrCandidateValidation`.
+4. **Case 4 (Incorrect Identity Pin):** Mismatched `IdentityValue` fingerprint -> fails closed immediately before dialing.
+5. **Case 5 (Invalid Protocol Response):** Server returns invalid protocol response (non-PPONG) -> fails closed with `ErrCandidateValidation`.
+6. **Case 6 (Successful Candidate):** Remote handshake + stream open + `PPING`/`PPONG` roundtrip verified -> succeeds (`nil`). Temporary socket closed deterministically.
+7. **Case 7 (Timeout / Cancellation):** Context cancellation -> fails closed deterministically.
+8. **Case 8 (Post-Validation Server Outage):** Candidate validated, but goes down before first client dial -> dial failure detected, candidate failure reported, enters `COOLDOWN`.
+
+### 7.2 Explicit Endpoint Identity Type Verification Suite
+Executed via `TestModeAwareIdentityValidation_SeparateRulesPerMode`:
+- `ModeTLSStream` with `IdentityTypePSKID` fails closed (illegal for TLS).
+- `ModeAEADStream` with `IdentityTypeCertPin` fails closed (illegal for AEAD).
+- `ModeRawKCP` with `IdentityTypeCertPin` fails closed (illegal for Raw-KCP).
+- Valid pairings (`tls-outer` + `cert-pin`, `aead-stream` + `psk-id`) pass validation.
+
+### 7.3 Configurable Bootstrap Manager Round-Trip
+Executed via `TestBootstrapManager_RoundTripAndModeAwareGeneration`:
+- Generates version 2 records for `aead-stream`, `tls-outer`, and `raw-kcp`.
+- Binds response to request ID, validity timestamp, and recovery generation token.
+- Rejects unconfigured transport mode requests with actionable error.
+
+### 7.4 Client Connection Pool & Identity Tracking Suite
+Executed via `internal/client/connection_identity_test.go`:
+- `TestConnectionIdentity_Matches`: Validates equivalence across `RemoteAddr`, `TransportMode`, `Generation`, `IdentityType`, `IdentityValue`, and `IsRecovery`.
+- `TestTimedConn_SameAddressModeChangeRecreates`: Recreates connection when transport mode changes at the same IP:port.
+- `TestTimedConn_EliminateImplicitFallbackOnCandidateFailure`: Confirms that candidate failure returns an error, reports candidate failure, and does NOT fall through to primary.
+- `TestClient_NewStrmContextCancellationStopsLoop`: Confirms that `newStrm` respects context cancellation and does not tight loop.
+
+### 7.5 Live Cross-Border Recovery via Public Recursive DNS (Google 8.8.8.8:53)
+Executed live on authorized infrastructure:
+- **Client Host:** Iran VPS (`185.18.215.124`, Panel01)
+- **Server Host:** Germany VPS (`77.37.65.2`, Hetzner)
+- **DNS Path Type:** `public_recursive` via `8.8.8.8:53` (delegated child zone `*.tunnel...ir` -> `ns-de...` -> `77.37.65.2`)
+- **EDNS0 RFC 6891 Buffer:** 4096-byte OPT buffer advertised in query and mirrored in response.
+- **Unpredictable Token:** `PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd`
+- **Execution & Latency Metrics:**
+  1. **Step A Baseline:** SOCKS5 request (`127.0.0.1:11990`) served via primary (`77.37.65.2:18088`). Received HTTP 200 in **86.61 ms**. Token verified byte-exact.
+  2. **Step B Primary Failure:** Applied `iptables -I OUTPUT -p tcp -d 77.37.65.2 --dport 18088 -j DROP` in **7.04 ms**. Primary request failed (`Client.Timeout`). Transition to `PRIMARY_DEGRADED`.
+  3. **Step C Emergency Signaling via Public Resolver:** Client sent emergency query to Google recursor `8.8.8.8:53`. Received authenticated bootstrap response in **132.39 ms** (`ID=msg-4d01a2d30123c909ac99b329570b67da`, status `OK`, replyBytes `302`). Parsed candidate `77.37.65.2:18089` (`mode: aead-stream`, `type: psk-id`, `val: SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d`, `gen: 1`).
+  4. **Step D Remote Validation Handshake:** Client performed remote AEAD handshake to `77.37.65.2:18089` in **175.11 ms**. Protocol `PPING`/`PPONG` verified. State transitioned to `RECOVERY_READY` (generation revision 6).
+  5. **Step E Real Application SOCKS5 Recovery:** SOCKS5 request through `127.0.0.1:11990` dynamically detected identity mismatch and routed connection to candidate `77.37.65.2:18089`:
+     `[CONNECTION-SWITCH] Connection identity mismatch (current: 77.37.65.2:18088 aead-stream gen=0 recov=false, desired: 77.37.65.2:18089 aead-stream gen=6 recov=true), recreating...`
+     `[RECOVERY-FAILOVER] Routing connection to validated recovery candidate 77.37.65.2:18089 (aead-stream, gen=6)`
+     Received HTTP 200 from remote test origin in **179.16 ms**. Unpredictable token matched byte-exact!
+  6. **Step F Adversarial Negative Checks:**
+     - Mismatched candidate identity fingerprint rejected fail-closed in 0.02ms.
+     - Expired bootstrap coordinates rejected fail-closed in 0.01ms.
+     - Incompatible identity type (TLS with PSK ID) rejected fail-closed in 0.01ms.
+  7. **Step G Deterministic Rollback:** `ResetRollback` cleared snapshot in 0.00ms; restored `PRIMARY_HEALTHY`.
+  8. **Step H Restoration & Production Health:** Iptables rule deleted in 6.04ms. Production SOCKS5 on `127.0.0.1:1090` returned `pong` (HTTP 200, healthy throughout).
+- **Evidentiary Proof:** Complete JSON audit trail logged to `docs/research/recovery_socks5_live_audit_phase14.json`.

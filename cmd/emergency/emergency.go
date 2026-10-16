@@ -3,9 +3,11 @@ package emergency
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -23,18 +25,23 @@ import (
 )
 
 var (
-	listenAddr    string
-	resolverAddr  string
-	domainSuffix  string
-	keyStr        string
-	keyFile       string
-	clientID      string
-	messageStr    string
-	timeoutSec    int
-	scanResolvers string
-	scanCacheFile string
-	bootstrapPort int
-	bootstrapMode string
+	listenAddr          string
+	resolverAddr        string
+	domainSuffix        string
+	keyStr              string
+	keyFile             string
+	clientID            string
+	messageStr          string
+	timeoutSec          int
+	scanResolvers       string
+	scanCacheFile       string
+	bootstrapIP         string
+	bootstrapPort       int
+	bootstrapMode       string
+	bootstrapCertFile   string
+	bootstrapKeyFile    string
+	bootstrapPin        string
+	bootstrapConfigFile string
 )
 
 func init() {
@@ -46,8 +53,13 @@ func init() {
 	serverCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
+	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (default $PAQET_BOOTSTRAP_IP or 77.37.65.2)")
 	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
+	serverCmd.Flags().StringVar(&bootstrapCertFile, "bootstrap-cert", "", "Path to certificate file for TLS candidate fingerprint computation")
+	serverCmd.Flags().StringVar(&bootstrapKeyFile, "bootstrap-key-file", "", "Path to key file for AEAD/Raw-KCP candidate fingerprint computation")
+	serverCmd.Flags().StringVar(&bootstrapPin, "bootstrap-pin", "", "Explicit canonical SHA256:<64 hex> identity pin")
+	serverCmd.Flags().StringVar(&bootstrapConfigFile, "bootstrap-config", "", "Path to JSON/YAML file containing candidate endpoint records")
 
 	sendCmd.Flags().StringVar(&resolverAddr, "resolver", "8.8.8.8:53", "Recursive DNS resolver address (e.g. 8.8.8.8:53)")
 	sendCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
@@ -69,6 +81,119 @@ var Cmd = &cobra.Command{
 	Short: "Authenticated emergency messaging and signaling over recursive DNS",
 }
 
+func computeCertFingerprint(certPath string) (string, error) {
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", fmt.Errorf("read cert file: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return "", fmt.Errorf("failed to decode PEM block from %s", certPath)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse certificate: %w", err)
+	}
+	digest := sha256.Sum256(cert.Raw)
+	return fmt.Sprintf("SHA256:%x", digest), nil
+}
+
+func parseKeyBytes(rawStr string) ([]byte, error) {
+	rawStr = strings.TrimSpace(rawStr)
+	if b, err := base64.StdEncoding.DecodeString(rawStr); err == nil && len(b) == 32 {
+		return b, nil
+	}
+	if b, err := hex.DecodeString(rawStr); err == nil && len(b) == 32 {
+		return b, nil
+	}
+	if len(rawStr) == 32 {
+		return []byte(rawStr), nil
+	}
+	return nil, fmt.Errorf("invalid key length %d: must decode to 32 bytes (base64, hex, or raw)", len(rawStr))
+}
+
+func setupBootstrapManager(emergencyPSK []byte) (*transport.BootstrapManager, error) {
+	var records []transport.BootstrapEndpointRecord
+
+	if bootstrapConfigFile != "" {
+		data, err := os.ReadFile(bootstrapConfigFile)
+		if err != nil {
+			return nil, fmt.Errorf("read bootstrap config %s: %w", bootstrapConfigFile, err)
+		}
+		if err := json.Unmarshal(data, &records); err != nil {
+			return nil, fmt.Errorf("parse bootstrap config JSON: %w", err)
+		}
+	} else {
+		ip := bootstrapIP
+		if ip == "" {
+			ip = os.Getenv("PAQET_BOOTSTRAP_IP")
+		}
+		if ip == "" {
+			ip = "77.37.65.2"
+		}
+
+		port := bootstrapPort
+		if port <= 0 {
+			port = 18089
+		}
+
+		mode := bootstrapMode
+		if mode == "" {
+			mode = "aead-stream"
+		}
+
+		var idType transport.EndpointIdentityType
+		var idValue string
+
+		switch mode {
+		case "tls-outer", "tls-stream":
+			idType = transport.IdentityTypeCertPin
+			if bootstrapCertFile != "" {
+				fp, err := computeCertFingerprint(bootstrapCertFile)
+				if err != nil {
+					return nil, fmt.Errorf("tls bootstrap cert error: %w", err)
+				}
+				idValue = fp
+			} else if bootstrapPin != "" {
+				idValue = bootstrapPin
+			} else {
+				return nil, errors.New("tls-outer bootstrap requires --bootstrap-cert or --bootstrap-pin (cannot use shared PSK as TLS certificate fingerprint)")
+			}
+
+		case "aead-stream", "raw-kcp":
+			idType = transport.IdentityTypePSKID
+			if bootstrapKeyFile != "" {
+				kData, err := os.ReadFile(bootstrapKeyFile)
+				if err != nil {
+					return nil, fmt.Errorf("read bootstrap key file %s: %w", bootstrapKeyFile, err)
+				}
+				kBytes, err := parseKeyBytes(string(kData))
+				if err != nil {
+					return nil, fmt.Errorf("parse bootstrap key: %w", err)
+				}
+				idValue = fmt.Sprintf("SHA256:%x", sha256.Sum256(kBytes))
+			} else if bootstrapPin != "" {
+				idValue = bootstrapPin
+			} else {
+				idValue = fmt.Sprintf("SHA256:%x", sha256.Sum256(emergencyPSK))
+			}
+		default:
+			return nil, fmt.Errorf("unsupported bootstrap transport mode %q", mode)
+		}
+
+		records = append(records, transport.BootstrapEndpointRecord{
+			ServerIP:      ip,
+			TransportPort: port,
+			TransportMode: mode,
+			IdentityType:  idType,
+			IdentityValue: idValue,
+			ValiditySec:   7200,
+		})
+	}
+
+	return transport.NewBootstrapManager(records, bootstrapMode, 1)
+}
+
 var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Runs the authoritative emergency DNS daemon",
@@ -76,6 +201,11 @@ var serverCmd = &cobra.Command{
 		psk, err := parseKey(keyStr, keyFile)
 		if err != nil {
 			log.Fatalf("failed to load emergency key: %v", err)
+		}
+
+		bm, err := setupBootstrapManager(psk)
+		if err != nil {
+			log.Fatalf("failed to initialize bootstrap manager: %v", err)
 		}
 
 		srv, err := transport.NewEmergencyDNSServer(transport.EmergencyDNSServerConfig{
@@ -88,23 +218,23 @@ var serverCmd = &cobra.Command{
 					msg.ID, msg.Type, len(msg.Payload), clientID)
 
 				if msg.Type == "bootstrap_request" {
-					port := bootstrapPort
-					if port <= 0 {
-						port = 18089
+					requestedMode := strings.TrimSpace(string(msg.Payload))
+					if requestedMode == "" || requestedMode == "REQUEST_BOOTSTRAP_ENDPOINT" {
+						requestedMode = bootstrapMode
 					}
-					mode := bootstrapMode
-					if mode == "" {
-						mode = "aead-stream"
+					endpointData, err := bm.GenerateResponse(msg, requestedMode)
+					if err != nil {
+						return &transport.EmergencyResponse{
+							ID:        msg.ID,
+							Status:    "ERROR",
+							Reply:     []byte(err.Error()),
+							Timestamp: time.Now().Unix(),
+						}, nil
 					}
-					bootstrapResp := transport.BootstrapEndpointData{
-						ServerIP:      "77.37.65.2",
-						TransportPort: port,
-						TransportMode: mode,
-						ServerPubKey:  fmt.Sprintf("SHA256:%x", sha256.Sum256(psk)),
-						ValidUntil:    time.Now().Add(2 * time.Hour).Unix(),
-					}
-					payload, err := json.Marshal(bootstrapResp)
+					payload, err := json.Marshal(endpointData)
 					if err == nil {
+						log.Printf("[EMERGENCY-SERVER] Generated bootstrap response ID=%s Mode=%s Endpoint=%s:%d IdentityType=%s",
+							msg.ID, endpointData.TransportMode, endpointData.ServerIP, endpointData.TransportPort, endpointData.IdentityType)
 						return &transport.EmergencyResponse{
 							ID:        msg.ID,
 							Status:    "OK",
@@ -217,22 +347,7 @@ func parseKey(kStr, kFile string) ([]byte, error) {
 		return nil, errors.New("no emergency key provided. An explicit 32-byte key must be supplied via --key-file, $PAQET_EMERGENCY_KEY, or --key")
 	}
 
-	// 1. Try base64
-	if b, err := base64.StdEncoding.DecodeString(rawStr); err == nil && len(b) == 32 {
-		return b, nil
-	}
-
-	// 2. Try hex
-	if b, err := hex.DecodeString(rawStr); err == nil && len(b) == 32 {
-		return b, nil
-	}
-
-	// 3. Try raw bytes
-	if len(rawStr) == 32 {
-		return []byte(rawStr), nil
-	}
-
-	return nil, fmt.Errorf("invalid key length (got %d chars). Key must decode to exactly 32 bytes (base64, hex, or raw). Zero-padding and truncation are rejected for security", len(rawStr))
+	return parseKeyBytes(rawStr)
 }
 
 var scanCmd = &cobra.Command{

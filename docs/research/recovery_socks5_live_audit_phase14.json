@@ -1,0 +1,127 @@
+{
+  "timestamp": "2026-10-16T10:05:56Z",
+  "phase": "Phase 14 Transport Completeness \u0026 Failover Resilience",
+  "test_token": "PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd",
+  "primary_endpoint": "77.37.65.2:18088",
+  "candidate_endpoint": "77.37.65.2:18089",
+  "socks5_listen_port": 11990,
+  "http_origin_port": 18999,
+  "dns_path": {
+    "resolver_configured": "8.8.8.8:53",
+    "path_type": "public_recursive",
+    "authoritative_host": "77.37.65.2:53",
+    "domain_suffix": "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir",
+    "query_type": "TXT",
+    "exchange_rtt_ms": 132.393781,
+    "authenticated": true,
+    "received_message_id": "msg-4d01a2d30123c909ac99b329570b67da"
+  },
+  "step_a_baseline": {
+    "passed": true,
+    "description": "Baseline HTTP request through primary Paqet transport served by :18088",
+    "duration_ms": 86.60891,
+    "details": "HTTP 200 OK, token PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd verified byte-exact"
+  },
+  "step_b_primary_drop": {
+    "passed": true,
+    "description": "Applied narrowly scoped iptables DROP rule; verified primary request fails",
+    "duration_ms": 7.043013,
+    "details": "iptables -I OUTPUT -p tcp -d 77.37.65.2 --dport 18088 -j DROP; request failed: Get \"http://127.0.0.1:18999/test-token\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+  },
+  "step_c_signaling": {
+    "passed": true,
+    "description": "Emergency signaling via authenticated DNS query via resolver 8.8.8.8:53 (public_recursive)",
+    "duration_ms": 132.393781,
+    "details": "DNS exchange completed via 8.8.8.8:53; candidate 77.37.65.2:18089 (mode: aead-stream, type: psk-id)"
+  },
+  "step_d_validation": {
+    "passed": true,
+    "description": "Cryptographic identity binding and AEAD remote handshake validation",
+    "duration_ms": 175.110905,
+    "details": "Candidate 77.37.65.2:18089 passed AEAD key derivation, smux handshake, and PPING/PPONG protocol check (gen: 6)"
+  },
+  "step_e_recovery": {
+    "passed": true,
+    "description": "Real application HTTP request through isolated SOCKS5 proxy routed via recovery candidate",
+    "duration_ms": 179.164687,
+    "details": "HTTP 200 OK; token PHASE14_PROVEN_adc8bdad43def3706c34e7741adf37dd matched byte-exact; candidate served connection in 179.16ms"
+  },
+  "step_f_adverse_tests": [
+    {
+      "passed": true,
+      "description": "Mismatched candidate identity fingerprint rejected fail-closed",
+      "duration_ms": 0.019332000000000002,
+      "details": "Validation returned: recovery: candidate endpoint failed authenticated validation handshake: aead-stream key fingerprint mismatch: expected SHA256:0000000000000000000000000000000000000000000000000000000000000000, configured PSK fingerprint is SHA256:fc145aba6e7da549028e0cdc913e06cc5adc08b424cdb08f14717812bf3e715d"
+    },
+    {
+      "passed": true,
+      "description": "Expired bootstrap coordinates fail validation",
+      "duration_ms": 0.007407,
+      "details": "Validation returned: bootstrap: endpoint coordinates expired at 1792145151 (current time 1792145161, ValidUntil \u003c= now is expired)"
+    },
+    {
+      "passed": true,
+      "description": "TLS candidate with psk-id identity type rejected fail-closed",
+      "duration_ms": 0.00992,
+      "details": "Validation returned: bootstrap: invalid identity type \"psk-id\" for TLS mode (must be cert-pin or pubkey-pin)"
+    }
+  ],
+  "step_g_rollback": {
+    "passed": true,
+    "description": "Deterministic ResetRollback clears active snapshot and returns to PRIMARY_HEALTHY",
+    "duration_ms": 0.004313,
+    "details": "Active snapshot cleared, state returned to PRIMARY_HEALTHY"
+  },
+  "step_h_restoration": {
+    "passed": true,
+    "description": "Iptables test rule deleted; production SOCKS5 verified healthy",
+    "duration_ms": 6.042409999999999,
+    "details": "iptables rule removed; production 127.0.0.1:1090 returned: pong"
+  },
+  "production_health": "pong",
+  "history": [
+    {
+      "from_state": "PRIMARY_HEALTHY",
+      "to_state": "PRIMARY_HEALTHY",
+      "reason": "initialization",
+      "timestamp": "2026-10-16T13:35:56.699397595+03:30"
+    },
+    {
+      "from_state": "PRIMARY_HEALTHY",
+      "to_state": "PRIMARY_DEGRADED",
+      "reason": "consecutive primary failures (1) reached threshold: primary unreachable: Get \"http://127.0.0.1:18999/test-token\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+      "timestamp": "2026-10-16T13:36:00.479610995+03:30"
+    },
+    {
+      "from_state": "PRIMARY_DEGRADED",
+      "to_state": "EMERGENCY_SIGNALING",
+      "reason": "degraded timeout elapsed; requesting bootstrap failover via emergency DNS",
+      "timestamp": "2026-10-16T13:36:00.58012839+03:30"
+    },
+    {
+      "from_state": "EMERGENCY_SIGNALING",
+      "to_state": "BOOTSTRAP_RECEIVED",
+      "reason": "received authenticated bootstrap endpoint 77.37.65.2:18089 (aead-stream)",
+      "timestamp": "2026-10-16T13:36:00.713036886+03:30"
+    },
+    {
+      "from_state": "BOOTSTRAP_RECEIVED",
+      "to_state": "CANDIDATE_ENDPOINT_VALIDATING",
+      "reason": "initiating independent authenticated handshake validation",
+      "timestamp": "2026-10-16T13:36:00.713037437+03:30"
+    },
+    {
+      "from_state": "CANDIDATE_ENDPOINT_VALIDATING",
+      "to_state": "RECOVERY_READY",
+      "reason": "candidate endpoint 77.37.65.2:18089 (aead-stream) validated and active for new connections",
+      "timestamp": "2026-10-16T13:36:00.888223929+03:30"
+    },
+    {
+      "from_state": "RECOVERY_READY",
+      "to_state": "PRIMARY_HEALTHY",
+      "reason": "manual or automated rollback: operator manual restoration",
+      "timestamp": "2026-10-16T13:36:01.067651776+03:30"
+    }
+  ],
+  "outcome": "PHASE 14 COMPLETE: TRANSPORT AUTHENTICATION, CONFIGURABLE BOOTSTRAP, SOCKS5 CONNECTION SWITCHING \u0026 RESILIENCE MATRIX VERIFIED"
+}

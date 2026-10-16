@@ -145,9 +145,12 @@ func TestSOCKS5_LiveApplicationRecoveryFlow(t *testing.T) {
 		EmergencyDialer: func(ctx context.Context, msg *transport.EmergencyMessage) (*transport.BootstrapEndpointData, error) {
 			emergencySignalingTriggered.Store(true)
 			return &transport.BootstrapEndpointData{
+				Version:       2,
 				ServerIP:      "127.0.0.1",
 				TransportPort: candidateServerPort,
 				TransportMode: "aead-stream",
+				IdentityType:  transport.IdentityTypePSKID,
+				IdentityValue: pubKeyFingerprint,
 				ServerPubKey:  pubKeyFingerprint,
 				ValidUntil:    time.Now().Add(1 * time.Hour).Unix(),
 			}, nil

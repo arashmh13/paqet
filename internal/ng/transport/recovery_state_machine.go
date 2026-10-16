@@ -54,14 +54,27 @@ var (
 
 // RecoveryEndpointSnapshot represents an immutable, validated snapshot of an authorized recovery endpoint.
 type RecoveryEndpointSnapshot struct {
-	ServerIP       string        `json:"server_ip"`
-	TransportPort  int           `json:"transport_port"`
-	TransportMode  TransportMode `json:"transport_mode"` // ModeRawKCP, ModeAEADStream, ModeTLSStream
-	ExpectedPubKey string        `json:"expected_pub_key"`
-	ValidUntil     int64         `json:"valid_until"`
-	MessageID      string        `json:"message_id"`
-	Generation     uint64        `json:"generation"`
-	ValidatedAt    time.Time     `json:"validated_at"`
+	ServerIP       string               `json:"server_ip"`
+	TransportPort  int                  `json:"transport_port"`
+	TransportMode  TransportMode        `json:"transport_mode"`             // ModeRawKCP, ModeAEADStream, ModeTLSStream
+	IdentityType   EndpointIdentityType `json:"identity_type"`              // "psk-id", "cert-pin", "pubkey-pin"
+	IdentityValue  string               `json:"identity_value"`             // Canonical format: "SHA256:<64 hex>"
+	ExpectedPubKey string               `json:"expected_pub_key,omitempty"` // Legacy alias
+	ValidUntil     int64                `json:"valid_until"`
+	MessageID      string               `json:"message_id"`
+	Generation     uint64               `json:"generation"`
+	ValidatedAt    time.Time            `json:"validated_at"`
+}
+
+// GetIdentityValue returns the canonical identity fingerprint, prioritizing IdentityValue over legacy ExpectedPubKey.
+func (s *RecoveryEndpointSnapshot) GetIdentityValue() string {
+	if s == nil {
+		return ""
+	}
+	if s.IdentityValue != "" {
+		return s.IdentityValue
+	}
+	return s.ExpectedPubKey
 }
 
 // Addr returns the "host:port" address string.
@@ -371,7 +384,9 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 			ServerIP:       endpoint.ServerIP,
 			TransportPort:  endpoint.TransportPort,
 			TransportMode:  endpoint.Mode(),
-			ExpectedPubKey: endpoint.ServerPubKey,
+			IdentityType:   endpoint.GetIdentityType(),
+			IdentityValue:  endpoint.GetIdentityValue(),
+			ExpectedPubKey: endpoint.GetIdentityValue(),
 			ValidUntil:     endpoint.ValidUntil,
 			MessageID:      req.ID,
 			Generation:     sm.currentGeneration,
@@ -423,11 +438,18 @@ func (sm *RecoveryStateMachine) ResetRollback(reason string) {
 	sm.recordTransitionLocked(sm.state, StatePrimaryHealthy, fmt.Sprintf("manual or automated rollback: %s", reason))
 }
 
+// CandidateConn is a connection interface capable of executing protocol ping/pong probes.
+type CandidateConn interface {
+	Ping(wait bool) error
+	Close() error
+}
+
 // CandidateValidatorOptions configures cryptographic validation for candidate endpoints.
 type CandidateValidatorOptions struct {
-	PSK        []byte
-	KCPKey     []byte
-	ServerName string
+	PSK          []byte
+	KCPKey       []byte
+	ServerName   string
+	RawKCPDialer func(ctx context.Context, targetAddr string, kcpKey []byte) (CandidateConn, error)
 }
 
 // BuildCandidateValidator constructs an authenticating validator that verifies remote cryptographic identities.
@@ -436,7 +458,7 @@ func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Co
 		if endpoint == nil {
 			return errors.New("nil endpoint")
 		}
-		expectedDigest, err := ParseSHA256Fingerprint(endpoint.ServerPubKey)
+		expectedDigest, err := ParseSHA256Fingerprint(endpoint.GetIdentityValue())
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidBootstrapData, err)
 		}
@@ -445,6 +467,11 @@ func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Co
 
 		switch endpoint.Mode() {
 		case ModeTLSStream:
+			// Enforce explicit identity type
+			if endpoint.GetIdentityType() != IdentityTypeCertPin && endpoint.GetIdentityType() != IdentityTypePubKeyPin {
+				return fmt.Errorf("%w: invalid identity type %q for TLS mode (must be cert-pin or pubkey-pin)",
+					ErrCandidateValidation, endpoint.GetIdentityType())
+			}
 			serverName := opts.ServerName
 			if serverName == "" {
 				serverName = endpoint.ServerIP
@@ -470,7 +497,7 @@ func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Co
 			leafDigest := sha256.Sum256(leafCert.Raw)
 			if leafDigest != expectedDigest {
 				return fmt.Errorf("%w: tls certificate fingerprint mismatch: got SHA256:%x, want %s",
-					ErrCandidateValidation, leafDigest, endpoint.ServerPubKey)
+					ErrCandidateValidation, leafDigest, endpoint.GetIdentityValue())
 			}
 
 			// Validate smux protocol handshake over TLS
@@ -503,10 +530,15 @@ func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Co
 			return nil
 
 		case ModeAEADStream:
+			// Enforce explicit identity type
+			if endpoint.GetIdentityType() != IdentityTypePSKID {
+				return fmt.Errorf("%w: invalid identity type %q for AEAD mode (must be psk-id)",
+					ErrCandidateValidation, endpoint.GetIdentityType())
+			}
 			keyDigest := sha256.Sum256(opts.PSK)
 			if keyDigest != expectedDigest {
 				return fmt.Errorf("%w: aead-stream key fingerprint mismatch: expected %s, configured PSK fingerprint is SHA256:%x",
-					ErrCandidateValidation, endpoint.ServerPubKey, keyDigest)
+					ErrCandidateValidation, endpoint.GetIdentityValue(), keyDigest)
 			}
 
 			netDialer := &net.Dialer{Timeout: 3 * time.Second}
@@ -568,6 +600,11 @@ func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Co
 			return nil
 
 		case ModeRawKCP:
+			// Enforce explicit identity type
+			if endpoint.GetIdentityType() != IdentityTypePSKID {
+				return fmt.Errorf("%w: invalid identity type %q for Raw-KCP mode (must be psk-id)",
+					ErrCandidateValidation, endpoint.GetIdentityType())
+			}
 			kcpKey := opts.KCPKey
 			if len(kcpKey) == 0 {
 				kcpKey = opts.PSK
@@ -575,7 +612,27 @@ func BuildCandidateValidator(opts CandidateValidatorOptions) func(ctx context.Co
 			keyDigest := sha256.Sum256(kcpKey)
 			if keyDigest != expectedDigest {
 				return fmt.Errorf("%w: raw-kcp key fingerprint mismatch: expected %s, configured key is SHA256:%x",
-					ErrCandidateValidation, endpoint.ServerPubKey, keyDigest)
+					ErrCandidateValidation, endpoint.GetIdentityValue(), keyDigest)
+			}
+
+			// Validate remote handshake
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("%w: raw-kcp validation canceled: %v", ErrCandidateValidation, err)
+			}
+
+			if opts.RawKCPDialer == nil {
+				return fmt.Errorf("%w: raw-kcp candidate validation requires RawKCPDialer; remote handshake cannot be proven without dialer", ErrCandidateValidation)
+			}
+
+			conn, err := opts.RawKCPDialer(ctx, targetAddr, kcpKey)
+			if err != nil {
+				return fmt.Errorf("%w: raw-kcp dial failed: %v", ErrCandidateValidation, err)
+			}
+			defer conn.Close()
+
+			// Authenticated transport establishment and protocol ping/pong verification
+			if err := conn.Ping(true); err != nil {
+				return fmt.Errorf("%w: raw-kcp candidate ping/pong validation failed: %v", ErrCandidateValidation, err)
 			}
 			return nil
 

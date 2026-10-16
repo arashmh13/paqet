@@ -319,7 +319,7 @@ func (d *DNSAsymmetricDialer) Metrics() HealthMetrics {
 	return d.metrics
 }
 
-// BuildDNSQuery constructs an RFC 1035 compliant UDP DNS Query packet.
+// BuildDNSQuery constructs an RFC 1035 compliant UDP DNS Query packet with RFC 6891 EDNS0 support.
 func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
 	var buf []byte
 
@@ -328,6 +328,7 @@ func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
 	binary.BigEndian.PutUint16(header[0:2], id)
 	binary.BigEndian.PutUint16(header[2:4], 0x0100) // Standard query, recursion desired
 	binary.BigEndian.PutUint16(header[4:6], 1)      // QDCOUNT = 1
+	binary.BigEndian.PutUint16(header[10:12], 1)    // ARCOUNT = 1 (EDNS0 OPT RR)
 	buf = append(buf, header...)
 
 	// QNAME: series of length-prefixed labels
@@ -343,6 +344,21 @@ func BuildDNSQuery(qname string, qtype uint16, id uint16) []byte {
 	binary.BigEndian.PutUint16(trailer[0:2], qtype)
 	binary.BigEndian.PutUint16(trailer[2:4], 0x0001) // Class IN
 	buf = append(buf, trailer...)
+
+	// RFC 6891 EDNS0 OPT RR (11 bytes):
+	// Root Name: 0x00
+	// TYPE: 41 (OPT)
+	// CLASS: 4096 (UDP payload size)
+	// TTL: 0
+	// RDLENGTH: 0
+	optRR := []byte{
+		0x00,
+		0x00, 0x29,
+		0x10, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+	}
+	buf = append(buf, optRR...)
 
 	return buf
 }
@@ -415,6 +431,12 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(hdr[2:4], respFlags)
 	binary.BigEndian.PutUint16(hdr[4:6], 1) // QDCOUNT = 1
 	binary.BigEndian.PutUint16(hdr[6:8], 1) // ANCOUNT = 1
+
+	reqAR := binary.BigEndian.Uint16(reqPacket[10:12])
+	if reqAR > 0 {
+		binary.BigEndian.PutUint16(hdr[10:12], 1) // ARCOUNT = 1 (EDNS0)
+	}
+
 	resp = append(resp, hdr...)
 	resp = append(resp, questionSec...)
 
@@ -446,6 +468,17 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(rdLen, uint16(len(rdata)))
 	resp = append(resp, rdLen...)
 	resp = append(resp, rdata...)
+
+	if reqAR > 0 {
+		optRR := []byte{
+			0x00,
+			0x00, 0x29,
+			0x10, 0x00,
+			0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00,
+		}
+		resp = append(resp, optRR...)
+	}
 
 	return resp, nil
 }

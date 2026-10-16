@@ -45,13 +45,59 @@ const (
 	MsgTypeData              = "data"
 )
 
+// EndpointIdentityType defines the explicit cryptographic identity verification scheme.
+type EndpointIdentityType string
+
+const (
+	// IdentityTypePSKID identifies AEAD or Raw-KCP endpoints via the SHA-256 fingerprint of the shared symmetric key.
+	IdentityTypePSKID EndpointIdentityType = "psk-id"
+	// IdentityTypeCertPin identifies TLS endpoints via the SHA-256 fingerprint of the server's leaf X.509 certificate.
+	IdentityTypeCertPin EndpointIdentityType = "cert-pin"
+	// IdentityTypePubKeyPin identifies TLS or asymmetric endpoints via the SHA-256 fingerprint of the server's public key.
+	IdentityTypePubKeyPin EndpointIdentityType = "pubkey-pin"
+)
+
 // BootstrapEndpointData specifies authenticated transport coordinates for endpoint failover.
 type BootstrapEndpointData struct {
-	ServerIP      string `json:"server_ip"`
-	TransportPort int    `json:"transport_port"`
-	TransportMode string `json:"transport_mode"` // "raw-kcp", "aead-stream", "tls-outer"
-	ServerPubKey  string `json:"server_pub_key,omitempty"`
-	ValidUntil    int64  `json:"valid_until"`
+	Version       int                  `json:"version"` // Schema version (2 for Phase 14)
+	ServerIP      string               `json:"server_ip"`
+	TransportPort int                  `json:"transport_port"`
+	TransportMode string               `json:"transport_mode"`           // "raw-kcp", "aead-stream", "tls-outer"
+	IdentityType  EndpointIdentityType `json:"identity_type"`            // "psk-id", "cert-pin", "pubkey-pin"
+	IdentityValue string               `json:"identity_value"`           // Canonical format: "SHA256:<64 hex characters>"
+	ServerPubKey  string               `json:"server_pub_key,omitempty"` // Backward-compatible alias for v1
+	ValidUntil    int64                `json:"valid_until"`
+	RecoveryGen   uint64               `json:"recovery_gen,omitempty"` // Authenticated recovery generation token
+	RequestID     string               `json:"request_id,omitempty"`   // Bound message ID
+}
+
+// GetIdentityValue returns the canonical identity fingerprint, prioritizing IdentityValue over legacy ServerPubKey.
+func (b *BootstrapEndpointData) GetIdentityValue() string {
+	if b == nil {
+		return ""
+	}
+	if b.IdentityValue != "" {
+		return b.IdentityValue
+	}
+	return b.ServerPubKey
+}
+
+// GetIdentityType returns the explicit identity scheme, inferring safely for legacy records.
+func (b *BootstrapEndpointData) GetIdentityType() EndpointIdentityType {
+	if b == nil {
+		return ""
+	}
+	if b.IdentityType != "" {
+		return b.IdentityType
+	}
+	switch b.TransportMode {
+	case "tls-outer", "tls", "tls-stream":
+		return IdentityTypeCertPin
+	case "aead-stream", "stream", "raw-kcp":
+		return IdentityTypePSKID
+	default:
+		return ""
+	}
 }
 
 // ParseSHA256Fingerprint parses and validates a canonical SHA-256 fingerprint string.
@@ -97,7 +143,12 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 		return errors.New("nil bootstrap endpoint data")
 	}
 
-	// 1. IP address and address class validation
+	// 1. Version validation
+	if b.Version < 0 || b.Version > 2 {
+		return fmt.Errorf("bootstrap: unsupported schema version %d", b.Version)
+	}
+
+	// 2. IP address and address class validation
 	if b.ServerIP == "" {
 		return errors.New("bootstrap: missing server IP")
 	}
@@ -121,12 +172,12 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 		return fmt.Errorf("bootstrap: private IP rejected by production security policy: %s", b.ServerIP)
 	}
 
-	// 2. Port validation
+	// 3. Port validation
 	if b.TransportPort <= 0 || b.TransportPort > 65535 {
 		return fmt.Errorf("bootstrap: invalid port: %d (must be 1-65535)", b.TransportPort)
 	}
 
-	// 3. Transport mode validation (strict whitelist)
+	// 4. Transport mode validation (strict whitelist)
 	switch b.TransportMode {
 	case "raw-kcp", "aead-stream", "tls-outer", "tls-stream":
 		// Whitelisted supported modes
@@ -134,7 +185,7 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 		return fmt.Errorf("bootstrap: unsupported transport mode: %q (fail-closed rejection)", b.TransportMode)
 	}
 
-	// 4. Timestamp & Validity Window (strictly nonzero and within bounds)
+	// 5. Timestamp & Validity Window (strictly nonzero and within bounds)
 	// P0 REQUIREMENT: ValidUntil == now.Unix() MUST be treated as expired!
 	if b.ValidUntil <= 0 {
 		return errors.New("bootstrap: missing or zero expiry timestamp (nonzero ValidUntil required for fail-closed recovery)")
@@ -151,16 +202,156 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 		}
 	}
 
-	// 5. Cryptographic Identity Binding
-	// Mandatory canonical SHA-256 fingerprint for all authenticated transports
-	if b.ServerPubKey == "" {
-		return fmt.Errorf("bootstrap: missing server public key/certificate identity fingerprint for mode %s", b.TransportMode)
+	// 6. Cryptographic Identity Binding
+	idVal := b.GetIdentityValue()
+	if idVal == "" {
+		return fmt.Errorf("bootstrap: missing server identity value for mode %s", b.TransportMode)
 	}
-	if _, err := ParseSHA256Fingerprint(b.ServerPubKey); err != nil {
-		return fmt.Errorf("bootstrap: invalid cryptographic identity fingerprint: %w", err)
+	if _, err := ParseSHA256Fingerprint(idVal); err != nil {
+		return fmt.Errorf("bootstrap: invalid cryptographic identity fingerprint %q: %w", idVal, err)
+	}
+
+	// 7. Identity Type vs Transport Mode consistency (P0 Requirement: separate rules per mode)
+	idType := b.GetIdentityType()
+	switch b.Mode() {
+	case ModeTLSStream:
+		if idType != IdentityTypeCertPin && idType != IdentityTypePubKeyPin {
+			return fmt.Errorf("bootstrap: invalid identity type %q for TLS mode (must be %s or %s)",
+				idType, IdentityTypeCertPin, IdentityTypePubKeyPin)
+		}
+	case ModeAEADStream:
+		if idType != IdentityTypePSKID {
+			return fmt.Errorf("bootstrap: invalid identity type %q for AEAD mode (must be %s)",
+				idType, IdentityTypePSKID)
+		}
+	case ModeRawKCP:
+		if idType != IdentityTypePSKID {
+			return fmt.Errorf("bootstrap: invalid identity type %q for Raw-KCP mode (must be %s)",
+				idType, IdentityTypePSKID)
+		}
+	default:
+		return fmt.Errorf("bootstrap: unsupported transport mode: %q", b.TransportMode)
 	}
 
 	return nil
+}
+
+// BootstrapEndpointRecord specifies a pre-configured recovery endpoint candidate.
+type BootstrapEndpointRecord struct {
+	ServerIP      string               `json:"server_ip" yaml:"server_ip"`
+	TransportPort int                  `json:"transport_port" yaml:"transport_port"`
+	TransportMode string               `json:"transport_mode" yaml:"transport_mode"`
+	IdentityType  EndpointIdentityType `json:"identity_type" yaml:"identity_type"`
+	IdentityValue string               `json:"identity_value" yaml:"identity_value"` // Canonical "SHA256:<64 hex>"
+	ValiditySec   int64                `json:"validity_sec" yaml:"validity_sec"`     // Expiry seconds relative to generation time
+}
+
+// BootstrapManager manages mode-aware, validated recovery candidate records and produces authenticated bootstrap payloads.
+type BootstrapManager struct {
+	mu          sync.RWMutex
+	records     map[string]BootstrapEndpointRecord // Keyed by transport mode
+	defaultMode string
+	recoveryGen uint64
+}
+
+// NewBootstrapManager creates a validated, mode-aware bootstrap manager.
+func NewBootstrapManager(records []BootstrapEndpointRecord, defaultMode string, initialGen uint64) (*BootstrapManager, error) {
+	bm := &BootstrapManager{
+		records:     make(map[string]BootstrapEndpointRecord),
+		defaultMode: defaultMode,
+		recoveryGen: initialGen,
+	}
+	for _, rec := range records {
+		if err := bm.AddRecord(rec); err != nil {
+			return nil, err
+		}
+	}
+	return bm, nil
+}
+
+// AddRecord validates and registers a candidate endpoint record.
+func (bm *BootstrapManager) AddRecord(rec BootstrapEndpointRecord) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	if rec.ServerIP == "" {
+		return errors.New("bootstrap record: missing server IP")
+	}
+	ip := net.ParseIP(rec.ServerIP)
+	if ip == nil {
+		return fmt.Errorf("bootstrap record: invalid server IP: %q", rec.ServerIP)
+	}
+	if rec.TransportPort <= 0 || rec.TransportPort > 65535 {
+		return fmt.Errorf("bootstrap record: invalid port %d", rec.TransportPort)
+	}
+	switch rec.TransportMode {
+	case "raw-kcp", "aead-stream", "tls-outer", "tls-stream":
+	default:
+		return fmt.Errorf("bootstrap record: unsupported transport mode %q", rec.TransportMode)
+	}
+	if rec.IdentityValue == "" {
+		return fmt.Errorf("bootstrap record: missing identity value for mode %s", rec.TransportMode)
+	}
+	if _, err := ParseSHA256Fingerprint(rec.IdentityValue); err != nil {
+		return fmt.Errorf("bootstrap record: invalid identity fingerprint %q: %w", rec.IdentityValue, err)
+	}
+	switch rec.TransportMode {
+	case "tls-outer", "tls-stream":
+		if rec.IdentityType != IdentityTypeCertPin && rec.IdentityType != IdentityTypePubKeyPin {
+			return fmt.Errorf("bootstrap record: invalid identity type %q for TLS mode (must be cert-pin or pubkey-pin)", rec.IdentityType)
+		}
+	case "aead-stream", "raw-kcp":
+		if rec.IdentityType != IdentityTypePSKID {
+			return fmt.Errorf("bootstrap record: invalid identity type %q for %s mode (must be psk-id)", rec.IdentityType, rec.TransportMode)
+		}
+	}
+	if rec.ValiditySec <= 0 {
+		rec.ValiditySec = 7200 // default 2 hours
+	}
+
+	bm.records[rec.TransportMode] = rec
+	return nil
+}
+
+// SetRecoveryGen updates the active recovery revision generation.
+func (bm *BootstrapManager) SetRecoveryGen(gen uint64) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	bm.recoveryGen = gen
+}
+
+// GenerateResponse generates an authenticated, versioned bootstrap response for the requested mode.
+func (bm *BootstrapManager) GenerateResponse(req *EmergencyMessage, requestedMode string) (*BootstrapEndpointData, error) {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+
+	mode := requestedMode
+	if mode == "" || mode == "REQUEST_BOOTSTRAP_ENDPOINT" {
+		mode = bm.defaultMode
+	}
+	if mode == "" {
+		mode = "aead-stream"
+	}
+
+	rec, ok := bm.records[mode]
+	if !ok {
+		return nil, fmt.Errorf("no recovery candidate configured for transport mode %q", mode)
+	}
+
+	now := time.Now()
+	data := &BootstrapEndpointData{
+		Version:       2,
+		ServerIP:      rec.ServerIP,
+		TransportPort: rec.TransportPort,
+		TransportMode: rec.TransportMode,
+		IdentityType:  rec.IdentityType,
+		IdentityValue: rec.IdentityValue,
+		ServerPubKey:  "", // omit to keep JSON compact for single-datagram DNS recursion
+		ValidUntil:    now.Unix() + rec.ValiditySec,
+		RecoveryGen:   bm.recoveryGen,
+		RequestID:     req.ID,
+	}
+	return data, nil
 }
 
 // EmergencyMessage represents an authenticated application datagram exchanged over DNS.

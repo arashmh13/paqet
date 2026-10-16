@@ -98,16 +98,28 @@ When conventional ports are severed, the client issues a `bootstrap_request`. Th
 
 ---
 
-## 4. Current External Dependency & Deployment Guide
+## 4. Independent Authoritative DNS Redundancy & Multi-Server Architecture
 
-- **Current Status:** Dual-authoritative nameserver code-level architecture and single-datagram stateless processing are implemented and verified in `v2.5.2-hardened`.
-- **External Blocker:** The second independent authoritative endpoint requires an active second VPS instance on a non-Hetzner provider (e.g. Vultr, OVH, DigitalOcean, or an independent datacenter).
-- **Deployment Procedure When Second VPS is Acquired:**
-  1. Provision `paqet-emergency.service` and copy `/opt/paqet/emergency.key` to `Node 2`.
-  2. In Cloudflare DNS:
-     - Add `ns2.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir` `A` $\longrightarrow$ `<Node2_IP>`.
-     - Add `tunnel...` `NS` $\longrightarrow$ `ns2...` alongside `ns-de...`.
-  3. Verify delegation via `dig +trace` and `paqet emergency scan`.
+### 4.1 State Synchronization vs. Stateless Control Signaling
+In Phase 11, cross-server testing proved that:
+1. **Single-Datagram Control Messages ($\le 64\text{ bytes}$):** Can be processed independently by distinct authoritative server instances. A client whose query reaches Server A, or whose retransmission reaches Server B, receives an authenticated response because each request datagram carries its own AEAD header and deterministic nonce.
+2. **Multipart Assembly Limitation:** Uncoordinated authoritative servers do not share in-memory reassembly buffers (`DNSReassembler`). If fragment 0 arrives at Server A and fragment 1 arrives at Server B, reassembly fails. Therefore, emergency control signaling must strictly fit within single-query frames.
+3. **Session Replay Synchronization:** For continuous multi-packet streams across servers, a shared state synchronization plane (e.g. distributed cache or raft log) is required. For the emergency plane, single-flight bootstrap requests utilize fresh request nonces and timestamp verification, ensuring security without distributed locks.
+
+### 4.2 Deployment Procedure for Secondary Nameserver (`ns2`)
+When an independent second VPS is provisioned on a non-Hetzner provider:
+1. **Host Hardening & Credentials:**
+   - Deploy `paqet-emergency.service` on Node 2.
+   - Synchronize `/opt/paqet/emergency.key` via secure channel (file permissions `0600`).
+   - Configure candidate endpoint records in `/opt/paqet/bootstrap_endpoints.json`.
+2. **Cloudflare DNS Configuration (STRICT PRECONDITION):**
+   - **Do NOT add an NS record until Node 2 is reachable and validated.**
+   - Add A record: `ns2.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir` $\longrightarrow$ `<Node2_IP>`.
+   - Add delegated NS record: `tunnel.passionatepharmacist...` $\longrightarrow$ `ns2...` (in addition to `ns-de...`).
+3. **End-to-End Multi-Server Verification:**
+   - Query `ns-de...` directly via `paqet emergency send --resolver 77.37.65.2:53`.
+   - Query `ns2...` directly via `paqet emergency send --resolver <Node2_IP>:53`.
+   - Query via public recursive resolvers (`8.8.8.8`, `1.1.1.1`) and verify recursors distribute queries across both nameservers without errors.
 
 ---
 
