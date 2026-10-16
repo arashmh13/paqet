@@ -43,6 +43,7 @@ var (
 	bootstrapPin        string
 	bootstrapConfigFile string
 	disableBootstrap    bool
+	serverID            string
 )
 
 func init() {
@@ -54,6 +55,7 @@ func init() {
 	serverCmd.Flags().StringVar(&domainSuffix, "domain", "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir", "Delegated child domain suffix")
 	serverCmd.Flags().StringVar(&keyFile, "key-file", "", "Path to file containing 32-byte shared key (prefer over --key)")
 	serverCmd.Flags().StringVar(&keyStr, "key", "", "Base64 or hex 32-byte shared key (prefer --key-file or $PAQET_EMERGENCY_KEY to prevent process argument exposure)")
+	serverCmd.Flags().StringVar(&serverID, "server-id", "ns-de-01", "Authoritative server cryptographic identity for multi-server domain separation")
 	serverCmd.Flags().StringVar(&bootstrapIP, "bootstrap-ip", "", "Candidate recovery IP advertised in bootstrap responses (required if --bootstrap-config and --disable-bootstrap are not set)")
 	serverCmd.Flags().IntVar(&bootstrapPort, "bootstrap-port", 18089, "Candidate recovery port advertised in bootstrap responses")
 	serverCmd.Flags().StringVar(&bootstrapMode, "bootstrap-mode", "aead-stream", "Candidate recovery transport mode advertised in bootstrap responses")
@@ -223,11 +225,13 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("failed to initialize bootstrap manager: %v", err)
 		}
+		bm.SetAuthoritativeServerID(serverID)
 
 		srv, err := transport.NewEmergencyDNSServer(transport.EmergencyDNSServerConfig{
 			ListenAddr:   listenAddr,
 			DomainSuffix: domainSuffix,
 			PSK:          psk,
+			ServerID:     serverID,
 			Handler: func(msg *transport.EmergencyMessage) (*transport.EmergencyResponse, error) {
 				// Privacy and Security: Log only metadata, never plaintext payload or key material
 				log.Printf("[EMERGENCY-SERVER] Authenticated message ID=%s Type=%s PayloadBytes=%d ClientID=%s Status=PROCESSED",

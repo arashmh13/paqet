@@ -327,43 +327,126 @@ const (
 	MaxSafeDNSUDPPayloadSize = 1400
 )
 
+// skipDomainName advances past a DNS domain name in wire format (handling labels and compression pointers).
+func skipDomainName(packet []byte, offset int) (int, error) {
+	for offset < len(packet) {
+		b := packet[offset]
+		if b == 0 {
+			return offset + 1, nil
+		}
+		if b&0xC0 == 0xC0 { // Compression pointer (2 bytes)
+			if offset+2 > len(packet) {
+				return 0, errors.New("truncated pointer")
+			}
+			return offset + 2, nil
+		}
+		offset += 1 + int(b)
+	}
+	return 0, errors.New("unterminated domain name")
+}
+
+// skipResourceRecord advances past a full Resource Record in wire format.
+func skipResourceRecord(packet []byte, offset int) (int, error) {
+	newOffset, err := skipDomainName(packet, offset)
+	if err != nil {
+		return 0, err
+	}
+	// TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) = 10 bytes
+	if newOffset+10 > len(packet) {
+		return 0, errors.New("truncated RR header")
+	}
+	rdlen := int(binary.BigEndian.Uint16(packet[newOffset+8 : newOffset+10]))
+	newOffset += 10 + rdlen
+	if newOffset > len(packet) {
+		return 0, errors.New("truncated RDATA")
+	}
+	return newOffset, nil
+}
+
+// ParseEDNSOption extracts the client's advertised UDP buffer size and presence of an RFC 6891 OPT record
+// from the Additional section of an incoming wire DNS packet.
+func ParseEDNSOption(packet []byte) (hasOPT bool, bufSize uint16, err error) {
+	if len(packet) < 12 {
+		return false, 512, ErrDNSInvalidQuery
+	}
+	qdcount := binary.BigEndian.Uint16(packet[4:6])
+	ancount := binary.BigEndian.Uint16(packet[6:8])
+	nscount := binary.BigEndian.Uint16(packet[8:10])
+	arcount := binary.BigEndian.Uint16(packet[10:12])
+
+	if arcount == 0 {
+		return false, 512, nil
+	}
+
+	offset := 12
+	// Walk Question section
+	for i := 0; i < int(qdcount); i++ {
+		offset, err = skipDomainName(packet, offset)
+		if err != nil {
+			return false, 512, err
+		}
+		offset += 4 // QTYPE + QCLASS
+		if offset > len(packet) {
+			return false, 512, errors.New("truncated question section")
+		}
+	}
+
+	// Walk Answer section
+	for i := 0; i < int(ancount); i++ {
+		offset, err = skipResourceRecord(packet, offset)
+		if err != nil {
+			return false, 512, err
+		}
+	}
+
+	// Walk Authority section
+	for i := 0; i < int(nscount); i++ {
+		offset, err = skipResourceRecord(packet, offset)
+		if err != nil {
+			return false, 512, err
+		}
+	}
+
+	// Walk Additional section
+	for i := 0; i < int(arcount); i++ {
+		nameOffset := offset
+		newOffset, err := skipDomainName(packet, offset)
+		if err != nil {
+			return false, 512, err
+		}
+		if newOffset+10 > len(packet) {
+			return false, 512, errors.New("truncated additional RR")
+		}
+		qtype := binary.BigEndian.Uint16(packet[newOffset : newOffset+2])
+		rawBufSize := binary.BigEndian.Uint16(packet[newOffset+2 : newOffset+4])
+		rdlen := int(binary.BigEndian.Uint16(packet[newOffset+8 : newOffset+10]))
+
+		if newOffset+10+rdlen > len(packet) {
+			return false, 512, errors.New("truncated additional RDATA")
+		}
+
+		// Check for RFC 6891 OPT RR: NAME must be root (single 0x00 byte), TYPE == 41 (OPT)
+		if packet[nameOffset] == 0x00 && newOffset == nameOffset+1 && qtype == 41 {
+			if rawBufSize < 512 {
+				rawBufSize = 512
+			}
+			return true, rawBufSize, nil
+		}
+
+		offset = newOffset + 10 + rdlen
+	}
+
+	return false, 512, nil
+}
+
 // ParseEDNSBufferSize extracts the client's advertised UDP buffer size from an incoming wire DNS query,
 // or returns 512 if no valid RFC 6891 OPT record is present.
 func ParseEDNSBufferSize(packet []byte) uint16 {
-	if len(packet) < 12 {
+	hasOPT, size, err := ParseEDNSOption(packet)
+	if err != nil || !hasOPT {
 		return 512
 	}
-	arcount := binary.BigEndian.Uint16(packet[10:12])
-	if arcount == 0 {
-		return 512
-	}
-
-	// Walk Question section
-	offset := 12
-	for offset < len(packet) {
-		length := int(packet[offset])
-		offset++
-		if length == 0 {
-			break
-		}
-		offset += length
-	}
-	offset += 4 // QTYPE + QCLASS
-	if offset >= len(packet) {
-		return 512
-	}
-
-	// Check for Root Name (0x00) and TYPE 41 (0x00 0x29) in additional section
-	if offset+11 <= len(packet) && packet[offset] == 0x00 {
-		qtype := binary.BigEndian.Uint16(packet[offset+1 : offset+3])
-		if qtype == 41 { // OPT
-			bufSize := binary.BigEndian.Uint16(packet[offset+3 : offset+5])
-			if bufSize >= 512 {
-				return bufSize
-			}
-		}
-	}
-	return 512
+	return size
 }
 
 // BuildDNSQueryWithEDNS constructs an RFC 1035 / RFC 6891 compliant UDP DNS Query packet.
@@ -484,13 +567,21 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(hdr[4:6], 1) // QDCOUNT = 1
 	binary.BigEndian.PutUint16(hdr[6:8], 1) // ANCOUNT = 1
 
-	reqAR := binary.BigEndian.Uint16(reqPacket[10:12])
+	hasOPT, clientBuf, _ := ParseEDNSOption(reqPacket)
 
-	// Cap server UDP response generation to documented safe size (1400 bytes).
-	// If a valid response cannot safely fit in UDP, set TC (Truncated) bit so client retries over RFC 7766 TCP.
-	maxUDPSize := MaxSafeDNSUDPPayloadSize
-	if clientBuf := int(ParseEDNSBufferSize(reqPacket)); clientBuf >= int(DefaultEDNSUDPPayloadSize) && clientBuf < MaxSafeDNSUDPPayloadSize {
-		maxUDPSize = clientBuf
+	// Explicit sizing rule: effective_udp_limit = min(server_udp_cap, validated_client_advertisement)
+	// - If no valid EDNS OPT record is present, use 512 bytes.
+	// - For a syntactically valid advertised value from 512 bytes up to server cap, respect that value.
+	// - Clamp larger advertisements to configured server cap.
+	effectiveLimit := 512
+	if hasOPT {
+		if clientBuf > MaxSafeDNSUDPPayloadSize {
+			effectiveLimit = MaxSafeDNSUDPPayloadSize
+		} else if clientBuf < 512 {
+			effectiveLimit = 512
+		} else {
+			effectiveLimit = int(clientBuf)
+		}
 	}
 
 	// RDATA: One or more RFC 1035 character-strings (max 255 bytes each)
@@ -509,13 +600,14 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 		}
 	}
 
-	// Check if response exceeds safe UDP size limit -> set TC (Truncated) bit
-	expectedLen := 12 + len(questionSec) + 10 + 2 + len(rdata)
-	if reqAR > 0 {
+	// Exact serialized length calculation:
+	// Header (12) + Question (len(questionSec)) + Answer (12 + len(rdata)) + OPT (11 if hasOPT else 0)
+	expectedLen := 12 + len(questionSec) + 12 + len(rdata)
+	if hasOPT {
 		expectedLen += 11
 	}
 
-	if expectedLen > maxUDPSize {
+	if expectedLen > effectiveLimit {
 		// Truncated response: TC bit set (0x0200), ANCOUNT = 0
 		truncHdr := make([]byte, 12)
 		binary.BigEndian.PutUint16(truncHdr[0:2], id)
@@ -523,17 +615,19 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 		binary.BigEndian.PutUint16(truncHdr[2:4], truncFlags)
 		binary.BigEndian.PutUint16(truncHdr[4:6], 1) // QDCOUNT = 1
 		binary.BigEndian.PutUint16(truncHdr[6:8], 0) // ANCOUNT = 0
-		if reqAR > 0 {
+		if hasOPT {
 			binary.BigEndian.PutUint16(truncHdr[10:12], 1) // ARCOUNT = 1
+		} else {
+			binary.BigEndian.PutUint16(truncHdr[10:12], 0) // ARCOUNT = 0
 		}
 		var truncResp []byte
 		truncResp = append(truncResp, truncHdr...)
 		truncResp = append(truncResp, questionSec...)
-		if reqAR > 0 {
+		if hasOPT {
 			optRR := []byte{
 				0x00,
 				0x00, 0x29,
-				byte(maxUDPSize >> 8), byte(maxUDPSize),
+				byte(effectiveLimit >> 8), byte(effectiveLimit),
 				0x00, 0x00, 0x00, 0x00,
 				0x00, 0x00,
 			}
@@ -542,8 +636,10 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 		return truncResp, nil
 	}
 
-	if reqAR > 0 {
+	if hasOPT {
 		binary.BigEndian.PutUint16(hdr[10:12], 1) // ARCOUNT = 1 (EDNS0)
+	} else {
+		binary.BigEndian.PutUint16(hdr[10:12], 0) // ARCOUNT = 0
 	}
 
 	resp = append(resp, hdr...)
@@ -562,11 +658,11 @@ func BuildDNSTXTResponse(reqPacket []byte, txtPayload []byte) ([]byte, error) {
 	resp = append(resp, rdLen...)
 	resp = append(resp, rdata...)
 
-	if reqAR > 0 {
+	if hasOPT {
 		optRR := []byte{
 			0x00,
 			0x00, 0x29,
-			byte(maxUDPSize >> 8), byte(maxUDPSize),
+			byte(effectiveLimit >> 8), byte(effectiveLimit),
 			0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00,
 		}

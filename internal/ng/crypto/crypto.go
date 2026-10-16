@@ -48,6 +48,59 @@ func DeriveKeys(psk []byte, salt []byte) ([]byte, []byte, error) {
 	return c2s, s2c, nil
 }
 
+// DeriveServerTrafficKeys derives server-specific directional keys using HKDF (RFC 5869)
+// with explicit domain separation incorporating the server's cryptographic identity (serverID).
+// PRK = HKDF-Extract(sha256, IKM=psk, salt=salt)
+// c2sKey = HKDF-Expand(PRK, info="paqet-ng-v3-c2s", L=32)
+// s2cKey = HKDF-Expand(PRK, info="paqet-ng-v3-s2c:" + serverID, L=32)
+func DeriveServerTrafficKeys(psk []byte, salt []byte, serverID string) ([]byte, []byte, error) {
+	if len(psk) == 0 {
+		return nil, nil, ErrInvalidKey
+	}
+	if len(salt) == 0 {
+		salt = []byte("paqet-ng-v3-hkdf-salt")
+	}
+	if serverID == "" {
+		serverID = "default"
+	}
+
+	c2sExtractor := hkdf.New(sha256.New, psk, salt, []byte("paqet-ng-v3-c2s"))
+	c2s := make([]byte, KeySize)
+	if _, err := io.ReadFull(c2sExtractor, c2s); err != nil {
+		return nil, nil, fmt.Errorf("crypto: failed to derive c2s v3 key: %w", err)
+	}
+
+	s2cInfo := []byte(fmt.Sprintf("paqet-ng-v3-s2c:%s", serverID))
+	s2cExtractor := hkdf.New(sha256.New, psk, salt, s2cInfo)
+	s2c := make([]byte, KeySize)
+	if _, err := io.ReadFull(s2cExtractor, s2c); err != nil {
+		return nil, nil, fmt.Errorf("crypto: failed to derive s2c v3 key: %w", err)
+	}
+
+	return c2s, s2c, nil
+}
+
+// DeriveServerResponseKey derives only the server-to-client response key for a specific serverID.
+func DeriveServerResponseKey(psk []byte, salt []byte, serverID string) ([]byte, error) {
+	if len(psk) == 0 {
+		return nil, ErrInvalidKey
+	}
+	if len(salt) == 0 {
+		salt = []byte("paqet-ng-v3-hkdf-salt")
+	}
+	if serverID == "" {
+		serverID = "default"
+	}
+
+	s2cInfo := []byte(fmt.Sprintf("paqet-ng-v3-s2c:%s", serverID))
+	extractor := hkdf.New(sha256.New, psk, salt, s2cInfo)
+	s2c := make([]byte, KeySize)
+	if _, err := io.ReadFull(extractor, s2c); err != nil {
+		return nil, fmt.Errorf("crypto: failed to derive s2c v3 key for server %s: %w", serverID, err)
+	}
+	return s2c, nil
+}
+
 // NewAEAD returns an AES-256-GCM cipher from a 32-byte key.
 func NewAEAD(key []byte) (cipher.AEAD, error) {
 	if len(key) != KeySize {

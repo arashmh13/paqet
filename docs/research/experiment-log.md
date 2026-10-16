@@ -650,4 +650,60 @@
      - Step H Restoration: Iptables test rule deleted in **48.32 ms**.
      - Production SOCKS5 on `127.0.0.1:1090` returned `pong` (healthy throughout).
      - Raw telemetry logged to `docs/research/recovery_socks5_live_audit_phase15.json`.
-- **Outcome:** Fail-closed configuration startup, data-plane credential separation, validation-to-dial identity binding, conservative EDNS0 buffers, and complete monotonic failover timeline verified end-to-end on live international infrastructure. Production services healthy.
+     - **Outcome:** Fail-closed configuration startup, data-plane credential separation, validation-to-dial identity binding, conservative EDNS0 buffers, and complete monotonic failover timeline verified end-to-end on live international infrastructure. Production services healthy.
+
+     ---
+
+     ### Cycle 24 — Phase 16 Recovery Telemetry Correction, DNS Sizing Enforcement & Multi-Authority Cryptographic Safety (2026-10-16)
+     - **Starting Point:** HEAD `fe00ba0`, release `v2.5.7-continuity`.
+     - **Primary Objectives:**
+     1. Correct recovery timing instrumentation and reconcile candidate validation latency anomaly (0.001 ms -> actual wire handshake duration).
+     2. Implement authenticated production proxy health verification (resolving "UNKNOWN" health status).
+     3. Enforce client's actual advertised UDP capacity in EDNS parsing and response generation (`min(server_cap, client_advertisement)`), including strict 512-byte limit when EDNS is absent.
+     4. Eliminate cryptographic ambiguity and AEAD nonce collisions in multi-authoritative mode via server-specific HKDF response key derivation (`paqet-ng-v3-s2c:<serverID>`).
+     5. Implement per-server replay filtering and client-side server authorization policy.
+     6. Measure per-attempt DNS query telemetry and sequential resolver failover.
+     - **Implemented Actions:**
+     1. Candidate Validation Timing & Production Health Correction:
+      - Wrapped `EmergencyDialer` callback to capture exact monotonic DNS query dispatch (`T3`) and response receipt (`T4`).
+      - Wrapped `CandidateValidator` callback to capture exact monotonic handshake start (`T5`) and finish (`T6`).
+      - Captured `T7` immediately when `Step()` commits `RECOVERY_READY`.
+      - Built `ValidateAndReconcileTimeline()` in `internal/ng/transport/timeline_validator.go`, enforcing monotonicity and component sum identity ($\sum \text{Intervals} = \text{Total}$).
+      - In `scripts/phase16_recovery/main.go`, implemented authenticated SOCKS5 health check querying through `127.0.0.1:1090` (`arash:arash`) to `http://127.0.0.1:8999/ping`, returning `HEALTHY` (`"pong"`) in 132.24 ms.
+     2. Strict EDNS Sizing & Parsing:
+      - Implemented RFC 6891 Additional Section parser in `ParseEDNSOption()` in `dns_asymmetric.go`.
+      - Traverses domain name labels/pointers and resource records to validate the OPT pseudo-RR (`TYPE == 41`, `NAME == 0x00`).
+      - Enforced `effective_limit = min(server_cap, client_advertisement)`: no-EDNS requests strictly clamped to 512 bytes (`ARCOUNT = 0`), oversized responses truncated with `TC = 1` and `ANCOUNT = 0`.
+      - Tested across sizes 512, 768, 1024, 1232, 1400, and 4096 in `internal/ng/transport/dns_edns_truncation_test.go`.
+     3. Multi-Authoritative Cryptographic Safety (RFC 5869 HKDF):
+      - Added `DeriveServerTrafficKeys()` and `DeriveServerResponseKey()` in `internal/ng/crypto/crypto.go`.
+      - Server response key (`s2cKey`) derived using HKDF info `paqet-ng-v3-s2c:<serverID>`, ensuring distinct server IDs derive mathematically distinct encryption keys for identical session IDs and sequence numbers, eliminating AES-GCM nonce collisions across servers.
+      - Implemented v3 framing (`AsymmetricMagicV3 = 0x50415143`) incorporating `ServerID` into unencrypted authenticated header (authenticated as AAD).
+      - Added per-server replay filters (`c.serverReplay[serverID]`) preventing cross-server sequence collisions while preventing intra-server replay.
+      - Added client-side server authorization whitelist (`AuthorizedServers`) in `AsymmetricConn`.
+      - Tested via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` and `TestMultiAuthoritative_FailoverAndServerRestart` in `internal/ng/transport/dns_redundancy_test.go`.
+     4. Built Release `v2.5.8-telemetry`:
+      - Binary SHA-256: `6bc774a9f5ec60b24c60587640f7e98d663a5b8446ea753d54c4770afba00532`.
+      - Deployed atomically to Germany VPS (`77.37.65.2`), updated `paqet-emergency.service` with `--server-id ns-de-01`, verified active.
+      - Deployed atomically to Iran VPS (`185.18.215.124`).
+     5. Live Reconciled Failover Benchmark (Iran ⇄ Germany via Public Recursive DNS):
+      - Primary: `77.37.65.2:18088`; Candidate: `77.37.65.2:18089`; Local SOCKS5: `127.0.0.1:11990`.
+      - Resolvers: Google `8.8.8.8:53` and Cloudflare `1.1.1.1:53`.
+      - Unpredictable Token: `PHASE16_PROVEN_ce3bc1913762b15a977917d8a9c25bed`.
+      - T0 Primary Failure Injected: 0.00 ms (iptables DROP on `:18088`).
+      - T1 Failure Threshold Crossed: 18.73 ms (`PRIMARY_DEGRADED`).
+      - T2 Degraded Hysteresis Expired: 79.22 ms (60.49 ms delay).
+      - T3 DNS Request Dispatched: 79.55 ms.
+      - T4 Authenticated DNS Bootstrap Received: 240.17 ms (DNS RTT: **160.63 ms**, ServerID: `ns-de-01`).
+      - T5 Candidate Validation Started: 240.29 ms.
+      - T6 Candidate Validation Completed: 418.41 ms (Validation Handshake RTT: **178.12 ms**).
+      - T7 Recovery State Activated: 418.44 ms (`RECOVERY_READY`, generation revision 6).
+      - T8 First App Connection Dispatched: 418.49 ms.
+      - T9 First App Response Verified: 505.95 ms (Post-activation request RTT: **87.47 ms**).
+      - **Total Failover Duration (T9 - T0): 505.95 ms (~0.51 seconds)**.
+      - **Unaccounted Overhead: 0.000 ms** (exact mathematical reconciliation).
+      - T10 Rollback Completed: 506.32 ms (`PRIMARY_HEALTHY`).
+      - T11 Primary Network Restored: 526.77 ms (Iptables DROP rule deleted in 20.45 ms).
+      - Production SOCKS5 on `127.0.0.1:1090`: Status `HEALTHY`, Response `"pong"` in 132.24 ms.
+      - Raw telemetry logged to `docs/research/recovery_socks5_live_audit_phase16.json`.
+     - **Outcome:** Telemetry reconciliation verified with zero unaccounted overhead, multi-authoritative cryptographic key/nonce collisions eliminated, EDNS sizing rules enforced, and production SOCKS5 verified healthy. Ready for commit and push.

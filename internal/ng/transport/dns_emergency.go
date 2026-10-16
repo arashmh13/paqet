@@ -59,16 +59,17 @@ const (
 
 // BootstrapEndpointData specifies authenticated transport coordinates for endpoint failover.
 type BootstrapEndpointData struct {
-	Version       int                  `json:"version"` // Schema version (2 for Phase 14)
-	ServerIP      string               `json:"server_ip"`
-	TransportPort int                  `json:"transport_port"`
-	TransportMode string               `json:"transport_mode"`           // "raw-kcp", "aead-stream", "tls-outer"
-	IdentityType  EndpointIdentityType `json:"identity_type"`            // "psk-id", "cert-pin", "pubkey-pin"
-	IdentityValue string               `json:"identity_value"`           // Canonical format: "SHA256:<64 hex characters>"
-	ServerPubKey  string               `json:"server_pub_key,omitempty"` // Backward-compatible alias for v1
-	ValidUntil    int64                `json:"valid_until"`
-	RecoveryGen   uint64               `json:"recovery_gen,omitempty"` // Authenticated recovery generation token
-	RequestID     string               `json:"request_id,omitempty"`   // Bound message ID
+	Version               int                  `json:"version"` // Schema version (2 for Phase 14)
+	ServerIP              string               `json:"server_ip"`
+	TransportPort         int                  `json:"transport_port"`
+	TransportMode         string               `json:"transport_mode"`                    // "raw-kcp", "aead-stream", "tls-outer"
+	IdentityType          EndpointIdentityType `json:"identity_type"`                     // "psk-id", "cert-pin", "pubkey-pin"
+	IdentityValue         string               `json:"identity_value"`                    // Canonical format: "SHA256:<64 hex characters>"
+	AuthoritativeServerID string               `json:"authoritative_server_id,omitempty"` // Authoritative server that produced this bootstrap
+	ServerPubKey          string               `json:"server_pub_key,omitempty"`          // Backward-compatible alias for v1
+	ValidUntil            int64                `json:"valid_until"`
+	RecoveryGen           uint64               `json:"recovery_gen,omitempty"` // Authenticated recovery generation token
+	RequestID             string               `json:"request_id,omitempty"`   // Bound message ID
 }
 
 // GetIdentityValue returns the canonical identity fingerprint, prioritizing IdentityValue over legacy ServerPubKey.
@@ -238,21 +239,23 @@ func (b *BootstrapEndpointData) Validate(now time.Time, maxValidityWindow time.D
 
 // BootstrapEndpointRecord specifies a pre-configured recovery endpoint candidate.
 type BootstrapEndpointRecord struct {
-	ServerIP      string               `json:"server_ip" yaml:"server_ip"`
-	TransportPort int                  `json:"transport_port" yaml:"transport_port"`
-	TransportMode string               `json:"transport_mode" yaml:"transport_mode"`
-	IdentityType  EndpointIdentityType `json:"identity_type" yaml:"identity_type"`
-	IdentityValue string               `json:"identity_value" yaml:"identity_value"`             // Canonical "SHA256:<64 hex>"
-	Provenance    string               `json:"provenance,omitempty" yaml:"provenance,omitempty"` // Provenance metadata (e.g. "key_file:bundle.key", "pin:SHA256:...")
-	ValiditySec   int64                `json:"validity_sec" yaml:"validity_sec"`                 // Expiry seconds relative to generation time
+	ServerIP              string               `json:"server_ip" yaml:"server_ip"`
+	TransportPort         int                  `json:"transport_port" yaml:"transport_port"`
+	TransportMode         string               `json:"transport_mode" yaml:"transport_mode"`
+	IdentityType          EndpointIdentityType `json:"identity_type" yaml:"identity_type"`
+	IdentityValue         string               `json:"identity_value" yaml:"identity_value"`                                       // Canonical "SHA256:<64 hex>"
+	AuthoritativeServerID string               `json:"authoritative_server_id,omitempty" yaml:"authoritative_server_id,omitempty"` // Bound authoritative server ID
+	Provenance            string               `json:"provenance,omitempty" yaml:"provenance,omitempty"`                           // Provenance metadata (e.g. "key_file:bundle.key", "pin:SHA256:...")
+	ValiditySec           int64                `json:"validity_sec" yaml:"validity_sec"`                                           // Expiry seconds relative to generation time
 }
 
 // BootstrapManager manages mode-aware, validated recovery candidate records and produces authenticated bootstrap payloads.
 type BootstrapManager struct {
-	mu          sync.RWMutex
-	records     map[string]BootstrapEndpointRecord // Keyed by transport mode
-	defaultMode string
-	recoveryGen uint64
+	mu                    sync.RWMutex
+	records               map[string]BootstrapEndpointRecord // Keyed by transport mode
+	defaultMode           string
+	authoritativeServerID string
+	recoveryGen           uint64
 }
 
 // NewBootstrapManager creates a validated, mode-aware bootstrap manager.
@@ -358,6 +361,13 @@ func (bm *BootstrapManager) GetRecord(mode string) (BootstrapEndpointRecord, boo
 	return rec, ok
 }
 
+// SetAuthoritativeServerID sets the authoritative server identity associated with generated bootstrap records.
+func (bm *BootstrapManager) SetAuthoritativeServerID(id string) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	bm.authoritativeServerID = id
+}
+
 // SetRecoveryGen updates the active recovery revision generation.
 func (bm *BootstrapManager) SetRecoveryGen(gen uint64) {
 	bm.mu.Lock()
@@ -387,18 +397,24 @@ func (bm *BootstrapManager) GenerateResponse(req *EmergencyMessage, requestedMod
 		return nil, fmt.Errorf("no recovery candidate configured for transport mode %q", mode)
 	}
 
+	authID := rec.AuthoritativeServerID
+	if authID == "" {
+		authID = bm.authoritativeServerID
+	}
+
 	now := time.Now()
 	data := &BootstrapEndpointData{
-		Version:       2,
-		ServerIP:      rec.ServerIP,
-		TransportPort: rec.TransportPort,
-		TransportMode: rec.TransportMode,
-		IdentityType:  rec.IdentityType,
-		IdentityValue: rec.IdentityValue,
-		ServerPubKey:  "", // omit to keep JSON compact for single-datagram DNS recursion
-		ValidUntil:    now.Unix() + rec.ValiditySec,
-		RecoveryGen:   bm.recoveryGen,
-		RequestID:     req.ID,
+		Version:               2,
+		ServerIP:              rec.ServerIP,
+		TransportPort:         rec.TransportPort,
+		TransportMode:         rec.TransportMode,
+		IdentityType:          rec.IdentityType,
+		IdentityValue:         rec.IdentityValue,
+		AuthoritativeServerID: authID,
+		ServerPubKey:          "", // omit to keep JSON compact for single-datagram DNS recursion
+		ValidUntil:            now.Unix() + rec.ValiditySec,
+		RecoveryGen:           bm.recoveryGen,
+		RequestID:             req.ID,
 	}
 	return data, nil
 }
@@ -433,10 +449,11 @@ func (m *EmergencyMessage) Validate() error {
 
 // EmergencyResponse represents an authenticated server response returned inside a DNS TXT record.
 type EmergencyResponse struct {
-	ID        string `json:"id"`        // Echoes Request ID
-	Status    string `json:"status"`    // e.g. "OK", "ERROR"
-	Reply     []byte `json:"reply"`     // Dynamic response payload
-	Timestamp int64  `json:"timestamp"` // Server Unix timestamp
+	ID        string `json:"id"`                  // Echoes Request ID
+	Status    string `json:"status"`              // e.g. "OK", "ERROR"
+	ServerID  string `json:"server_id,omitempty"` // Cryptographic Server ID of the answering server
+	Reply     []byte `json:"reply"`               // Dynamic response payload
+	Timestamp int64  `json:"timestamp"`           // Server Unix timestamp
 }
 
 // EmergencyDNSServerConfig configures the authoritative DNS emergency service.
@@ -444,6 +461,7 @@ type EmergencyDNSServerConfig struct {
 	ListenAddr   string
 	DomainSuffix string
 	PSK          []byte
+	ServerID     string // Unique cryptographic identity of this authoritative server instance (e.g. "ns-de-01")
 	Handler      func(msg *EmergencyMessage) (*EmergencyResponse, error)
 }
 
@@ -517,6 +535,7 @@ type EmergencyDNSServer struct {
 	udpSem      chan struct{} // Bounded semaphore for simultaneous UDP packet handlers
 	tcpSem      chan struct{} // Bounded semaphore for simultaneous TCP connections
 	mu          sync.Mutex
+	stopOnce    sync.Once
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
 }
@@ -531,6 +550,9 @@ func NewEmergencyDNSServer(cfg EmergencyDNSServerConfig) (*EmergencyDNSServer, e
 	}
 	if len(cfg.PSK) != 32 {
 		return nil, errors.New("emergency dns: PSK must be exactly 32 bytes")
+	}
+	if cfg.ServerID == "" {
+		cfg.ServerID = "ns-de-01"
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
@@ -587,10 +609,13 @@ func (s *EmergencyDNSServer) ActiveSessionsCount() int {
 
 // Stop shuts down the authoritative DNS server cleanly.
 func (s *EmergencyDNSServer) Stop() error {
-	close(s.stopChan)
-	errUDP := s.udpConn.Close()
-	errTCP := s.tcpListener.Close()
-	s.wg.Wait()
+	var errUDP, errTCP error
+	s.stopOnce.Do(func() {
+		close(s.stopChan)
+		errUDP = s.udpConn.Close()
+		errTCP = s.tcpListener.Close()
+		s.wg.Wait()
+	})
 	if errUDP != nil {
 		return errUDP
 	}
@@ -908,14 +933,18 @@ func (s *EmergencyDNSServer) processExistingSessionQuery(
 			respMsg = &EmergencyResponse{
 				ID:        reqMsg.ID,
 				Status:    "ERROR",
+				ServerID:  s.cfg.ServerID,
 				Reply:     []byte(err.Error()),
 				Timestamp: time.Now().Unix(),
 			}
+		} else if respMsg != nil && respMsg.ServerID == "" {
+			respMsg.ServerID = s.cfg.ServerID
 		}
 	} else {
 		respMsg = &EmergencyResponse{
 			ID:        reqMsg.ID,
 			Status:    "OK",
+			ServerID:  s.cfg.ServerID,
 			Reply:     append([]byte("ACK_ECHO:"), reqMsg.Payload...),
 			Timestamp: time.Now().Unix(),
 		}
@@ -951,7 +980,7 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 	reqDigest [32]byte,
 ) []byte {
 	// 1. Ephemeral unpersisted session for candidate validation
-	candidateConn, err := NewServerAsymmetricSession(sessionID, s.cfg.PSK)
+	candidateConn, err := NewServerAsymmetricSessionWithID(sessionID, s.cfg.PSK, s.cfg.ServerID)
 	if err != nil {
 		return BuildDNSErrorResponse(reqPacket, 2 /* SERVFAIL */)
 	}
@@ -1049,14 +1078,18 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 			respMsg = &EmergencyResponse{
 				ID:        reqMsg.ID,
 				Status:    "ERROR",
+				ServerID:  s.cfg.ServerID,
 				Reply:     []byte(err.Error()),
 				Timestamp: time.Now().Unix(),
 			}
+		} else if respMsg != nil && respMsg.ServerID == "" {
+			respMsg.ServerID = s.cfg.ServerID
 		}
 	} else {
 		respMsg = &EmergencyResponse{
 			ID:        reqMsg.ID,
 			Status:    "OK",
+			ServerID:  s.cfg.ServerID,
 			Reply:     append([]byte("ACK_ECHO:"), reqMsg.Payload...),
 			Timestamp: time.Now().Unix(),
 		}
@@ -1084,27 +1117,58 @@ func (s *EmergencyDNSServer) processNewSessionQuery(
 	return dnsRespPacket
 }
 
+// DNSQueryAttemptRecord tracks detailed metrics and outcomes for each query attempt.
+type DNSQueryAttemptRecord struct {
+	AttemptIndex      int     `json:"attempt_index"`
+	ResolverAddr      string  `json:"resolver_addr"`
+	Protocol          string  `json:"protocol"` // "udp" or "tcp"
+	TxID              uint16  `json:"tx_id"`
+	SentAtMonotonicMs float64 `json:"sent_at_monotonic_ms"`
+	RcvdAtMonotonicMs float64 `json:"rcvd_at_monotonic_ms"`
+	DurationMs        float64 `json:"duration_ms"`
+	RCode             int     `json:"rcode"`
+	Truncated         bool    `json:"truncated"`
+	Authenticated     bool    `json:"authenticated"`
+	ServerID          string  `json:"server_id"`
+	Status            string  `json:"status"` // "SUCCESS", "TIMEOUT", "TRUNCATED_FALLBACK_TCP", "AUTH_FAIL", "DROP"
+	Error             string  `json:"error,omitempty"`
+}
+
 // EmergencyDNSClientConfig configures the emergency DNS client.
 type EmergencyDNSClientConfig struct {
-	ResolverAddr   string // e.g. "8.8.8.8:53"
-	DomainSuffix   string // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
-	ClientID       string
-	PSK            []byte
-	SessionID      uint64
-	Timeout        time.Duration
-	MaxRetries     int
-	EDNSBufferSize uint16 // Advertised UDP buffer size in OPT RR (default 1232)
+	ResolverAddr      string   // e.g. "8.8.8.8:53"
+	Resolvers         []string // Candidate resolvers for sequential failover (e.g. ["8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"])
+	DomainSuffix      string   // e.g. "tunnel.passionatepharmacistwithdeepaffectionfortechnologyanditscience.ir"
+	ClientID          string
+	PSK               []byte
+	SessionID         uint64
+	Timeout           time.Duration // Total timeout across all attempts
+	PerAttemptTimeout time.Duration // Timeout for an individual attempt (default 1500ms)
+	MaxRetries        int
+	EDNSBufferSize    uint16   // Advertised UDP buffer size in OPT RR (default 1232)
+	AuthorizedServers []string // Whitelist of authorized server IDs (fail closed if server ID not in list)
 }
 
 // EmergencyDNSClient sends authenticated application messages over public recursive DNS and verifies responses.
 type EmergencyDNSClient struct {
-	cfg     EmergencyDNSClientConfig
-	session *AsymmetricConn
+	cfg      EmergencyDNSClientConfig
+	session  *AsymmetricConn
+	mu       sync.Mutex
+	attempts []DNSQueryAttemptRecord
+}
+
+// LastExchangeAttempts returns a copy of the query attempts recorded during the last Exchange call.
+func (c *EmergencyDNSClient) LastExchangeAttempts() []DNSQueryAttemptRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	res := make([]DNSQueryAttemptRecord, len(c.attempts))
+	copy(res, c.attempts)
+	return res
 }
 
 // NewEmergencyDNSClient initializes an emergency client for a given session.
 func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, error) {
-	if cfg.ResolverAddr == "" {
+	if cfg.ResolverAddr == "" && len(cfg.Resolvers) == 0 {
 		cfg.ResolverAddr = "8.8.8.8:53"
 	}
 	if cfg.DomainSuffix == "" {
@@ -1117,7 +1181,10 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 		cfg.ClientID = "c01"
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 4000 * time.Millisecond
+		cfg.Timeout = 6000 * time.Millisecond
+	}
+	if cfg.PerAttemptTimeout <= 0 {
+		cfg.PerAttemptTimeout = 1500 * time.Millisecond
 	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 2
@@ -1129,7 +1196,7 @@ func NewEmergencyDNSClient(cfg EmergencyDNSClientConfig) (*EmergencyDNSClient, e
 		cfg.EDNSBufferSize = DefaultEDNSUDPPayloadSize
 	}
 
-	sess, err := NewClientAsymmetricSession(cfg.SessionID, cfg.PSK)
+	sess, err := NewClientAsymmetricSessionWithServers(cfg.SessionID, cfg.PSK, cfg.AuthorizedServers)
 	if err != nil {
 		return nil, err
 	}
@@ -1172,10 +1239,14 @@ func (c *EmergencyDNSClient) Exchange(ctx context.Context, msg *EmergencyMessage
 	// Generate a 64-bit cryptographically secure random nonce for cache busting
 	curOffset := cryptoRandUint64()
 
-	resolverUDP, err := net.ResolveUDPAddr("udp", c.cfg.ResolverAddr)
-	if err != nil {
-		return nil, 0, fmt.Errorf("resolve resolver addr %s: %w", c.cfg.ResolverAddr, err)
+	resolvers := c.cfg.Resolvers
+	if len(resolvers) == 0 {
+		resolvers = []string{c.cfg.ResolverAddr}
 	}
+
+	c.mu.Lock()
+	c.attempts = nil
+	c.mu.Unlock()
 
 	startOverall := time.Now()
 
@@ -1186,14 +1257,35 @@ func (c *EmergencyDNSClient) Exchange(ctx context.Context, msg *EmergencyMessage
 		default:
 		}
 
-		resp, err := c.attemptExchange(ctx, resolverUDP, curOffset, totalParts, frame, chunkSize, msg.ID)
+		resolverStr := resolvers[attempt%len(resolvers)]
+		resolverUDP, err := net.ResolveUDPAddr("udp", resolverStr)
+		if err != nil {
+			continue
+		}
+
+		perTimeout := c.cfg.PerAttemptTimeout
+		if perTimeout <= 0 {
+			perTimeout = 1500 * time.Millisecond
+		}
+		if perTimeout > c.cfg.Timeout {
+			perTimeout = c.cfg.Timeout
+		}
+
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, perTimeout)
+		resp, attemptRec, err := c.attemptExchangeWithRecord(attemptCtx, attempt, resolverUDP, resolverStr, curOffset, totalParts, frame, chunkSize, msg.ID, startOverall, perTimeout)
+		cancelAttempt()
+
+		c.mu.Lock()
+		c.attempts = append(c.attempts, attemptRec)
+		c.mu.Unlock()
+
 		if err == nil && resp != nil {
 			return resp, time.Since(startOverall), nil
 		}
 
 		if attempt < c.cfg.MaxRetries {
-			// Exponential backoff with jitter: 250ms * 2^attempt + jitter
-			backoff := time.Duration(250*(1<<attempt))*time.Millisecond + time.Duration(cryptoRandUint64()%50)*time.Millisecond
+			// Fast sequential fallback with 50-100ms jitter
+			backoff := 50*time.Millisecond + time.Duration(cryptoRandUint64()%50)*time.Millisecond
 			select {
 			case <-ctx.Done():
 				return nil, 0, ctx.Err()
@@ -1202,7 +1294,7 @@ func (c *EmergencyDNSClient) Exchange(ctx context.Context, msg *EmergencyMessage
 		}
 	}
 
-	return nil, time.Since(startOverall), fmt.Errorf("emergency exchange timed out after %d retries", c.cfg.MaxRetries)
+	return nil, time.Since(startOverall), fmt.Errorf("emergency exchange timed out after %d retries across resolvers %v", c.cfg.MaxRetries, resolvers)
 }
 
 func (c *EmergencyDNSClient) attemptExchange(
@@ -1214,13 +1306,44 @@ func (c *EmergencyDNSClient) attemptExchange(
 	chunkSize int,
 	expectedMsgID string,
 ) (*EmergencyResponse, error) {
+	resp, _, err := c.attemptExchangeWithRecord(ctx, 0, resolverUDP, resolverUDP.String(), curOffset, totalParts, frame, chunkSize, expectedMsgID, time.Now(), c.cfg.Timeout)
+	return resp, err
+}
+
+func (c *EmergencyDNSClient) attemptExchangeWithRecord(
+	ctx context.Context,
+	attemptIndex int,
+	resolverUDP *net.UDPAddr,
+	resolverStr string,
+	curOffset uint64,
+	totalParts uint8,
+	frame []byte,
+	chunkSize int,
+	expectedMsgID string,
+	startOverall time.Time,
+	attemptTimeout time.Duration,
+) (*EmergencyResponse, DNSQueryAttemptRecord, error) {
 	conn, err := net.ListenUDP("udp", nil)
+	attemptStart := time.Now()
+	sentMonotonicMs := float64(attemptStart.Sub(startOverall).Microseconds()) / 1000.0
+
+	rec := DNSQueryAttemptRecord{
+		AttemptIndex:      attemptIndex,
+		ResolverAddr:      resolverStr,
+		Protocol:          "udp",
+		SentAtMonotonicMs: sentMonotonicMs,
+	}
+
 	if err != nil {
-		return nil, err
+		rec.Status = "ERROR"
+		rec.Error = err.Error()
+		rec.DurationMs = float64(time.Since(attemptStart).Microseconds()) / 1000.0
+		rec.RcvdAtMonotonicMs = float64(time.Since(startOverall).Microseconds()) / 1000.0
+		return nil, rec, err
 	}
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(c.cfg.Timeout))
+	_ = conn.SetDeadline(attemptStart.Add(attemptTimeout))
 
 	type pendingQuery struct {
 		txID  uint16
@@ -1238,32 +1361,38 @@ func (c *EmergencyDNSClient) attemptExchange(
 		chunk := frame[start:end]
 
 		qname := EncodeDNSQName(c.cfg.DomainSuffix, c.cfg.ClientID, curOffset, i, totalParts, chunk)
-
-		// RFC 1035 limits validation: labels <= 63, full name <= 253
 		if len(qname) > 253 {
-			return nil, fmt.Errorf("emergency client: qname length %d exceeds RFC 1035 limit (253)", len(qname))
+			rec.Status = "ERROR"
+			rec.Error = "qname length exceeds 253"
+			return nil, rec, fmt.Errorf("emergency client: qname length %d exceeds RFC 1035 limit (253)", len(qname))
 		}
 
 		txID := uint16(cryptoRandUint64())
+		rec.TxID = txID
 		queryPkt := BuildDNSQueryWithEDNS(qname, 0x0010 /* TXT */, txID, c.cfg.EDNSBufferSize)
 		if _, err := conn.WriteToUDP(queryPkt, resolverUDP); err != nil {
-			return nil, err
+			rec.Status = "ERROR"
+			rec.Error = err.Error()
+			return nil, rec, err
 		}
 
 		queries = append(queries, pendingQuery{txID: txID, qname: qname})
 	}
 
 	buf := make([]byte, 4096)
-	deadline := time.Now().Add(c.cfg.Timeout)
+	deadline := attemptStart.Add(attemptTimeout)
 
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			rec.Status = "CANCELED"
+			rec.DurationMs = float64(time.Since(attemptStart).Microseconds()) / 1000.0
+			rec.RcvdAtMonotonicMs = float64(time.Since(startOverall).Microseconds()) / 1000.0
+			return nil, rec, ctx.Err()
 		default:
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		_ = conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			continue
@@ -1286,34 +1415,58 @@ func (c *EmergencyDNSClient) attemptExchange(
 			continue
 		}
 
+		rcvdTime := time.Now()
+		rec.DurationMs = float64(rcvdTime.Sub(attemptStart).Microseconds()) / 1000.0
+		rec.RcvdAtMonotonicMs = float64(rcvdTime.Sub(startOverall).Microseconds()) / 1000.0
+
 		respFlags := binary.BigEndian.Uint16(respPkt[2:4])
+		rec.RCode = int(respFlags & 0x000F)
 		if respFlags&0x0200 != 0 {
 			// TC (Truncation) flag is set: payload exceeded safe UDP buffer. Fall back to RFC 7766 TCP port 53!
-			return c.attemptTCPExchange(ctx, resolverUDP.String(), queries[0].qname, expectedMsgID)
+			rec.Truncated = true
+			rec.Status = "TRUNCATED_FALLBACK_TCP"
+			tcpResp, tcpRec, tcpErr := c.attemptTCPExchangeWithRecord(ctx, attemptIndex, resolverStr, queries[0].qname, expectedMsgID, startOverall, attemptTimeout)
+			if tcpErr == nil {
+				return tcpResp, tcpRec, nil
+			}
+			return nil, rec, tcpErr
 		}
 
 		txtAnswer, err := ParseDNSTXTResponse(respPkt)
 		if err != nil || len(txtAnswer) < AsymmetricHeaderLen {
+			rec.Status = "DROP"
+			rec.Error = "invalid txt response format"
 			continue
 		}
 
-		// Decrypt and authenticate downstream frame
-		_, _, respPlaintext, err := c.session.openFrame(txtAnswer)
+		// Decrypt and authenticate downstream frame with ServerID binding
+		_, _, respPlaintext, serverID, err := c.session.openFrameWithServerID(txtAnswer)
 		if err != nil {
-			continue
+			rec.Status = "AUTH_FAIL"
+			rec.Error = err.Error()
+			return nil, rec, err
 		}
 
 		var resp EmergencyResponse
 		if err := json.Unmarshal(respPlaintext, &resp); err != nil {
-			continue
+			rec.Status = "AUTH_FAIL"
+			rec.Error = "unmarshal json: " + err.Error()
+			return nil, rec, err
 		}
 
 		if resp.ID == expectedMsgID {
-			return &resp, nil
+			rec.Status = "SUCCESS"
+			rec.Authenticated = true
+			rec.ServerID = serverID
+			resp.ServerID = serverID
+			return &resp, rec, nil
 		}
 	}
 
-	return nil, errors.New("timeout waiting for valid response")
+	rec.Status = "TIMEOUT"
+	rec.DurationMs = float64(time.Since(attemptStart).Microseconds()) / 1000.0
+	rec.RcvdAtMonotonicMs = float64(time.Since(startOverall).Microseconds()) / 1000.0
+	return nil, rec, errors.New("timeout waiting for valid response")
 }
 
 func (c *EmergencyDNSClient) attemptTCPExchange(
@@ -1322,60 +1475,112 @@ func (c *EmergencyDNSClient) attemptTCPExchange(
 	qname string,
 	expectedMsgID string,
 ) (*EmergencyResponse, error) {
-	d := &net.Dialer{Timeout: c.cfg.Timeout}
+	resp, _, err := c.attemptTCPExchangeWithRecord(ctx, 0, resolverAddr, qname, expectedMsgID, time.Now(), c.cfg.Timeout)
+	return resp, err
+}
+
+func (c *EmergencyDNSClient) attemptTCPExchangeWithRecord(
+	ctx context.Context,
+	attemptIndex int,
+	resolverAddr string,
+	qname string,
+	expectedMsgID string,
+	startOverall time.Time,
+	attemptTimeout time.Duration,
+) (*EmergencyResponse, DNSQueryAttemptRecord, error) {
+	attemptStart := time.Now()
+	sentMonotonicMs := float64(attemptStart.Sub(startOverall).Microseconds()) / 1000.0
+
+	rec := DNSQueryAttemptRecord{
+		AttemptIndex:      attemptIndex,
+		ResolverAddr:      resolverAddr,
+		Protocol:          "tcp",
+		SentAtMonotonicMs: sentMonotonicMs,
+	}
+
+	d := &net.Dialer{Timeout: attemptTimeout}
 	conn, err := d.DialContext(ctx, "tcp", resolverAddr)
 	if err != nil {
-		return nil, fmt.Errorf("tcp dns fallback dial failed: %w", err)
+		rec.Status = "ERROR"
+		rec.Error = fmt.Sprintf("tcp dial: %v", err)
+		return nil, rec, fmt.Errorf("tcp dns fallback dial failed: %w", err)
 	}
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(c.cfg.Timeout))
+	_ = conn.SetDeadline(time.Now().Add(attemptTimeout))
 
 	txID := uint16(cryptoRandUint64())
+	rec.TxID = txID
 	queryPkt := BuildDNSQueryWithEDNS(qname, 0x0010 /* TXT */, txID, c.cfg.EDNSBufferSize)
 
-	// RFC 7766 TCP framing: 2-byte big-endian length prefix
 	frameBuf := make([]byte, 2+len(queryPkt))
 	binary.BigEndian.PutUint16(frameBuf[0:2], uint16(len(queryPkt)))
 	copy(frameBuf[2:], queryPkt)
 
 	if _, err := conn.Write(frameBuf); err != nil {
-		return nil, fmt.Errorf("tcp dns write: %w", err)
+		rec.Status = "ERROR"
+		rec.Error = err.Error()
+		return nil, rec, fmt.Errorf("tcp dns write: %w", err)
 	}
 
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		return nil, fmt.Errorf("tcp dns read len: %w", err)
+		rec.Status = "ERROR"
+		rec.Error = err.Error()
+		return nil, rec, fmt.Errorf("tcp dns read len: %w", err)
 	}
 	respLen := binary.BigEndian.Uint16(lenBuf[:])
 	respBuf := make([]byte, respLen)
 	if _, err := io.ReadFull(conn, respBuf); err != nil {
-		return nil, fmt.Errorf("tcp dns read packet: %w", err)
+		rec.Status = "ERROR"
+		rec.Error = err.Error()
+		return nil, rec, fmt.Errorf("tcp dns read packet: %w", err)
 	}
 
+	rcvdTime := time.Now()
+	rec.DurationMs = float64(rcvdTime.Sub(attemptStart).Microseconds()) / 1000.0
+	rec.RcvdAtMonotonicMs = float64(rcvdTime.Sub(startOverall).Microseconds()) / 1000.0
+
 	if len(respBuf) < 12 {
-		return nil, errors.New("tcp dns: response too short")
+		rec.Status = "ERROR"
+		return nil, rec, errors.New("tcp dns: response too short")
 	}
+
+	respFlags := binary.BigEndian.Uint16(respBuf[2:4])
+	rec.RCode = int(respFlags & 0x000F)
 
 	txtAnswer, err := ParseDNSTXTResponse(respBuf)
 	if err != nil || len(txtAnswer) < AsymmetricHeaderLen {
-		return nil, fmt.Errorf("tcp dns parse txt: %w", err)
+		rec.Status = "DROP"
+		rec.Error = "invalid txt format"
+		return nil, rec, fmt.Errorf("tcp dns parse txt: %w", err)
 	}
 
-	_, _, respPlaintext, err := c.session.openFrame(txtAnswer)
+	_, _, respPlaintext, serverID, err := c.session.openFrameWithServerID(txtAnswer)
 	if err != nil {
-		return nil, fmt.Errorf("tcp dns auth frame: %w", err)
+		rec.Status = "AUTH_FAIL"
+		rec.Error = err.Error()
+		return nil, rec, fmt.Errorf("tcp dns auth frame: %w", err)
 	}
 
 	var resp EmergencyResponse
 	if err := json.Unmarshal(respPlaintext, &resp); err != nil {
-		return nil, fmt.Errorf("tcp dns unmarshal json: %w", err)
+		rec.Status = "AUTH_FAIL"
+		rec.Error = "unmarshal json: " + err.Error()
+		return nil, rec, fmt.Errorf("tcp dns unmarshal json: %w", err)
 	}
 
 	if resp.ID == expectedMsgID {
-		return &resp, nil
+		rec.Status = "SUCCESS"
+		rec.Authenticated = true
+		rec.ServerID = serverID
+		resp.ServerID = serverID
+		return &resp, rec, nil
 	}
-	return nil, fmt.Errorf("tcp dns unexpected message id: got %s, want %s", resp.ID, expectedMsgID)
+
+	rec.Status = "AUTH_FAIL"
+	rec.Error = "unexpected message id"
+	return nil, rec, fmt.Errorf("tcp dns unexpected message id: got %s, want %s", resp.ID, expectedMsgID)
 }
 
 // GenerateEmergencyKey produces a fresh 32-byte cryptographically secure random key.

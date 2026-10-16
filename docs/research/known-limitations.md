@@ -126,13 +126,23 @@ Passing self-authored unit tests, adversarial fuzz harnesses, or simulated middl
 
 ## 15. Post-Activation Request Latency vs. Total End-to-End Failover Duration
 
-- **Scope & Distinction (Phase 15):** In live testing, the application request through SOCKS5 `:11990` completed in **87.94 ms** (or 179.16 ms in Phase 14). This metric represents the HTTP round-trip latency *after* the recovery candidate has been authenticated and placed in `RECOVERY_READY`.
+- **Scope & Distinction (Phase 16 Telemetry Reconciled):** In live testing, the application request through SOCKS5 `:11990` completed in **87.47 ms** (87.94 ms in Phase 15, 179.16 ms in Phase 14). This metric represents the HTTP round-trip latency *after* the recovery candidate has been authenticated and placed in `RECOVERY_READY`.
 - **Total Failover Duration:** The full duration from the moment the primary transport is severed to the moment the first valid application response is verified includes:
-  1. Primary failure detection threshold crossing (35.40 ms).
-  2. Degraded-state hysteresis delay (60.62 ms).
-  3. Public recursive DNS bootstrap exchange RTT (4639.34 ms via Google `8.8.8.8:53`).
-  4. Candidate cryptographic handshake validation (0.00 ms).
-  5. State activation delay (0.00 ms).
-  6. Post-activation application request through SOCKS5 (87.94 ms).
-  7. **Total Monotonic Failover Duration: 4993.79 ms (~4.99 seconds)**.
-- **Operational Reality:** An 87 ms application request latency is expected for an active proxy channel, but operators must understand that automated failover across international public recursive DNS takes approximately 5 seconds from initial failure to restored traffic. Technical documentation must never misrepresent an 87 ms post-activation request as "87 ms total failover".
+  1. Primary failure detection threshold crossing (18.73 ms).
+  2. Degraded-state hysteresis delay (60.49 ms).
+  3. Signaling dispatch delay (0.33 ms).
+  4. Public recursive DNS bootstrap exchange RTT (160.63 ms via Google `8.8.8.8:53`).
+  5. Candidate validation dispatch delay (0.12 ms).
+  6. Candidate cryptographic handshake validation (178.12 ms).
+  7. State activation delay (0.03 ms).
+  8. Application connection dispatch delay (0.04 ms).
+  9. Post-activation application request through SOCKS5 (87.47 ms).
+  10. Unaccounted overhead: 0.000 ms (exact mathematical reconciliation).
+  11. **Total Monotonic Failover Duration: 505.95 ms (~0.51 seconds)**.
+- **Operational Reality:** When recursive DNS responses are processed without packet drops or multi-second resolver timeouts, failover achieves restored application traffic within ~506 ms. If public recursive resolvers experience cross-border packet drops, client retry backoffs can extend total failover to ~4.99 seconds (as observed in Phase 15). Technical documentation must distinguish the post-activation application request latency (87 ms) from the total failure-to-restored-traffic duration (506 ms to 4.99 s).
+
+---
+
+## 16. Multi-Authoritative Control Plane Statelessness Requirement
+
+- **Multipart Incompatibility Across Uncoordinated Nameservers:** While single-datagram emergency messages ($\le 64\text{ bytes}$) operate seamlessly across independent authoritative nameservers, multi-packet fragmented messages require in-memory reassembly buffers that are local to each server instance. If resolver load-balancing splits fragments across two independent servers, neither server can complete reassembly. Therefore, multi-authoritative emergency DNS is strictly constrained to single-query messages ($\le 64\text{ bytes}$). General-purpose data tunnels cannot span uncoordinated multi-authoritative servers without a shared state coordination bus.

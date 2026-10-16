@@ -16,12 +16,19 @@ import (
 )
 
 const (
-	// AsymmetricMagic identifies asymmetric transport frames ("PAQA").
+	// AsymmetricMagic identifies legacy v2 asymmetric transport frames ("PAQA").
 	AsymmetricMagic uint32 = 0x50415141
 
-	// AsymmetricHeaderLen is the fixed size of unencrypted frame header:
+	// AsymmetricMagicV3 identifies v3 asymmetric transport frames with explicit ServerID domain separation ("PAQC").
+	AsymmetricMagicV3 uint32 = 0x50415143
+
+	// AsymmetricHeaderLen is the fixed size of unencrypted v2 frame header:
 	// Magic (4) + SessionID (8) + Seq (4) + Ack (4) = 20 bytes.
 	AsymmetricHeaderLen = 20
+
+	// AsymmetricHeaderV3MinLen is the minimum size of unencrypted v3 frame header:
+	// Magic (4) + SessionID (8) + Seq (4) + Ack (4) + ServerIDLen (1) = 21 bytes.
+	AsymmetricHeaderV3MinLen = 21
 
 	// DefaultAsymmetricMTU is the maximum payload size per chunk (120 bytes for DNS, 1380 for UDP).
 	DefaultAsymmetricMTU = 1380
@@ -85,19 +92,23 @@ type UpstreamReceiver interface {
 
 // AsymmetricConn implements net.Conn over directionally decoupled upstream and downstream transports.
 type AsymmetricConn struct {
-	sessionID  uint64
-	role       Role
-	mtu        int
-	psk        []byte
-	encKey     []byte
-	decKey     []byte
-	sendSeq    atomic.Uint32
-	lastAckRcv atomic.Uint32
-	nextRecv   atomic.Uint32
+	sessionID         uint64
+	role              Role
+	serverID          string          // Authoritative server ID for multi-authority domain separation
+	authorizedServers map[string]bool // Optional client-side whitelist of authorized server IDs
+	mtu               int
+	psk               []byte
+	encKey            []byte
+	decKey            []byte
+	sendSeq           atomic.Uint32
+	lastAckRcv        atomic.Uint32
+	nextRecv          atomic.Uint32
 
-	sender   UpstreamSender
-	receiver DownstreamReceiver
-	replay   *replay.Filter
+	sender       UpstreamSender
+	receiver     DownstreamReceiver
+	replay       *replay.Filter
+	serverReplay map[string]*replay.Filter
+	replayMu     sync.Mutex
 
 	pipeR *io.PipeReader
 	pipeW *io.PipeWriter
@@ -133,7 +144,7 @@ func NewClientAsymmetricConn(
 		mtu = DefaultAsymmetricMTU
 	}
 
-	c2s, s2c, err := crypto.DeriveKeys(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)))
+	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)), "default")
 	if err != nil {
 		return nil, fmt.Errorf("derive keys: %w", err)
 	}
@@ -273,18 +284,46 @@ func (c *AsymmetricConn) NextSendSeq() uint32 {
 	return c.sendSeq.Add(1)
 }
 
+// ServerID returns the configured server ID for this connection.
+func (c *AsymmetricConn) ServerID() string {
+	return c.serverID
+}
+
+// SetServerID sets the authoritative server ID.
+func (c *AsymmetricConn) SetServerID(id string) {
+	c.serverID = id
+}
+
+// SetAuthorizedServers sets the whitelist of authorized server IDs for client connections.
+func (c *AsymmetricConn) SetAuthorizedServers(servers []string) {
+	c.authorizedServers = make(map[string]bool)
+	for _, s := range servers {
+		c.authorizedServers[s] = true
+	}
+}
+
 // NewServerAsymmetricSession creates an AsymmetricConn configured as RoleServer for a given session.
 func NewServerAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
-	c2s, s2c, err := crypto.DeriveKeys(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)))
+	return NewServerAsymmetricSessionWithID(sessionID, psk, "default")
+}
+
+// NewServerAsymmetricSessionWithID creates an AsymmetricConn configured as RoleServer with a specific ServerID.
+func NewServerAsymmetricSessionWithID(sessionID uint64, psk []byte, serverID string) (*AsymmetricConn, error) {
+	if serverID == "" {
+		serverID = "default"
+	}
+	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
+	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, salt, serverID)
 	if err != nil {
-		return nil, fmt.Errorf("derive keys: %w", err)
+		return nil, fmt.Errorf("derive server keys: %w", err)
 	}
 
 	return &AsymmetricConn{
 		sessionID: sessionID,
 		role:      RoleServer,
+		serverID:  serverID,
 		psk:       psk,
-		encKey:    s2c, // server encrypts with s2c
+		encKey:    s2c, // server encrypts with s2c bound to serverID
 		decKey:    c2s, // server decrypts with c2s
 		replay:    replay.NewFilter(30 * time.Second),
 	}, nil
@@ -292,28 +331,60 @@ func NewServerAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, 
 
 // NewClientAsymmetricSession creates an AsymmetricConn configured as RoleClient for a given session.
 func NewClientAsymmetricSession(sessionID uint64, psk []byte) (*AsymmetricConn, error) {
-	c2s, s2c, err := crypto.DeriveKeys(psk, []byte(fmt.Sprintf("paqet-asym-%d", sessionID)))
+	return NewClientAsymmetricSessionWithServers(sessionID, psk, nil)
+}
+
+// NewClientAsymmetricSessionWithServers creates an AsymmetricConn configured as RoleClient with authorized servers.
+func NewClientAsymmetricSessionWithServers(sessionID uint64, psk []byte, authorizedServers []string) (*AsymmetricConn, error) {
+	salt := []byte(fmt.Sprintf("paqet-asym-%d", sessionID))
+	c2s, s2c, err := crypto.DeriveServerTrafficKeys(psk, salt, "default")
 	if err != nil {
-		return nil, fmt.Errorf("derive keys: %w", err)
+		return nil, fmt.Errorf("derive client keys: %w", err)
+	}
+
+	authMap := make(map[string]bool)
+	for _, s := range authorizedServers {
+		authMap[s] = true
 	}
 
 	return &AsymmetricConn{
-		sessionID: sessionID,
-		role:      RoleClient,
-		psk:       psk,
-		encKey:    c2s, // client encrypts with c2s
-		decKey:    s2c, // client decrypts with s2c
-		replay:    replay.NewFilter(30 * time.Second),
+		sessionID:         sessionID,
+		role:              RoleClient,
+		psk:               psk,
+		encKey:            c2s, // client encrypts with c2s
+		decKey:            s2c, // default s2c; dynamically derives if serverID is in v3 header
+		authorizedServers: authMap,
+		replay:            replay.NewFilter(30 * time.Second),
 	}, nil
 }
 
 // sealFrame packs Magic, SessionID, Seq, Ack, and AEAD-encrypted payload into a wire datagram.
 func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, error) {
-	header := make([]byte, AsymmetricHeaderLen)
-	binary.BigEndian.PutUint32(header[0:4], AsymmetricMagic)
-	binary.BigEndian.PutUint64(header[4:12], c.sessionID)
-	binary.BigEndian.PutUint32(header[12:16], seq)
-	binary.BigEndian.PutUint32(header[16:20], ack)
+	var header []byte
+	if c.serverID != "" || c.role == RoleServer {
+		srvID := c.serverID
+		if srvID == "" {
+			srvID = "default"
+		}
+		if len(srvID) > 64 {
+			return nil, errors.New("asymmetric: serverID exceeds 64 bytes limit")
+		}
+		header = make([]byte, AsymmetricHeaderV3MinLen+len(srvID))
+		binary.BigEndian.PutUint32(header[0:4], AsymmetricMagicV3)
+		binary.BigEndian.PutUint64(header[4:12], c.sessionID)
+		binary.BigEndian.PutUint32(header[12:16], seq)
+		binary.BigEndian.PutUint32(header[16:20], ack)
+		header[20] = byte(len(srvID))
+		copy(header[21:], srvID)
+	} else {
+		// Client upstream v3 frame: ServerIDLen = 0
+		header = make([]byte, AsymmetricHeaderV3MinLen)
+		binary.BigEndian.PutUint32(header[0:4], AsymmetricMagicV3)
+		binary.BigEndian.PutUint64(header[4:12], c.sessionID)
+		binary.BigEndian.PutUint32(header[12:16], seq)
+		binary.BigEndian.PutUint32(header[16:20], ack)
+		header[20] = 0 // No server ID in upstream
+	}
 
 	// Nonce is deterministically constructed from SessionID, Seq, and Role (12 bytes)
 	nonce := make([]byte, crypto.NonceSize)
@@ -329,33 +400,55 @@ func (c *AsymmetricConn) sealFrame(seq, ack uint32, plaintext []byte) ([]byte, e
 	// Encrypt plaintext with header authenticated as AAD
 	ciphertext := aead.Seal(nil, nonce, plaintext, header)
 
-	frame := make([]byte, AsymmetricHeaderLen+len(ciphertext))
-	copy(frame[:AsymmetricHeaderLen], header)
-	copy(frame[AsymmetricHeaderLen:], ciphertext)
+	frame := make([]byte, len(header)+len(ciphertext))
+	copy(frame[:len(header)], header)
+	copy(frame[len(header):], ciphertext)
 	return frame, nil
 }
 
-// VerifyFrame cryptographically verifies the frame's header, magic, session ID,
-// and AEAD authentication tag, and returns the decrypted plaintext WITHOUT
-// updating or checking the sliding replay window.
-// This allows authenticating retransmissions before consulting the duplicate reply cache.
-func (c *AsymmetricConn) VerifyFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
+// VerifyFrameWithServerID cryptographically verifies the frame's header, magic, session ID,
+// and AEAD authentication tag, returning the decrypted plaintext and authenticating ServerID.
+func (c *AsymmetricConn) VerifyFrameWithServerID(frame []byte) (seq, ack uint32, plaintext []byte, serverID string, err error) {
 	if len(frame) < AsymmetricHeaderLen+crypto.TagSize {
-		return 0, 0, nil, ErrAsymmetricShortFrame
+		return 0, 0, nil, "", ErrAsymmetricShortFrame
 	}
 
 	magic := binary.BigEndian.Uint32(frame[0:4])
-	if magic != AsymmetricMagic {
-		return 0, 0, nil, ErrAsymmetricInvalidMagic
+	var headerLen int
+	var sessID uint64
+
+	switch magic {
+	case AsymmetricMagicV3:
+		if len(frame) < AsymmetricHeaderV3MinLen+crypto.TagSize {
+			return 0, 0, nil, "", ErrAsymmetricShortFrame
+		}
+		sessID = binary.BigEndian.Uint64(frame[4:12])
+		seq = binary.BigEndian.Uint32(frame[12:16])
+		ack = binary.BigEndian.Uint32(frame[16:20])
+		srvIDLen := int(frame[20])
+		headerLen = AsymmetricHeaderV3MinLen + srvIDLen
+		if len(frame) < headerLen+crypto.TagSize {
+			return 0, 0, nil, "", ErrAsymmetricShortFrame
+		}
+		if srvIDLen > 0 {
+			serverID = string(frame[21 : 21+srvIDLen])
+		}
+
+	case AsymmetricMagic:
+		// Legacy v2 frame
+		sessID = binary.BigEndian.Uint64(frame[4:12])
+		seq = binary.BigEndian.Uint32(frame[12:16])
+		ack = binary.BigEndian.Uint32(frame[16:20])
+		headerLen = AsymmetricHeaderLen
+		serverID = "legacy"
+
+	default:
+		return 0, 0, nil, "", ErrAsymmetricInvalidMagic
 	}
 
-	sessID := binary.BigEndian.Uint64(frame[4:12])
 	if sessID != c.sessionID {
-		return 0, 0, nil, fmt.Errorf("session ID mismatch: got %d, want %d", sessID, c.sessionID)
+		return 0, 0, nil, "", fmt.Errorf("session ID mismatch: got %d, want %d", sessID, c.sessionID)
 	}
-
-	seq = binary.BigEndian.Uint32(frame[12:16])
-	ack = binary.BigEndian.Uint32(frame[16:20])
 
 	peerRole := RoleServer
 	if c.role == RoleServer {
@@ -366,37 +459,86 @@ func (c *AsymmetricConn) VerifyFrame(frame []byte) (seq, ack uint32, plaintext [
 	binary.BigEndian.PutUint32(nonce[8:12], seq)
 	nonce[0] ^= byte(peerRole)
 
-	aead, err := crypto.NewAEAD(c.decKey)
-	if err != nil {
-		return 0, 0, nil, err
+	var decKey []byte
+	if c.role == RoleClient && magic == AsymmetricMagicV3 && serverID != "" {
+		// Client verifying downstream server response:
+		// Check server authorization policy
+		if len(c.authorizedServers) > 0 && !c.authorizedServers[serverID] {
+			return 0, 0, nil, serverID, fmt.Errorf("server %q is not authorized by client policy (fail-closed)", serverID)
+		}
+		salt := []byte(fmt.Sprintf("paqet-asym-%d", c.sessionID))
+		sKey, err := crypto.DeriveServerResponseKey(c.psk, salt, serverID)
+		if err != nil {
+			return 0, 0, nil, serverID, fmt.Errorf("derive server response key: %w", err)
+		}
+		decKey = sKey
+	} else {
+		decKey = c.decKey
 	}
 
-	header := frame[:AsymmetricHeaderLen]
-	ciphertext := frame[AsymmetricHeaderLen:]
+	aead, err := crypto.NewAEAD(decKey)
+	if err != nil {
+		return 0, 0, nil, serverID, err
+	}
+
+	header := frame[:headerLen]
+	ciphertext := frame[headerLen:]
 
 	plaintext, err = aead.Open(nil, nonce, ciphertext, header)
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("aead open: %w", err)
+		return 0, 0, nil, serverID, fmt.Errorf("aead open: %w", err)
 	}
 
-	return seq, ack, plaintext, nil
+	return seq, ack, plaintext, serverID, nil
+}
+
+// VerifyFrame cryptographically verifies the frame's header, magic, session ID,
+// and AEAD authentication tag, and returns the decrypted plaintext WITHOUT
+// updating or checking the sliding replay window.
+func (c *AsymmetricConn) VerifyFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
+	seq, ack, plaintext, _, err = c.VerifyFrameWithServerID(frame)
+	return seq, ack, plaintext, err
 }
 
 // openFrame parses, verifies replay, and decrypts an incoming wire datagram.
 func (c *AsymmetricConn) openFrame(frame []byte) (seq, ack uint32, plaintext []byte, err error) {
-	seq, ack, plaintext, err = c.VerifyFrame(frame)
+	seq, ack, plaintext, _, err = c.openFrameWithServerID(frame)
+	return seq, ack, plaintext, err
+}
+
+// openFrameWithServerID parses, verifies replay, and decrypts an incoming wire datagram, returning serverID.
+func (c *AsymmetricConn) openFrameWithServerID(frame []byte) (seq, ack uint32, plaintext []byte, serverID string, err error) {
+	seq, ack, plaintext, serverID, err = c.VerifyFrameWithServerID(frame)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, serverID, err
 	}
 
 	// Replay verification and recording ONLY AFTER successful authentication
-	if c.replay != nil {
-		if err := c.replay.Validate(uint64(seq)); err != nil {
-			return 0, 0, nil, fmt.Errorf("replay check seq %d: %w", seq, err)
+	c.replayMu.Lock()
+	defer c.replayMu.Unlock()
+
+	var filter *replay.Filter
+	if c.role == RoleClient && serverID != "" {
+		if c.serverReplay == nil {
+			c.serverReplay = make(map[string]*replay.Filter)
+		}
+		f, ok := c.serverReplay[serverID]
+		if !ok {
+			f = replay.NewFilter(30 * time.Second)
+			c.serverReplay[serverID] = f
+		}
+		filter = f
+	} else {
+		filter = c.replay
+	}
+
+	if filter != nil {
+		if err := filter.Validate(uint64(seq)); err != nil {
+			return 0, 0, nil, serverID, fmt.Errorf("replay check seq %d for server %q: %w", seq, serverID, err)
 		}
 	}
 
-	return seq, ack, plaintext, nil
+	return seq, ack, plaintext, serverID, nil
 }
 
 // recvLoop processes inbound packets from the downstream receiver, reordering as needed.

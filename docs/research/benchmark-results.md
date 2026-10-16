@@ -132,4 +132,33 @@ Executed against `v2.5.2-hardened` (`secp0hardened`, SHA-256 `c6c2331188d650d00b
 4. **Conclusion:** All empirical figures are observations from the tested sample under specific cross-border network conditions. Emergency control signaling must remain strictly $\le 64\text{ bytes}$.
 5. **Artifact Reference:** Reconciled JSON dataset preserved in `docs/research/emergency_dns_hardened_soak_stats.json`. Deterministic calculation engine in `internal/ng/dns/benchmark_analysis.go`.
 
+### 5.3 Phase 16 Recovery Telemetry Diagnosis & Reconciled Benchmark
+
+#### Monotonic Recovery Timeline Breakdown (Live Iran ⇄ Germany Run)
+Executed live against `v2.5.8-telemetry` (GitCommit: `phase16audit`, SHA-256 `6bc774a9f5ec60b24c60587640f7e98d663a5b8446ea753d54c4770afba00532`):
+
+| Timeline Milestone | Cumulative Monotonic Time | Component Interval Duration | Milestone Description |
+| :--- | :--- | :--- | :--- |
+| **T0: Failure Injected** | $0.00\text{ ms}$ | — | Primary transport port `:18088` severed via firewall rule |
+| **T1: Threshold Crossed** | $18.73\text{ ms}$ | $18.73\text{ ms}$ | Consecutive primary failure detected; state $\rightarrow$ `PRIMARY_DEGRADED` |
+| **T2: Hysteresis Expired** | $79.22\text{ ms}$ | $60.49\text{ ms}$ | Degraded hysteresis window elapsed ($50\text{ms}$ config + loop latency) |
+| **T3: DNS Dispatched** | $79.55\text{ ms}$ | $0.33\text{ ms}$ | Query dispatched to Google recursor `8.8.8.8:53` (1232B EDNS0 buffer) |
+| **T4: Bootstrap Received** | $240.17\text{ ms}$ | $160.63\text{ ms}$ | Authenticated bootstrap payload received (ServerID: `ns-de-01`) |
+| **T5: Validation Started** | $240.29\text{ ms}$ | $0.12\text{ ms}$ | Candidate remote handshake initiated |
+| **T6: Validation Completed**| $418.41\text{ ms}$ | $178.12\text{ ms}$ | Remote AEAD handshake, smux session, and `PPING`/`PPONG` verified |
+| **T7: State Activated** | $418.44\text{ ms}$ | $0.03\text{ ms}$ | State transitioned to `RECOVERY_READY` (generation revision 6) |
+| **T8: App Request Sent** | $418.49\text{ ms}$ | $0.04\text{ ms}$ | Application HTTP request dispatched through SOCKS5 proxy `:11990` |
+| **T9: App Response Verified**| $505.95\text{ ms}$ | $87.47\text{ ms}$ | HTTP 200 returned from remote origin; token byte-exact verified |
+| **TOTAL FAILOVER DURATION** | **$505.95\text{ ms}$** | **$505.95\text{ ms}$** | **Failure injection ($T_0$) to restored application traffic ($T_9$)** |
+| **Unaccounted Overhead** | — | **$0.000\text{ ms}$** | Exact mathematical identity: $\sum \text{Intervals} = T_9 - T_0$ |
+| **T10: Rollback Completed** | $506.32\text{ ms}$ | $0.37\text{ ms}$ | `ResetRollback` executed; state returned to `PRIMARY_HEALTHY` |
+| **T11: Network Restored** | $526.77\text{ ms}$ | $20.45\text{ ms}$ | Iptables DROP rule deleted; primary network restored |
+
+#### Production Service Health Verification
+- **Target:** Production SOCKS5 proxy on `127.0.0.1:1090` (authenticated `arash:arash`).
+- **Endpoint:** `http://127.0.0.1:8999/ping`
+- **Result:** Status `HEALTHY`, Response `"pong"`, Duration $132.24\text{ ms}$.
+- **Artifact Reference:** `docs/research/recovery_socks5_live_audit_phase16.json`.
+
+
 

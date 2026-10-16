@@ -287,3 +287,67 @@ Executed live on authorized infrastructure:
   * Unknown transport mode rejected fail-closed in 0.00 ms.
 - **Production SOCKS5 Health:** Checked immediately following live run (`127.0.0.1:1090`) -> `pong` (healthy throughout).
 - **Evidentiary Artifact:** Logged to `docs/research/recovery_socks5_live_audit_phase15.json`.
+
+---
+
+## 9. Telemetry Correction, Sizing Verification & Multi-Authoritative Adversarial Suite (Phase 16)
+
+### 9.1 Multi-Authoritative Cryptographic Safety Suite
+Executed via `internal/ng/transport/dns_redundancy_test.go`:
+- `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation`:
+  * Spawns Server A (`srv-de-01`) and Server B (`srv-nl-01`) sharing identical PSK and session ID.
+  * Verifies both servers derive distinct `s2c` keys using HKDF domain separation (`s2c_A != s2c_B`).
+  * Demonstrates that Server A's response is decrypted using Server A's identity and Server B's response using Server B's identity.
+  * Rejects tampered ServerID in header AAD fail-closed.
+  * Rejects responses from unauthorized rogue Server C (`srv-rogue-01`) fail-closed.
+  * Replays to Server A return identical cached ciphertext, mathematically preventing new encryption under a reused nonce.
+  * Executes concurrent requests to both servers with zero race conditions.
+- `TestMultiAuthoritative_FailoverAndServerRestart`:
+  * Exercises client sequential failover across resolvers: Server A answers Exchange 1.
+  * Server A is cleanly stopped (`serverA.Stop()`).
+  * Exchange 2 cleanly fails over to Server B, decrypts authenticated reply, and verifies `ServerID = srv-nl-01`.
+  * Verifies per-server anti-replay filters prevent false replay rejections across distinct server sequence spaces.
+  * Verified attempt telemetry records 2 attempts during failover (Attempt 0: `TIMEOUT`, Attempt 1: `SUCCESS`).
+
+### 9.2 Strict EDNS Response Sizing Suite
+Executed via `internal/ng/transport/dns_edns_truncation_test.go`:
+- `TestEDNS0_AllAdvertisedSizesAndSizingRule`:
+  * Validates sizes 512, 768, 1024, 1232, 1400, and 4096.
+  * For 512-byte limit, 600-byte payload triggers `TC = 1`, `ANCOUNT = 0`, and serialized length $\le 512$.
+  * For limits $\ge 768$, 600-byte payload delivers complete answer with `TC = 0`, `ANCOUNT = 1`.
+  * For all sizes, 1500-byte payload (> 1400-byte server cap) triggers `TC = 1`.
+- `TestEDNS0_NoEDNS_LimitsTo512AndOmitsOPT`:
+  * Requests without EDNS strictly enforce 512-byte ceiling and omit OPT RR from responses (`ARCOUNT = 0`).
+- `TestEDNS0_MultipleAdditionalRecords`:
+  * Confirms parser correctly traverses multiple resource records in the Additional section to extract the OPT pseudo-RR.
+
+### 9.3 Monotonic Timeline Validator Suite
+Executed via `internal/ng/transport/timeline_validator_test.go`:
+- `TestTimelineValidator_ValidTimelineReconciles`: Verifies exact reconciliation ($\sum \text{components} = \text{total}$) with zero unaccounted overhead.
+- `TestTimelineValidator_NonMonotonicRejected`: Verifies descriptive rejection when timestamps violate monotonic sequence.
+
+### 9.4 Live Reconciled Failover Telemetry (Iran ⇄ Germany via Public Recursive DNS)
+Executed live on authorized infrastructure:
+- **Client Host:** Iran VPS (`185.18.215.124`, Panel01)
+- **Server Host:** Germany VPS (`77.37.65.2`, Hetzner)
+- **DNS Resolver Pool:** Google `8.8.8.8:53` and Cloudflare `1.1.1.1:53`
+- **EDNS Buffer:** Conservative 1232 bytes (`DefaultEDNSUDPPayloadSize`)
+- **Unpredictable Token:** `PHASE16_PROVEN_ce3bc1913762b15a977917d8a9c25bed`
+- **Reconciled Monotonic Timeline:**
+  * **T0 (Primary Failure Injected):** 0.00 ms (iptables DROP on `:18088`)
+  * **T1 (Failure Threshold Crossed):** 18.73 ms (`PRIMARY_DEGRADED`)
+  * **T2 (Degraded Hysteresis Expired):** 79.22 ms (60.49 ms hysteresis delay)
+  * **T3 (DNS Request Dispatched):** 79.55 ms (Sent to `8.8.8.8:53`)
+  * **T4 (DNS Bootstrap Received):** 240.17 ms (DNS RTT: **160.63 ms**, ServerID: `ns-de-01`)
+  * **T5 (Candidate Validation Started):** 240.29 ms
+  * **T6 (Candidate Validation Completed):** 418.41 ms (Validation Handshake RTT: **178.12 ms**)
+  * **T7 (Recovery State Activated):** 418.44 ms (`RECOVERY_READY`, generation revision 6)
+  * **T8 (First App Connection Started):** 418.49 ms (Issued via SOCKS5 `:11990`)
+  * **T9 (First App Response Verified):** 505.95 ms (Post-activation request RTT: **87.47 ms**)
+  * **Total Failure-to-First-Response Duration (T9 - T0): 505.95 ms**
+  * **Unaccounted Overhead:** **0.000 ms** (exact mathematical identity)
+  * **T10 (Rollback Completed):** 506.32 ms (`PRIMARY_HEALTHY`)
+  * **T11 (Primary Network Restored):** 526.77 ms (Iptables DROP rule deleted in 20.45 ms)
+- **Production SOCKS5 Proxy Verification:**
+  * Target: `127.0.0.1:1090` (authenticated SOCKS5 `arash:arash`) -> `pong` in **132.24 ms** (`HEALTHY`).
+- **Evidentiary Artifact:** Logged to `docs/research/recovery_socks5_live_audit_phase16.json`.

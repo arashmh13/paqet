@@ -39,6 +39,8 @@ This document defines an explicit, empirically grounded resilience matrix classi
 | **FD-15** | **Rollback / Generation Race During Dial** | Rollback or generation increments while dial in flight | Identity verified before pool insertion; socket closed | Tested via `TestTimedConn_GenerationChangeOrRollbackDuringDialRejectsConnection` | **FAIL-CLOSED SAFE** |
 | **FD-16** | **DNS Response Exceeding Safe UDP Limit** | Server response exceeds 1400 bytes | Server sets TC=1; client retries via RFC 7766 TCP :53 | Tested via `TestEDNS0_ResponseTruncationWhenExceedingLimit` & `TestEDNS0_TCPPort53FallbackOnTruncation` | **PROVEN & VERIFIED** |
 | **FD-17** | **Emergency PSK Conflation** | Emergency server started without candidate identity flags | Implicit fallback removed; daemon fails startup | Tested via `TestEmergencyServerStartup_AEADWithoutKeyOrPinFails` & live CLI verification | **FAIL-CLOSED SAFE** |
+| **FD-18** | **Cross-Server Nonce Reuse in Multi-Authoritative** | Two independent authoritative servers answer same session/seq | Server-specific HKDF response keys (`s2cKey` bound to `ServerID`) prevent key/nonce collision | Tested via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` | **PROVEN & VERIFIED** |
+| **FD-19** | **Unauthorized Rogue Server Injection** | Unlisted server sharing root PSK attempts to serve bootstrap | Client enforces `AuthorizedServers` whitelist in `VerifyFrameWithServerID`; rejects rogue reply | Tested via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` | **FAIL-CLOSED SAFE** |
 
 ---
 

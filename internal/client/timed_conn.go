@@ -18,12 +18,13 @@ import (
 
 // ConnectionIdentity explicitly identifies a connection's destination, transport mode, recovery generation, and identity.
 type ConnectionIdentity struct {
-	RemoteAddr    string
-	TransportMode transport.TransportMode
-	Generation    uint64
-	IdentityType  transport.EndpointIdentityType
-	IdentityValue string
-	IsRecovery    bool
+	RemoteAddr            string
+	TransportMode         transport.TransportMode
+	Generation            uint64
+	IdentityType          transport.EndpointIdentityType
+	IdentityValue         string
+	AuthoritativeServerID string
+	IsRecovery            bool
 }
 
 // Matches returns true if two connection identities are equivalent across all fields.
@@ -33,6 +34,7 @@ func (id ConnectionIdentity) Matches(target ConnectionIdentity) bool {
 		id.Generation == target.Generation &&
 		id.IdentityType == target.IdentityType &&
 		id.IdentityValue == target.IdentityValue &&
+		id.AuthoritativeServerID == target.AuthoritativeServerID &&
 		id.IsRecovery == target.IsRecovery
 }
 
@@ -74,12 +76,13 @@ func (tc *timedConn) desiredIdentity() ConnectionIdentity {
 		snapshot := re.ActiveSnapshot()
 		if snapshot != nil && !snapshot.IsExpired(time.Now()) && snapshot.MatchesGeneration(re.CurrentGeneration()) {
 			return ConnectionIdentity{
-				RemoteAddr:    snapshot.Addr(),
-				TransportMode: snapshot.TransportMode,
-				Generation:    snapshot.Generation,
-				IdentityType:  snapshot.IdentityType,
-				IdentityValue: snapshot.GetIdentityValue(),
-				IsRecovery:    true,
+				RemoteAddr:            snapshot.Addr(),
+				TransportMode:         snapshot.TransportMode,
+				Generation:            snapshot.Generation,
+				IdentityType:          snapshot.IdentityType,
+				IdentityValue:         snapshot.GetIdentityValue(),
+				AuthoritativeServerID: snapshot.AuthoritativeServerID,
+				IsRecovery:            true,
 			}
 		}
 	}
@@ -193,12 +196,13 @@ func (tc *timedConn) createConn() (tnet.Conn, ConnectionIdentity, error) {
 		}
 
 		targetID := ConnectionIdentity{
-			RemoteAddr:    snapshot.Addr(),
-			TransportMode: snapshot.TransportMode,
-			Generation:    snapshot.Generation,
-			IdentityType:  snapshot.IdentityType,
-			IdentityValue: snapshot.GetIdentityValue(),
-			IsRecovery:    true,
+			RemoteAddr:            snapshot.Addr(),
+			TransportMode:         snapshot.TransportMode,
+			Generation:            snapshot.Generation,
+			IdentityType:          snapshot.IdentityType,
+			IdentityValue:         snapshot.GetIdentityValue(),
+			AuthoritativeServerID: snapshot.AuthoritativeServerID,
+			IsRecovery:            true,
 		}
 		return candidateConn, targetID, nil
 	}

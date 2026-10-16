@@ -74,3 +74,39 @@ func TestAEADEncryptDecrypt(t *testing.T) {
 		t.Fatal("expected authentication failure on mismatched AAD")
 	}
 }
+
+func TestDeriveServerTrafficKeys(t *testing.T) {
+	psk := []byte("super-secret-password-1234567890123456")
+	salt := []byte("session-salt-12345")
+
+	// Deriving for server A
+	c2sA, s2cA, err := DeriveServerTrafficKeys(psk, salt, "ns-de-01")
+	if err != nil {
+		t.Fatalf("DeriveServerTrafficKeys ns-de-01 failed: %v", err)
+	}
+
+	// Deriving for server B
+	c2sB, s2cB, err := DeriveServerTrafficKeys(psk, salt, "ns2-nl-01")
+	if err != nil {
+		t.Fatalf("DeriveServerTrafficKeys ns2-nl-01 failed: %v", err)
+	}
+
+	// c2s keys (client-to-server) MUST be identical so any server can process the query
+	if !bytes.Equal(c2sA, c2sB) {
+		t.Fatalf("client-to-server keys must be identical across server instances")
+	}
+
+	// s2c keys (server-to-client) MUST be distinct to prevent cross-server key/nonce reuse
+	if bytes.Equal(s2cA, s2cB) {
+		t.Fatalf("server-to-client response keys for distinct server IDs must be distinct")
+	}
+
+	// Single derivation check
+	s2cOnlyA, err := DeriveServerResponseKey(psk, salt, "ns-de-01")
+	if err != nil {
+		t.Fatalf("DeriveServerResponseKey failed: %v", err)
+	}
+	if !bytes.Equal(s2cA, s2cOnlyA) {
+		t.Fatalf("DeriveServerResponseKey must match DeriveServerTrafficKeys for identical serverID")
+	}
+}

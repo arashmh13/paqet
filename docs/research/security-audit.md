@@ -307,3 +307,50 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   * Unpredictable Token Verified Byte-Exact: `PHASE15_PROVEN_fd06fd5251a6c37143e21b0489f9a5b0`
   * Raw Telemetry Artifact: `docs/research/recovery_socks5_live_audit_phase15.json`
   * Production SOCKS5 proxy on `127.0.0.1:1090` verified healthy (`pong`) throughout.
+
+---
+
+## 12. Recovery Telemetry Correction, DNS Sizing Enforcement & Multi-Authority Cryptographic Safety (Phase 16)
+
+### 12.1 Root Cause & Resolution of Candidate Validation Timing Anomaly
+- **Prior Telemetry Defect:** In Phase 15, `recovery_socks5_live_audit_phase15.json` reported `candidate_validation_rtt_ms` as approximately 0.001 ms, while state transition history showed 178 ms between `BOOTSTRAP_RECEIVED` and `RECOVERY_READY`.
+- **Root Cause Identified:** `sm.Step(ctx)` performs both `EmergencyDialer` (DNS exchange) and `CandidateValidator` (remote handshake) before returning. In Phase 15's script, `t4` was taken after `Step()` had already finished both operations. Lines 360-363 took `t5 := t4` and `t6 := time.Now()`, measuring only CPU delta between two sequential statements rather than the handshake itself. Furthermore, `production_health` reported `"UNKNOWN"` because `http.Get("http://127.0.0.1:8999/ping")` made a direct unauthenticated loopback request rather than querying through the authenticated SOCKS5 proxy on `127.0.0.1:1090`.
+- **Remediation & Exact Milestone Tracking:**
+  1. Wrapped `EmergencyDialer` with monotonic timer callbacks to capture `T3` (DNS query dispatch) and `T4` (DNS response receipt).
+  2. Wrapped `CandidateValidator` with monotonic timer callbacks to capture `T5` (candidate handshake start) and `T6` (candidate handshake completion).
+  3. `T7` captured immediately when `Step()` commits `RECOVERY_READY`.
+  4. Built and validated `ValidateAndReconcileTimeline()` (`internal/ng/transport/timeline_validator.go`): enforces strict monotonic ordering ($T_i \le T_{i+1}$) and mathematical reconciliation ($\sum \text{intervals} + \text{unaccounted\_overhead} = \text{total}$).
+  5. Implemented authenticated SOCKS5 health check querying through `127.0.0.1:1090` (`arash:arash`) returning `HEALTHY` and `"pong"` in 132.24 ms.
+  6. Reconciled Live Results (Phase 16):
+     * DNS Exchange RTT: **160.63 ms**
+     * Candidate Validation RTT: **178.12 ms** (matching wire handshake latency)
+     * Total Failover Time: **505.95 ms**
+     * Unaccounted Overhead: **0.000 ms** (exact mathematical identity)
+     * Logged to `docs/research/recovery_socks5_live_audit_phase16.json`.
+
+### 12.2 Strict EDNS Response Sizing & RFC 6891 Compliance
+- **Prior Weakness:** `ParseEDNSBufferSize()` previously assumed the first bytes following the Question section were an OPT record, and response generation did not consistently respect valid buffer advertisements below 1232 bytes (such as the standard 512-byte limit when EDNS is absent).
+- **Remediation & Strict Sizing Invariant:**
+  1. Implemented complete RFC 6891 Additional Section parser in `ParseEDNSOption()`: traverses Question, Answer, Authority, and Additional sections using wire-format domain name decompression (`skipDomainName`) and record skipping (`skipResourceRecord`).
+  2. Confirms that NAME is root (`0x00`), TYPE is 41 (`OPT`), and extracts the advertised buffer size.
+  3. Enforced explicit sizing rule:
+     $$\text{effective\_udp\_limit} = \min(\text{server\_udp\_cap}, \text{validated\_client\_advertisement})$$
+     * No EDNS present: strictly 512 bytes (`ARCOUNT = 0` in response).
+     * Valid EDNS (512–1400 bytes): strictly respected.
+     * Advertisements > 1400 bytes: clamped to 1400 bytes.
+  4. When serialized response exceeds `effective_udp_limit`, the server returns a standards-compliant truncated packet with `TC = 1` (`0x0200`) and `ANCOUNT = 0`.
+  5. Verified across sizes 512, 768, 1024, 1232, 1400, and 4096 in `TestEDNS0_AllAdvertisedSizesAndSizingRule`.
+
+### 12.3 Cryptographic Nonce & Key Separation in Multi-Authoritative Mode
+- **Prior Security Hazard:** In asymmetric transport, downstream AEAD nonces were derived from `(sessionID, seq, role)`. Two independent servers sharing the same PSK answering the same request at sequence 1 derived identical `s2c` keys and constructed identical nonces. If their response payloads differed, an identical key/nonce pair was used to encrypt different plaintexts (a catastrophic AES-GCM nonce collision leaking the GHASH key).
+- **Cryptographic Domain Separation Architecture (RFC 5869 HKDF):**
+  1. Introduced explicit `ServerID` binding in key derivation:
+     $$\text{PRK} = \text{HKDF-Extract}(\text{SHA-256}, \text{IKM}=\text{PSK}, \text{salt}=\text{sessionID})$$
+     $$\text{c2sKey} = \text{HKDF-Expand}(\text{PRK}, \text{info}=\text{"paqet-ng-v3-c2s"}, L=32)$$
+     $$\text{s2cKey} = \text{HKDF-Expand}(\text{PRK}, \text{info}=\text{"paqet-ng-v3-s2c:"} \mathbin{\Vert} \text{ServerID}, L=32)$$
+  2. Client-to-server (`c2s`) keys remain shared across servers so that any authorized server can decrypt upstream queries.
+  3. Server-to-client (`s2c`) response keys are cryptographically isolated per `ServerID`. Server A (`srv-de-01`) and Server B (`srv-nl-01`) derive mathematically distinct response keys, preventing cross-server key/nonce reuse even at identical sequence numbers.
+  4. Frame Framing v3 (`AsymmetricMagicV3 = 0x50415143`): includes `ServerIDLen` and `ServerID` in the unencrypted authenticated header (authenticated as AAD).
+  5. Per-Server Replay Filtering: The client maintains separate replay windows (`c.serverReplay[serverID]`), allowing independent servers to maintain their own sequence counters without causing false replay rejections on the client.
+  6. Client Authorization Whitelist (`AuthorizedServers`): Client verifies that the answering `serverID` is authorized by its configuration policy, rejecting rogue server responses fail-closed.
+  7. Adversarially verified via `TestMultiAuthoritative_CryptographicSafetyAndKeyNonceSeparation` and `TestMultiAuthoritative_FailoverAndServerRestart`.

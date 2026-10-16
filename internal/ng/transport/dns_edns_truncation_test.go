@@ -50,6 +50,169 @@ func TestEDNS0_ParseEDNSBufferSize_MalformedInputs(t *testing.T) {
 	}
 }
 
+func TestEDNS0_AllAdvertisedSizesAndSizingRule(t *testing.T) {
+	sizes := []uint16{512, 768, 1024, 1232, 1400, 4096}
+
+	for _, sz := range sizes {
+		queryPkt := BuildDNSQueryWithEDNS("test.sizing.example.com", 0x0010, 0x1000+sz, sz)
+
+		hasOPT, parsedSz, err := ParseEDNSOption(queryPkt)
+		if err != nil {
+			t.Fatalf("ParseEDNSOption failed for size %d: %v", sz, err)
+		}
+		if !hasOPT {
+			t.Fatalf("expected hasOPT=true for size %d", sz)
+		}
+		if parsedSz != sz {
+			t.Fatalf("parsed buffer size mismatch: got %d, want %d", parsedSz, sz)
+		}
+
+		// Test with 600-byte payload:
+		payload600 := make([]byte, 600)
+		for i := range payload600 {
+			payload600[i] = byte('A' + (i % 26))
+		}
+
+		resp600, err := BuildDNSTXTResponse(queryPkt, payload600)
+		if err != nil {
+			t.Fatalf("BuildDNSTXTResponse failed: %v", err)
+		}
+
+		flags600 := binary.BigEndian.Uint16(resp600[2:4])
+		isTC600 := flags600&0x0200 != 0
+		actualLen600 := len(resp600)
+
+		if sz == 512 {
+			// For 512, 650 bytes cannot fit -> MUST truncate!
+			if !isTC600 {
+				t.Fatalf("expected TC=1 for 600B payload on 512B limit, got TC=0")
+			}
+			ancount := binary.BigEndian.Uint16(resp600[6:8])
+			if ancount != 0 {
+				t.Fatalf("expected ANCOUNT=0 on truncated response, got %d", ancount)
+			}
+			if actualLen600 > 512 {
+				t.Fatalf("truncated response length %d exceeds 512", actualLen600)
+			}
+		} else {
+			// For 768, 1024, 1232, 1400, 4096: 650 bytes MUST fit!
+			if isTC600 {
+				t.Fatalf("expected TC=0 for 600B payload on %dB limit, got TC=1", sz)
+			}
+			ancount := binary.BigEndian.Uint16(resp600[6:8])
+			if ancount != 1 {
+				t.Fatalf("expected ANCOUNT=1, got %d", ancount)
+			}
+			if actualLen600 > int(sz) && sz <= 1400 {
+				t.Fatalf("response length %d exceeds advertised %d", actualLen600, sz)
+			}
+		}
+
+		// Test with 1500-byte payload (> 1400-byte server cap):
+		payload1500 := make([]byte, 1500)
+		for i := range payload1500 {
+			payload1500[i] = byte('B' + (i % 26))
+		}
+
+		resp1500, err := BuildDNSTXTResponse(queryPkt, payload1500)
+		if err != nil {
+			t.Fatalf("BuildDNSTXTResponse 1500 failed: %v", err)
+		}
+		flags1500 := binary.BigEndian.Uint16(resp1500[2:4])
+		if flags1500&0x0200 == 0 {
+			t.Fatalf("expected TC=1 for 1500B payload across all sizes, got TC=0 on sz=%d", sz)
+		}
+		if len(resp1500) > int(sz) && sz <= 1400 {
+			t.Fatalf("truncated response length %d exceeds limit %d", len(resp1500), sz)
+		}
+	}
+	t.Logf("PASS: Verified effective UDP sizing rule across sizes 512, 768, 1024, 1232, 1400, 4096")
+}
+
+func TestEDNS0_NoEDNS_LimitsTo512AndOmitsOPT(t *testing.T) {
+	// Query without EDNS (ednsBufSize = 0)
+	queryNoEDNS := BuildDNSQueryWithEDNS("noedns.example.com", 0x0010, 0x2222, 0)
+
+	hasOPT, size, err := ParseEDNSOption(queryNoEDNS)
+	if err != nil {
+		t.Fatalf("ParseEDNSOption failed: %v", err)
+	}
+	if hasOPT {
+		t.Fatalf("expected hasOPT=false for query without EDNS")
+	}
+	if size != 512 {
+		t.Fatalf("expected default size 512, got %d", size)
+	}
+
+	// Payload that fits in 512 (e.g. 100 bytes)
+	payloadSmall := make([]byte, 100)
+	respSmall, err := BuildDNSTXTResponse(queryNoEDNS, payloadSmall)
+	if err != nil {
+		t.Fatalf("BuildDNSTXTResponse failed: %v", err)
+	}
+	flagsSmall := binary.BigEndian.Uint16(respSmall[2:4])
+	if flagsSmall&0x0200 != 0 {
+		t.Fatalf("expected TC=0 for small payload without EDNS")
+	}
+	arcountSmall := binary.BigEndian.Uint16(respSmall[10:12])
+	if arcountSmall != 0 {
+		t.Fatalf("expected ARCOUNT=0 in response when client did not send EDNS, got %d", arcountSmall)
+	}
+
+	// Payload that overflows 512 (e.g. 500 bytes)
+	payloadLarge := make([]byte, 500)
+	respLarge, err := BuildDNSTXTResponse(queryNoEDNS, payloadLarge)
+	if err != nil {
+		t.Fatalf("BuildDNSTXTResponse large failed: %v", err)
+	}
+	flagsLarge := binary.BigEndian.Uint16(respLarge[2:4])
+	if flagsLarge&0x0200 == 0 {
+		t.Fatalf("expected TC=1 when response without EDNS exceeds 512 bytes")
+	}
+	arcountLarge := binary.BigEndian.Uint16(respLarge[10:12])
+	if arcountLarge != 0 {
+		t.Fatalf("expected ARCOUNT=0 in truncated response when client did not send EDNS, got %d", arcountLarge)
+	}
+	t.Logf("PASS: Verified no-EDNS requests enforce strict 512-byte limit and omit OPT RR")
+}
+
+func TestEDNS0_MultipleAdditionalRecords(t *testing.T) {
+	baseQuery := BuildDNSQueryWithEDNS("multi.example.com", 0x0010, 0x3333, 0)
+
+	dummyRR := []byte{
+		0x05, 'e', 'x', 't', 'r', 'a', 0x00,
+		0x00, 0x10, // TYPE TXT
+		0x00, 0x01, // CLASS IN
+		0x00, 0x00, 0x00, 0x00, // TTL 0
+		0x00, 0x05, // RDLEN 5
+		0x04, 't', 'e', 's', 't',
+	}
+
+	optRR := []byte{
+		0x00,
+		0x00, 0x29, // TYPE OPT
+		0x04, 0xD0, // CLASS = 1232
+		0x00, 0x00, 0x00, 0x00, // TTL
+		0x00, 0x00, // RDLEN 0
+	}
+
+	pkt := append(baseQuery, dummyRR...)
+	pkt = append(pkt, optRR...)
+	binary.BigEndian.PutUint16(pkt[10:12], 2)
+
+	hasOPT, size, err := ParseEDNSOption(pkt)
+	if err != nil {
+		t.Fatalf("ParseEDNSOption failed on multi-record additional section: %v", err)
+	}
+	if !hasOPT {
+		t.Fatalf("expected hasOPT=true when OPT RR follows another additional RR")
+	}
+	if size != 1232 {
+		t.Fatalf("expected size 1232, got %d", size)
+	}
+	t.Logf("PASS: Verified parser correctly scans multiple records in Additional section to locate OPT RR")
+}
+
 func TestEDNS0_ResponseTruncationWhenExceedingLimit(t *testing.T) {
 	// Client sends standard RFC 1035 query with 512-byte limit (ednsBufSize = 0)
 	queryPkt := BuildDNSQueryWithEDNS("payload.example.com", 0x0010, 0x4321, 0)

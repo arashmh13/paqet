@@ -54,16 +54,17 @@ var (
 
 // RecoveryEndpointSnapshot represents an immutable, validated snapshot of an authorized recovery endpoint.
 type RecoveryEndpointSnapshot struct {
-	ServerIP       string               `json:"server_ip"`
-	TransportPort  int                  `json:"transport_port"`
-	TransportMode  TransportMode        `json:"transport_mode"`             // ModeRawKCP, ModeAEADStream, ModeTLSStream
-	IdentityType   EndpointIdentityType `json:"identity_type"`              // "psk-id", "cert-pin", "pubkey-pin"
-	IdentityValue  string               `json:"identity_value"`             // Canonical format: "SHA256:<64 hex>"
-	ExpectedPubKey string               `json:"expected_pub_key,omitempty"` // Legacy alias
-	ValidUntil     int64                `json:"valid_until"`
-	MessageID      string               `json:"message_id"`
-	Generation     uint64               `json:"generation"`
-	ValidatedAt    time.Time            `json:"validated_at"`
+	ServerIP              string               `json:"server_ip"`
+	TransportPort         int                  `json:"transport_port"`
+	TransportMode         TransportMode        `json:"transport_mode"`                    // ModeRawKCP, ModeAEADStream, ModeTLSStream
+	IdentityType          EndpointIdentityType `json:"identity_type"`                     // "psk-id", "cert-pin", "pubkey-pin"
+	IdentityValue         string               `json:"identity_value"`                    // Canonical format: "SHA256:<64 hex>"
+	ExpectedPubKey        string               `json:"expected_pub_key,omitempty"`        // Legacy alias
+	AuthoritativeServerID string               `json:"authoritative_server_id,omitempty"` // Authoritative server that issued this snapshot
+	ValidUntil            int64                `json:"valid_until"`
+	MessageID             string               `json:"message_id"`
+	Generation            uint64               `json:"generation"`
+	ValidatedAt           time.Time            `json:"validated_at"`
 }
 
 // GetIdentityValue returns the canonical identity fingerprint, prioritizing IdentityValue over legacy ExpectedPubKey.
@@ -381,16 +382,17 @@ func (sm *RecoveryStateMachine) Step(ctx context.Context) (RecoveryState, error)
 		// Validation successful! Activate recovery endpoint snapshot for new connections
 		sm.recordTransitionLocked(sm.state, StateRecoveryReady, fmt.Sprintf("candidate endpoint %s:%d (%s) validated and active for new connections", endpoint.ServerIP, endpoint.TransportPort, endpoint.Mode()))
 		snapshot := &RecoveryEndpointSnapshot{
-			ServerIP:       endpoint.ServerIP,
-			TransportPort:  endpoint.TransportPort,
-			TransportMode:  endpoint.Mode(),
-			IdentityType:   endpoint.GetIdentityType(),
-			IdentityValue:  endpoint.GetIdentityValue(),
-			ExpectedPubKey: endpoint.GetIdentityValue(),
-			ValidUntil:     endpoint.ValidUntil,
-			MessageID:      req.ID,
-			Generation:     sm.currentGeneration,
-			ValidatedAt:    time.Now(),
+			ServerIP:              endpoint.ServerIP,
+			TransportPort:         endpoint.TransportPort,
+			TransportMode:         endpoint.Mode(),
+			IdentityType:          endpoint.GetIdentityType(),
+			IdentityValue:         endpoint.GetIdentityValue(),
+			ExpectedPubKey:        endpoint.GetIdentityValue(),
+			AuthoritativeServerID: endpoint.AuthoritativeServerID,
+			ValidUntil:            endpoint.ValidUntil,
+			MessageID:             req.ID,
+			Generation:            sm.currentGeneration,
+			ValidatedAt:           time.Now(),
 		}
 		sm.activeSnapshot = snapshot
 		sm.activeEndpoint = snapshot.Addr()
