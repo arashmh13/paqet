@@ -223,3 +223,52 @@ Phase 18 instruments every sub-phase of DNS recovery query exchanges, capturing 
 
 
 
+
+### 5.6 Phase 19 v4 Session Nonce Lifecycle & Multi-Server Authoritative-Set Staging Benchmark
+
+#### Release Metadata
+- **Version:** `v2.5.11-sesssalt`
+- **Git Commit:** `db86722`
+- **Binary SHA-256:** `1cb0378201a95fe9ffad0dae8a19a8d055e41a66c3c1ee702b5aab408f316a99`
+- **Gzip SHA-256:** `6232af5c292bf70bc06e71a1d8865028ea2c9ed2825759c9dd6b28f680400986`
+
+#### Key / Nonce Lifecycle Summary (Honest Probabilistic Statement)
+- v3 (PAQC) deterministic SessionID‖Seq nonce domain: `P ≈ n²/2⁶⁵` bound under a fixed credential epoch. NOT mathematical. Suitable only for awareness that a captured request is tagged with the exact same key/nonce domain after a restart.
+- v4 (PAQD) per-session random 16-byte seed + per-server-instance random 8-byte RNB: `P ≈ n²/2¹²⁹` on seed (with implicit 2⁶⁵ on RNB). NOT mathematical. Suitable as a documented defense-in-depth limit against accidental collision.
+- The "restart noncereuse" defect class was CONFIRMED under Phase 18 v3 on the failure path (`nonce 535151515151515100000001` reused across restart with a different plaintext) and ELIMINATED on the v4 path via per-instance RNB regeneration (verified by the deterministic `TestPhase19_V4ReplayAfterRestartNoKeyNonceReuse` test against the fixed binary).
+
+#### Restart-Replay, Rotation, and Cross-Server Repeatability Observations (Loopback Wire)
+| Test | Mode | Result | Notable Numeric |
+| :--- | :--- | :--- | :--- |
+| Same-session-life wire exchange | v4 | pass | 24.6 ms RTT (boot) |
+| Server Restart (same identity/seed) | v4 | pass | full lifetime fresh per-instance nonce, previously non-colliding responses |
+| Cross-server repeat request | v4 | pass | distinct per server (byte-different ciphertexts) |
+| Rotated credentials + restart | v4 | pass | stale client fail-closed; fresh client ok |
+| Revoked identity | v4 | pass | fail-closed |
+| Replayed old response | v4 | pass | rejected by per-domain window |
+| Exhausted sequence sealing | v4 | pass | max-halt at `0xFFFFFFF0`, no wrap |
+| Identical-ciphertext retransmission | v4 | pass | byte-identical cached response |
+
+#### Isolated Staged Deployment Evidence (Runs `PHASE19_STAGE_RUN_001..004`),
+Germany Node, transient `paqet-phase19-stage` systemd-run unit on loopback `127.0.0.1:15353`, response secret + PSK generated with `openssl rand 32` on the target host:
+| Stage | Description | Result |
+| :--- | :--- | :--- |
+| 6a | Startup with missing `--server-secret-file` | rejected (exit 1) |
+| 6b | Short 8-byte secret file | rejected (exit 1) |
+| 6c | 0644 permissions on secret file | rejected (policy) |
+| 6d | Symlinked secret file | rejected (policy) |
+| 7 | Successful isolated-stage startup binding | `active` on loopback |
+| 8 | Authenticated v4 e2e exchange (`PHASE19_STAGE_RUN_002_TOKEN_b20c`) | 1.14 ms RTT, byte-exact echo |
+| 9 | Wrong/stale credential exchange (`PHASE19_STAGE_RUN_003`) | client timed out (server never authenticated) |
+| 10 | Restart + same-identity replay exchange (`POST_RESTART_REPLAY_b20c`) | 1.13 ms RTT |
+
+#### Production State (Read-Only Re-Audit at the END of Phase 19)
+| Property | Status |
+| Running executable (Germany emergency daemon) | VERIFIED `c950611e...` (Phase 17 binary). |
+| On-disk executable (Germany) | VERIFIED identical to running binary. |
+| Active systemd unit `paqet-emergency.service` | VERIFIED active. |
+| Effective config | VERIFIED no `--server-secret-file`, no `--legacy-single-server`, no `--protocol-v4`. Thus protocol mode on the live production daemon is still v3/legacy hybrid (not multi-server-credentialed). |
+| Dedicated response-secret presence (production) | VERIFIED ABSENT (no `server_*.secret`). |
+| Client authorized-server configuration (production) | NOT VERIFIED (none provisioned). |
+| Production SOCKS5 (Iran `127.0.0.1:1090`) | VERIFIED `pong` (healthy). |
+| Staging entities | VERIFIED fully cleaned after each run. |

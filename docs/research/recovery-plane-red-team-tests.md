@@ -477,3 +477,63 @@ Verified via standalone binary `./bin/paqet-ng emergency server`:
 4. Explicit `--legacy-single-server`: Logs warning `Running in legacy single-server mode; multi-authoritative security guarantees are disabled`.
 5. Missing bootstrap config: Aborts fail-closed.
 6. Zero listener sockets opened prior to validation.
+
+
+---
+
+## 12. Phase 19 v4 Wire Safety: Restart Replay, Cross-Server Repeats & Explicit CLI Configuration Suite
+
+### 12.1 Replay-after-restart scenario (TDD red-green)
+Executed via `internal/ng/transport/phase19_restart_replay_test.go`:
+- `TestPhase19_V4ReplayAfterRestartNoKeyNonceReuse`:
+  1. Captures an authenticated v4 client request; instance 1 decrypts and seals response R1 (nonce per RNB_A).
+  2. Simulates full restart (fresh instance from the same long-term creds): decrypts the same captured request again, seals R2.
+  3. Asserts `R1.replay_nonce != R2.replay_nonce` (nonce-domain isolation) and correct decryption in both instances.
+- Historically reproduced nonces under the Phase-18 v3 scheme (nonce `535151515151515100000001`) — proving the need for the RNB redesign. Now enforces the per-instance nonce base.
+- `_SameSeedDifferentSessionIDDivergentKeys`: same seed + different session IDs must derive distinct c2s keys.
+
+### 12.2 v4 Wire E2E (loopback transport with real EmergencyDNSClient / EmergencyDNSServer)
+Executed via `internal/ng/transport/phase19_session_and_v4_test.go`:
+- `TestPhase19_V4WireEndToEndLoopback`:
+  * v4 exchange → OK (ServerID authenticated).
+  * Failover to second server identity → OK.
+  * Server restart with SAME credentials → OK.
+- `TestPhase19_ServerRetransmissionCacheReturnsIdenticalCiphertextV4`: duplicate authenticated requests return byte-identical cached ciphertext.
+- `TestPhase19_CrossVersionExplicitRejection`: all cross-version (v2↔v3↔v4) frames fail with explicit rejection errors; no silent re-interpretation.
+- `TestPhase19_SessionIDCollisionDeterministic`: forced full sessionID reuse under distinct per-session seeds yields entirely independent (key, nonce) domains.
+
+### 12.3 v4 Wire-Level Rotation/Revocation With Restart
+Executed via `internal/ng/transport/phase19_replay_domain_test.go`:
+- `TestPhase19_V4OldResponseReplayRejectedOnClient`: identity identical response bytes replayed back → rejected by per-domain client replay window.
+- `TestPhase19_V4RotationAndRevocationAfterRestart`:
+  * Two independent server instances serving repeated requests.
+  * Key rotation (server A restarts with a rotated secret).
+  * Stale-credential client MUST fail closed; rotated-credential client succeeds.
+  * Revoked server B (removed from the map) rejected fail-closed.
+- `TestPhase19_V4SequenceExhaustionAndRetransmission`: seal at `MaxSafeSequenceNumber` aborts cleanly (no wraparound).
+
+### 12.4 Phase-19 CLI Multi-Server Authorized-Server Configuration Suite
+Executed via `cmd/emergency/phase19_client_config_test.go` (loader + CLI + wire integration):
+1. Two server-ID entries load and construct credentials fail-closed.
+2. Unknown third identity rejected.
+3. Empty configuration fails.
+4. Missing response-secret file fails.
+5. Invalid 32-byte secret length fails.
+6. Duplicate server IDs fail.
+7. Reserved/malformed server IDs fail.
+8. Insecure file permissions (0644) fail.
+9. In-place mutation of loaded slices cannot affect stored secrets (loader deep-copies).
+10. Revocation step processed via stale client fails-closed.
+11. Legacy mode cannot be silently pulled in via a malformed-v4-config.
+12. Ambiguous flag combos (`--authorized-servers-config` with singular `--server-id/--server-secret-file` or with `--legacy-single-server`) all fail.
+13. PSK never silently used as a per-server response credential.
+14. Wire: response from either authorized server accepted; also unknown-identity responses rejected fail-closed.
+
+### 12.5 Isolated Staging Suite (Run IDs PHASE19_STAGE_RUN_001..004)
+On the Germany node `/opt/paqet/staging-phase19`:
+1. Candidate built with dedicated response credential and staging PSK, served via transient `systemd-run` unit under `--disable-bootstrap` on `127.0.0.1:15353`.
+2. Startup-probe matrix: missing secret file → exit 1; short secret → exit 1; 0644 permission → exit 1; symlink-redirect → exit 1.
+3. v4 e2e exchange with `--authorized-servers-config`: byte-exact echo at 1.14 ms RTT (RUN_002).
+4. Wrong credential: exchange fails (no server authentication response) (RUN_003).
+5. Restart: same server identity, exchange re-verified (RUN_004).
+6. Cleanup: transient unit stopped, staging directory removed, no leftover firewall rules, no extra systemd units. Production untouched.

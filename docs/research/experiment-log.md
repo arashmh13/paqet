@@ -804,3 +804,37 @@
      - `go test ./...`: 100% PASS across all packages.
      - `go test -race ./...`: 0 data races.
 - **Outcome:** Complete elimination of shared-PSK fallback, mandatory per-server credentials, session uniqueness and nonce lifecycle safety, defensive slice cloning, inter-attempt timeline reconciliation, and live node auditing completed without disrupting production services. Ready for final commit and push.
+
+
+---
+
+### Cycle 27: v4 Session Nonce Lifecycle, Multi-Server CLI Configuration & Isolated Staging (Phase 19)
+- **Objective:** Eliminate AEAD key/nonce re-derivation after a server restart with the exact captured request; introduce an explicit client-side multi-server authorized-server mapping; quantify session-ID collisions honestly; complete staged isolated deployment of `v2.5.11-sesssalt`.
+- **Defect Confirmed:** Captured v4 request replayed against a restarted server under identical credentials re-derives the same s2c key AND same `SessionID‖Seq` nonce; two different plaintexts would share the same nonce — a catastrophic AES-GCM reuse window.
+- **Redesign:**
+  * Added `SessionSeed` (128-bit crypto/rand per session) → HKDF salt `paqet-v4-<seed><sessionID>` for c2s; response key `HKDF(secret, salt, "paqet-v4-s2c:<serverID>")`.
+  * Added per-server-instance downstream `respNonceBase` (8 random bytes, generated on `NewServerAsymmetricSessionWithIDV4`); downstream nonce = `respNonceBase || seq` (server-role XORed).
+  * Response frame includes `RNBLen || respNonceBase` under the header AAD; identity mismatch (or degenerate all-zero RNB) rejected fail-closed.
+  * Client replay window keyed by `(serverID, RNB)` — replayed old-identity chunks cannot bypass the window; up to 32 domains per connection with pruning.
+- **CLI / Config:**
+  * `--authorized-servers-config` JSON loader (Version=1, Protocol=v4, Generation, `authorized_servers[] {server_id, secret_file}`); loader deep-copies secret bytes, rejects symlinks / 0644 / short-decoded files, rejects reserved and malformed IDs.
+  * CLI ambiguity policy: among `--authorized-servers-config`, singular `--server-id`/`--server-secret-file` and `--legacy-single-server` ONLY ONE selection is valid. Mixing is rejected fail-closed at startup.
+  * Server exposes `--protocol-v4` to explicitly select the v4 wire schema; absent flag retains v3 semantics so an operator cannot accidentally claim v4 guarantees.
+- **Production Audit (read-only):**
+  * Confirmed Germany production binary = running exe = on-disk = `c950611e...` (Phase 17). No `--server-secret-file`, no `--legacy-single-server`, no `--protocol-v4`.
+  * SOCKS5 (`127.0.0.1:1090`) verified healthy (`pong`) repeatedly during the run.
+  * Production was NEVER restarted nor modified.
+- **Staged Isolated Deployment (Germany, `/opt/paqet/staging-phase19`):**
+  * Candidate SHA-256 `1cb03782...` (gzip `6232af5c...`), built via `-trimpath -s -w -X paqet/cmd/version.Version=v2.5.11-sesssalt -X paqet/cmd/version.GitCommit=db86722`.
+  * Startup failure probes: missing `--server-secret-file` → exit 1; short secret → exit 1; insecure permissions (0644) → exit 1; symlinked secret → exit 1.
+  * Authenticated e2e (`PHASE19_STAGE_RUN_002_TOKEN_b20c`): OK / 1.14 ms RTT via `--authorized-servers-config`.
+  * Wrong-credential client → fails closed (server never authenticates).
+  * `systemctl restart paqet-phase19-stage` followed by `POST_RESTART_REPLAY_b20c` exchange → authenticated OK 1.13 ms RTT.
+  * Cleanup: transient unit stopped, staging directory removed, no firewall changes, no transient binary remains.
+- **Quality Gates:** `gofmt -w .`, `go vet ./...` clean; `go test -count=1 ./...` PASS (~18 s transport/crypto/cli suites); `go test -race` PASS on crypto, transport, emergency CLI; wire e2e verified via transport library and CLI direct paths.
+- **Commits Pushed:**
+  * `b9cfe66`: v4 per-restart downstream nonce isolation + authorized-server config loader + replay tests.
+  * `3b07bfa`: credential-file permission/symlink policy on server startup path.
+  * `773140c`: `--protocol-v4` server CLI flag.
+  * `db86722`: wire `ProtocolV4` into server config struct literal.
+- **Outcome:** Phase 19 cryptographic and config-level requirements met; the isolated staging test confirmed the production path remains unmodified; explicit honest probabilistic bounds documented everywhere (no claims of mathematical uniqueness for randomly-generated finite identifiers).

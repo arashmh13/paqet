@@ -477,3 +477,60 @@ The emergency engine strictly enforces the `EmergencyMessage` schema:
   1. Defined `DNSInterAttemptGap` tracking `StartMonotonicMs`, `EndMonotonicMs`, `DurationMs`, and `Reason`.
   2. Implemented `DNSExchangeTimeline.Reconcile(toleranceMs)`: verifies that `TotalDurationMs == sum(Attempts) + sum(Gaps)` within numerical tolerance ($\le 2.0$ ms). Unaccounted intervals are calculated and audited fail-closed.
   3. Tested via `TestDNSExchangeTimeline_ReconcileSuite`: verified single-attempt success, multi-attempt backoff reconciliation, and negative gap rejection.
+
+## 15. Phase 19 Audit: v4 Session Nonce Lifecycle, Explicit Authorized-Server Mapping & Restart Replay Containment
+
+### 15.1 Quantified Session-ID Collision Analysis (Honest Probabilistic Bounds)
+The 64-bit session identifier is NOT a mathematical identifier. Under a fixed credential epoch (c2s PSK + per-server response secret), the birthday collision bound is:
+- v3: `P ≈ n² / 2⁶⁵`. At n = 10⁶ sessions: ~5.4×10⁻¹⁴. At n = 2³² sessions: ~50%.
+- v4: `P ≈ n² / 2¹²⁹` (risk shifts to the 128-bit per-session random seed). n = 10⁹ sessions: ≈ 10⁻²⁰.
+Both are PROBABILISTIC upper bounds under the stated seed-generation assumptions (crypto/rand). Accidental collisions are NOT the same class as deliberate replay — see §15.3.
+
+### 15.2 v4 Lifecycle Redesign (Per-Instance Downstream Nonce Stream Base)
+- Frame format: `Magic(4)+SessionID(8)+Seq(4)+Ack(4)+SeedLen(1)+Seed(16)+ServerIDLen(1)+ServerID(+ServerID then RNBLen+RNB for server frames)`.
+- AAD coverage: entire cleartext frame prefix (seeded + session + sequence).
+- Server responses carry an 8-byte per-instance random "downstream nonce stream base" (RNB), regenerated at each server (re)start.
+- The server-side downstream AEAD nonce is `RNB || seq` (role-XORed), NOT `SessionID || seq`.
+- After a restart, a replayed captured request under the same `(sessionID, seed, serverID, long-term creds)` derives an identical s2c key but a FRESH RNB, so the (key, nonce) pair differs from any previous response — nonce reuse eliminated across restarts (empirically verified).
+- Client-side replay filter is keyed by `(serverID, RNB)`, so the restarted instance uses a fresh window and the attacker cannot leverage the OLD stream base to bypass the window.
+- Full spec: `docs/research/paqet_protocol_v4_spec.md`.
+
+### 15.3 Replay-After-Restart Defect Confirmed, Then Eradicated (TDD evidence)
+- First confirmed defect: `TestPhase19_V4ReplayAfterRestartNoKeyNonceReuse` on the Phase 18 v3 approach reproduced identical nonces (`5351515151515151_00000001`) with different plaintexts because the server response一致性 recreated the previous key/nonce domain — this is the exact scenario considered adversarial for a captured initial request around a restart.
+- Fixed by introducing the per-instance stream base + per-instance nonce composition; the same test now enforces nonce-domain uniqueness per server instance.
+
+### 15.4 Explicit Multi-Server Authorized-Server Mapping (CLI Loader)
+- New `--authorized-servers-config <file.json>` schema v1 on the emergency client: explicit `version=1`, `protocol="v4"`, `generation`, and `authorized_servers[].{server_id, secret_file}`. Inline response secrets are rejected.
+- Credential-file policy: symlink (Lstat) rejected, non-regular paths rejected, 0600/0400-style permissions enforced (group/world bits rejected), exactly 32-byte decoded secret required (parseKeyBytes: base64 / hex / raw).
+- Ambiguity policy at CLI level: `--authorized-servers-config` is incompatible with legacy `--legacy-single-server` AND incompatible with the singular `--server-id`/`--server-secret-file` convenience path. All flag-mixing combinations fail-closed BEFORE any socket is opened.
+- Safe metadata: the CLI prints safe, non-secret diagnostics — `[CLIENT] protocol=v4-PAQD authorized-servers=[srv-a-01 srv-b-01]`.
+
+### 15.5 v4 Lifecycle Verification Matrix (wire-level)
+| Test | Scope | Result |
+| Creating sessions with same seed & different sessionIDs derives different c2s keys | v4 wire constructor | pass |
+| Restarted server replays captured request under same creds → nonce does NOT equal the pre-restart nonce | deterministic crypto-layer + wire e2e | pass |
+| Old response replay rejected by per-domain window | client session persistence | pass |
+| Two independent servers processing a repeated request under distinct identities → distinct response keys, byte-distinct ciphertexts | cross-server wire test | pass |
+| Key rotation after server restart: stale-credential client must fail closed, fresh-credential client must succeed | e2e + CLI | pass |
+| Revoked server from client map rejected | CLI + plane | pass |
+| Sequence exhaustion hard-stop with no wraparound | deterministic seam | pass |
+| Cached ciphertext retransmission byte-identical | retransmission cache | pass |
+
+### 15.6 Protocol Version Rejection Matrix
+- v4 frames rejected on legacy and v3 sessions (explicit `ErrProtocolVersionSignature`).
+- v3 frames rejected on v4 sessions (explicit).
+- v2 frames rejected on v4 and v3 (explicit `ErrLegacyProtocolDisabled`).
+- Frame-version-dependent / seed-length-dependent angle mismatch rejected before AEAD key derivation.
+
+### 15.7 Staged Deployment Evidence (Run PHASE19_STAGE_RUN_001/002/003/004)
+- Candidate `v2.5.11-sesssalt` built with `CGO_ENABLED=1 go build -trimpath -ldflags "-s -w -X paqet/cmd/version.Version=v2.5.11-sesssalt -X paqet/cmd/version.GitCommit=db86722"`.
+- Binary SHA-256: `1cb0378201a95fe9ffad0dae8a19a8d055e41a66c3c1ee702b5aab408f316a99`.
+- Gzip SHA-256: `6232af5c292bf70bc06e71a1d8865028ea2c9ed2825759c9dd6b28f680400986`.
+- Isolated staging daemon at `127.0.0.1:15353` on the Germany node under a transient `paqet-phase19-stage` systemd unit with `--disable-bootstrap`, dedicated `srv-stage-01`, and a dedicated 32-byte response credential generated with `openssl rand 32` on the target host (never in source, shell history, or the report).
+- Stage 6 (fail-closed probes): missing secret file rejected; short secret file rejected (invalid length 8); 0644 permissions rejected (unsafe permission policy); symlink-replaced secret rejected. All exit code 1 before any listener binding.
+- Stage 7 (successful startup): active with explicit identity and dedicated credential; confirmed via `systemctl` + `ss` listener.
+- Stage 8 (e2e exchange): authenticated request/reply, byte-exact echo at 1.14 ms RTT with `--authorized-servers-config` + v4-PAQD protocol.
+- Stage 9 (wrong credential): stale-credential client fails exchange with ERR exit code 1; the server NEVER authenticated the response.
+- Stage 10 (restart): `systemctl restart` preserves the identity; `POST_RESTART_REPLAY` e2e still yields authenticated response at 1.13 ms RTT.
+- Phase 19 production state (read-only): unmodified; Germany production daemon still running the Phase 17 binary at `c950611e...` without `--server-secret-file`; no dedicated credential files on any production node.
+- Cleanup: transient `paqet-phase19-stage` stopped, staging filesystem removed, temporary secrets destroyed on-node, no firewall changes, no transient artifacts left.
