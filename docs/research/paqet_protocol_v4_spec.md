@@ -98,3 +98,43 @@ Because the response key is a symmetric secret also held by the client, any clie
 
 - v3: `P_collision ≈ n² / 2⁶⁵` birthday bound on the 64-bit SessionID under a fixed credential epoch. n = 10⁶ ⇒ ≈ 5.4×10⁻¹⁴; n = 2³² ⇒ ≈ 50%. This is a PROBABILISTIC statement.
 - v4: `P ≈ n² / 2¹²⁹` birthday bound on the 128-bit seed-salt component. n = 10⁹ ⇒ ≈ 10⁻²⁰. Also PROBABILISTIC. Both collision estimates are reported only as bounds against ACCIDENTAL random collisions; adversarial replay is treated separately (see duplicate/replay semantics).
+
+
+---
+
+## Rev 2 Addendum (Phase 20): Server-Session Nonce/Key Base, Domain Sealing & Control-Message Safety
+
+Status naming correction: the previous "per-instance RNB" term is renamed the **server-session nonce/key base**. It is generated exactly once inside `NewServerAsymmetricSessionWithIDV4` (the single call site of `crypto.GenerateDownstreamNonceBase()`), i.e. per reconstructed SERVER SESSION — not per process, and not per TCP/UDP connection. Normal reconnects and session evictions create NEW sessions (fresh base); process restart destroys sessions so the next request reconstructs every session with a fresh base; server restart is the same mechanism at process scale.
+
+### v4.1 Key-derivation change (KDF-context only; wire layout unchanged)
+- `s2c` response-key HKDF salt becomes `V4Salt(seed, sessionID) || serverSessionBase` (both `DeriveServerTrafficKeysV4` and `DeriveServerResponseKeyV4`). The `c2s` salt is UNCHANGED (must stay derivable from the cleartext request alone).
+- Consequence: every reconstruction of the same `(sessionID, seed, serverID, secret)` tuple produces a DIFFERENT response key. Cross-instance ciphertexts are key-disjoint; `(key, nonce)` reuse now additionally requires a base collision.
+- v4.1 is mandated before any production promotion; the Phase 19 candidate's KDF differed and was never deployed to production. Explicit change note, not a silent modification.
+
+### Residual collision bound (PROBABILISTIC, not an invariant)
+- Accidental base collision across `n` reconstructions of the SAME session tuple: `P ≈ n²/2⁶⁵` — n=10⁶ ⇒ ~2.7×10⁻⁸; n=10⁹ ⇒ ~0.027. Accidental collision of client seeds remains the n²/2¹²⁹ bound.
+- Deliberate replay of an existing session tuple is NOT a collision question: the attacker replays the exact captured frame. That class is covered by the per-domain client replay window, domain-capacity sealing (below), and the response AEAD binding — not by entropy bounds.
+
+### Replay-domain capacity (Phase 20 fix)
+- Client replay-window domains (`serverID#base`, per-connection) are capped at `MaxServerReplayDomainsPerConn = 32`.
+- On a 33rd DISTINCT AUTHENTICATED domain the connection is SEALED: `ErrReplayDomainCapacity`, `replayDomainSealed` set permanently, every further downstream frame fails closed. Domains are NEVER evicted — eviction would silently re-open an accepted replay window (Acceptance Criterion 1).
+- Capacity is consumed ONLY by AEAD-authenticated frames: malformed frames, unknown server IDs, corrupted ciphertexts and all-zero bases are rejected before the replay stage and cannot consume capacity (verified by flood tests).
+- Memory bound: ≤32 × window filter per connection, exhausted state is one atomic bit.
+- A sealed session requires a new authenticated session (new client session construction); this is explicit, not implicit.
+
+### Control-message safety policy (explicit, table-driven)
+| Type | Class | Duplicate/replay semantics |
+| --- | --- | --- |
+| `ping` | read-only | safe to answer any number of times; no state |
+| `status` | read-only | safe; state report only |
+| `bootstrap_request` | idempotent | duplicate re-generates a fresh validity window; same semantics |
+| `bootstrap_response` | idempotent | client-side last-writer-wins endpoint apply |
+| `alert` | idempotent | duplicates re-notify; no durable state mutation |
+| `data` | state-changing | UNSUPPORTED for exactly-once without a durable dedup layer; transport class `ClassStateChanging`; never claim exactly-once from in-memory state |
+| unknown | unsupported | rejected by `Validate()` before any handler (FORMERR); payloads are opaque bytes, never interpreted as commands |
+
+- The server reply cache / retransmission fingerprint is a RETRANSMISSION OPTIMIZATION, never replay protection: a duplicate may re-run the handler after cache eviction or server restart, and the SAME handler must be safe to run twice. Verified by wire tests for every supported type (duplicate on live server, the same request to two independent servers, and replay after a full server restart with all in-memory state lost).
+- No exactly-once semantics are claimed anywhere. Future state-changing operations require durable `(sessionID, requestDigest)` dedup with bounded storage before execution.
+
+### Trust model (unchanged, restated)
+Symmetric per-server response secrets protect against foreign servers (an ID-holder without the secret cannot authenticate) but NOT against a compromised authorized client, who can forge frames for that identity. Asymmetric server authentication remains a separate future phase.

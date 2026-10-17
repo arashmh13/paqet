@@ -167,7 +167,11 @@ func DeriveV4ClientTrafficKey(c2sPSK []byte, sessionSeed []byte, sessionID uint6
 //   - s2cKey: HKDF-SHA256(ikm=serverResponseSecret, salt=V4Salt(seed, sessionID), info="paqet-v4-s2c:"+serverID)
 //
 // No implicit fallback to the shared PSK is permitted anywhere in v4 derivation.
-func DeriveServerTrafficKeysV4(c2sPSK []byte, serverResponseSecret []byte, sessionSeed []byte, sessionID uint64, serverID string) ([]byte, []byte, error) {
+// DeriveServerTrafficKeysV4 derives both directions for a v4 server session. The
+// per-server-session nonce/key base (serverSessionBase, 8 bytes) is bound into the
+// s2c HKDF salt (NOT the c2s salt, which must stay derivable from the cleartext
+// request alone) so each session reconstruction has key-disjoint downstream traffic.
+func DeriveServerTrafficKeysV4(c2sPSK []byte, serverResponseSecret []byte, sessionSeed []byte, sessionID uint64, serverID string, serverSessionBase []byte) ([]byte, []byte, error) {
 	if len(c2sPSK) != KeySize {
 		return nil, nil, ErrInvalidKey
 	}
@@ -180,6 +184,9 @@ func DeriveServerTrafficKeysV4(c2sPSK []byte, serverResponseSecret []byte, sessi
 	if serverID == "" {
 		return nil, nil, fmt.Errorf("crypto: serverID cannot be empty in v4 derivation")
 	}
+	if len(serverSessionBase) != DownstreamNonceBaseSize {
+		return nil, nil, fmt.Errorf("crypto: server session base must be %d bytes", DownstreamNonceBaseSize)
+	}
 	salt := V4Salt(sessionSeed, sessionID)
 
 	c2sExtractor := hkdf.New(sha256.New, c2sPSK, salt, []byte("paqet-v4-c2s"))
@@ -189,7 +196,8 @@ func DeriveServerTrafficKeysV4(c2sPSK []byte, serverResponseSecret []byte, sessi
 	}
 
 	s2cInfo := []byte(fmt.Sprintf("paqet-v4-s2c:%s", serverID))
-	s2cExtractor := hkdf.New(sha256.New, serverResponseSecret, salt, s2cInfo)
+	s2cSalt := append(append([]byte(nil), salt...), serverSessionBase...)
+	s2cExtractor := hkdf.New(sha256.New, serverResponseSecret, s2cSalt, s2cInfo)
 	s2c := make([]byte, KeySize)
 	if _, err := io.ReadFull(s2cExtractor, s2c); err != nil {
 		return nil, nil, fmt.Errorf("crypto: failed to derive v4 s2c key: %w", err)
@@ -199,9 +207,11 @@ func DeriveServerTrafficKeysV4(c2sPSK []byte, serverResponseSecret []byte, sessi
 }
 
 // DeriveServerResponseKeyV4 derives only the v4 server-to-client response key
-// from the dedicated server response secret, the per-session random seed, and
-// the server identity.
-func DeriveServerResponseKeyV4(serverResponseSecret []byte, sessionSeed []byte, sessionID uint64, serverID string) ([]byte, error) {
+// from the dedicated server response secret, the per-session random seed, the
+// server identity, and the per-server-session nonce/key base carried in the
+// response frame header (bound into the HKDF salt so each server-session
+// reconstruction is key-disjoint).
+func DeriveServerResponseKeyV4(serverResponseSecret []byte, sessionSeed []byte, sessionID uint64, serverID string, serverSessionBase []byte) ([]byte, error) {
 	if len(serverResponseSecret) == 0 {
 		return nil, ErrMissingResponseSecret
 	}
@@ -211,7 +221,10 @@ func DeriveServerResponseKeyV4(serverResponseSecret []byte, sessionSeed []byte, 
 	if serverID == "" {
 		return nil, fmt.Errorf("crypto: serverID cannot be empty in v4 response key derivation")
 	}
-	salt := V4Salt(sessionSeed, sessionID)
+	if len(serverSessionBase) != DownstreamNonceBaseSize {
+		return nil, fmt.Errorf("crypto: server session base must be %d bytes", DownstreamNonceBaseSize)
+	}
+	salt := append(V4Salt(sessionSeed, sessionID), serverSessionBase...)
 	s2cInfo := []byte(fmt.Sprintf("paqet-v4-s2c:%s", serverID))
 	extractor := hkdf.New(sha256.New, serverResponseSecret, salt, s2cInfo)
 	s2c := make([]byte, KeySize)

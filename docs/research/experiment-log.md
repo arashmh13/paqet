@@ -838,3 +838,17 @@
   * `773140c`: `--protocol-v4` server CLI flag.
   * `db86722`: wire `ProtocolV4` into server config struct literal.
 - **Outcome:** Phase 19 cryptographic and config-level requirements met; the isolated staging test confirmed the production path remains unmodified; explicit honest probabilistic bounds documented everywhere (no claims of mathematical uniqueness for randomly-generated finite identifiers).
+
+
+---
+
+### Cycle 28: Phase 20 — Replay-Domain Sealing, v4.1 KDF Binding, Message-Safety Policy, Migration Preflight
+- **Objective:** Close the remaining replay-lifecycle risks (domain-capacity eviction, nonce-base lifecycle naming), make control handling safe after restart, verify multi-server CLI-path rotation, and produce a ready-but-blocked production migration preflight.
+- **Defects confirmed & fixed:**
+  1. `pruneOldestReplayDomain` eviction could re-open an accepted replay window (deterministic red test). → replaced by fail-closed sealing; capacity consumed only by authenticated frames; flood + race concurrency tests prove determinism.
+  2. v4 s2c HKDF salt did not include the server-session base: same-tuple reconstructions shared the full key schedule. → v4.1 binds the base into the s2c salt (single call-site generation verified: `NewServerAsymmetricSessionWithIDV4`); wire layout unchanged; client derives the key from the AAD-carried base.
+  3. Control-message policy was implicit. → explicit `MessageTypeSafety` classes; unknown types fail-closed in `Validate`; `data` marked state-changing (exactly-once unsupported without durable dedup).
+- **Tests added:** 4 domain-capacity tests (incl. -race concurrency), 4 lifecycle/quantification tests, 1 policy table test + 2 wire duplicate-matrix tests, 3 CLI-path rotation/revocation/legacy-rejection tests. Full suite `go test -race ./...` PASS; gofmt/vet clean.
+- **Production audit (read-only):** Germany emergency daemon binary `c950611e…` (v3 named-fallback; NO `--protocol-v4`, NO `--server-secret-file`); Iran has no client authorized-servers config; SOCKS5 `127.0.0.1:1090` `pong` healthy; rollback binaries checksummed (`paqet.prev` d4043086…, `paqet-ng.v259.gz` 1deaddbe…). No approved maintenance window exists ⇒ promotion blocked by design; preflight is READY.
+- **Candidate:** `v2.5.13-domainseal` built locally (hashes in benchmark §5.7); Phase 19 staging evidence retained under its original run IDs (RUN_001..004, 2026-10-17).
+- **Honesty audit:** all probabilistic bounds labeled probabilistic; no "mathematically unique", no exactly-once, no server-only-auth claims; JSON schema for audit artifacts unchanged and validated.

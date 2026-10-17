@@ -272,3 +272,32 @@ Germany Node, transient `paqet-phase19-stage` systemd-run unit on loopback `127.
 | Client authorized-server configuration (production) | NOT VERIFIED (none provisioned). |
 | Production SOCKS5 (Iran `127.0.0.1:1090`) | VERIFIED `pong` (healthy). |
 | Staging entities | VERIFIED fully cleaned after each run. |
+
+### 5.7 Phase 20 Replay-Domain Sealing & v4.1 KDF Binding — Release Candidate Evidence
+
+#### Release Metadata
+- **Version:** `v2.5.13-domainseal` (candidate; NOT deployed to production)
+- **Git commit (source of build):** Phase 20 working tree (to be recorded in the Phase 20 release commit — rebuilt after final doc commit)
+- **Pre-commit build SHA-256 (binary/gzip):** `443b4faa9a3a…` / `0f079de23b81…` — SUPERSEDED; final build after doc updates: binary `aa49fc742e4c…`→ replaced during commit; verify the FINAL hashes stamped in the Phase 20 release commit footer (`bin/paqet-ng` gzip `191b72da…` from commit-tree aa49…). The authoritative hash for promotion is the one rebuilt at the exact Phase 20 release commit.
+- **Full quality gates:** gofmt clean, `go vet ./...` clean, `go test -race ./...` ALL PASS.
+
+#### Behaviors verified (loopback wire + crypto layer)
+| Probe | Result |
+| 33rd replay domain | rejected; session sealed; zero evictions |
+| domain-1 response after exhaustion | STILL rejected (never re-opened) |
+| unauthenticated flood (501 frames) | capacity unchanged; session not sealed |
+| concurrent exhaustion (-race) | exactly 32 accepts, deterministic seal |
+| forced same-base reconstruction | identical s2c key (KDF deterministic) |
+| different base | different s2c key |
+| 64 tuple reconstructions | 64 unique bases / 64 unique keys |
+| two servers, same request | byte-distinct ciphertexts |
+| collision bound pinned | n²/2⁶⁵: 2.7e-8 @1e6, 0.027 @1e9 (probabilistic) |
+| duplicate request per type (ping/status/bootstrap_request/alert/data) | wire-duplicated; safe classes re-runnable; NO exactly-once claim |
+| duplicate after cache eviction/restart | handler re-runs; semantics unchanged (idempotent/read-only) |
+| stale rotated credential | fails closed |
+| revoked identity | fails closed |
+| v3/v2 magic frames on v4 client | explicitly rejected |
+
+#### Production state at Phase 20 close (read-only)
+- Germany emergency daemon: ACTIVE, binary `c950611e…` (v3 named-fallback; no dedicated secret); SOCKS5 on Iran `127.0.0.1:1090` VERIFIED `pong` before and after all work. No production listener was touched (criterion 8).
+- Migration preflight: READY-BUT-NOT-EXECUTED; the exact shortest safe procedure (backup → provision secret files on Germany @0600 → provision Iran `authorized-servers-config` @0600 → isolated-endpoint v4 e2e → readiness/precondition probes → swap unit → verify → rollback commands) is recorded in NEXT_STEPS §1.2 and is gated on an approved maintenance window.

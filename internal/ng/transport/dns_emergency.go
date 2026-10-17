@@ -48,6 +48,52 @@ const (
 	MsgTypeData              = "data"
 )
 
+// MessageSafetyClass classifies the replay/duplicate-processing semantics of an
+// authenticated emergency control message (Phase 20 P0-3). An in-memory reply
+// cache is a RETRANSMISSION OPTIMIZATION, never durable replay protection: every
+// supported type must therefore be safe to process twice even after the cache
+// (and all session state) is lost to a restart.
+type MessageSafetyClass int
+
+const (
+	// ClassReadOnly: answering twice produces identical semantics and no state change.
+	ClassReadOnly MessageSafetyClass = iota
+	// ClassIdempotent: answering twice produces the same effective state (safe duplicates).
+	ClassIdempotent
+	// ClassStateChanging: duplicates can create side effects — requires durable
+	// deduplication before execution; rejected/unsupported unless a specific policy exists.
+	ClassStateChanging
+	// ClassUnsupported: not accepted from the network in this protocol revision.
+	ClassUnsupported
+)
+
+// MessageTypeSafety returns the explicit replay/duplicate-processing policy for a
+// message type. Unknown types are ClassUnsupported and are rejected fail-closed by
+// Validate() before any handler runs; DNS payloads are never interpreted as shell
+// commands by the transport layer.
+//
+//	ping                → read-only (echo/liveness probe)
+//	status              → read-only (state report; no mutation)
+//	bootstrap_request   → idempotent (re-generates a fresh validity window; same semantics)
+//	bootstrap_response  → idempotent client-side apply (last-writer-wins endpoint set)
+//	alert               → idempotent (duplicates re-notify; no durable state mutation)
+//	data                → state-changing: UNSUPPORTED for exactly-once without a durable
+//	                      dedup layer; transport marks it ClassStateChanging and callers
+//	                      MUST NOT enable non-idempotent data operations unless they add
+//	                      persistent (sessionID, message ID) dedup with bounded storage.
+func MessageTypeSafety(msgType string) MessageSafetyClass {
+	switch msgType {
+	case MsgTypePing, MsgTypeStatus:
+		return ClassReadOnly
+	case MsgTypeBootstrapRequest, MsgTypeBootstrapResponse, MsgTypeAlert:
+		return ClassIdempotent
+	case MsgTypeData:
+		return ClassStateChanging
+	default:
+		return ClassUnsupported
+	}
+}
+
 // EndpointIdentityType defines the explicit cryptographic identity verification scheme.
 type EndpointIdentityType string
 

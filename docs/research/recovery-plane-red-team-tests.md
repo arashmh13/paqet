@@ -537,3 +537,31 @@ On the Germany node `/opt/paqet/staging-phase19`:
 4. Wrong credential: exchange fails (no server authentication response) (RUN_003).
 5. Restart: same server identity, exchange re-verified (RUN_004).
 6. Cleanup: transient unit stopped, staging directory removed, no leftover firewall rules, no extra systemd units. Production untouched.
+
+
+---
+
+## 13. Phase 20 Red-Team Suite: Domain-Capacity Sealing, Nonce/Key Lifecycle & Duplicate-Processing Matrix
+
+### 13.1 Replay-domain capacity (P0-1) — `phase20_replay_domain_capacity_test.go`
+- `TestPhase20_DomainCapacity_FirstDomainAcceptedThenReplayRejected`: accept domain-1 → reject its verbatim replay → fill EXACTLY 32 distinct authenticated domains → 33rd rejected, session sealed, domains retained (no eviction) → domain-1 response STILL rejected after exhaustion → further frames on sealed session rejected. (Defeat-criterion-1 test: fails on the Phase 19 eviction code.)
+- `TestPhase20_DomainCapacity_TwoAuthorizedServerIDs`: two identities consume independent domains; per-identity replay rejection; same-identity same-domain higher seq accepted (in-order stream preserved without reopening windows).
+- `TestPhase20_DomainCapacity_MalformedFramesDoNotConsumeCapacity`: floods of unknown-ID / corrupted-ciphertext / truncated / all-zero-RNB frames (501 total) rejected AND domain count unchanged; session not sealed; a legitimate new domain still accepted afterwards.
+- `TestPhase20_DomainCapacity_ConcurrentExhaustionDeterministic` (`-race`): concurrent open of 96 distinct domains → exactly 32 accepted, all others ErrReplayDomainCapacity, deterministic final state (sealed, 32 domains), zero evictions.
+
+### 13.2 Server-session nonce/key base lifecycle (P0-2) — `phase20_lifecycle_and_policies_test.go`
+- `_ForcedBaseReuseBindsKey`: forced same-base reconstruction → identical s2c key (deterministic KDF); different base → different key (binding proven).
+- `_RepeatedTupleReconstruction`: 64 real constructor recreations of the same tuple → 64 unique bases and 64 unique key schedules.
+- `_CrossServerDistinctDomains`: two identities, same request+seq → byte-distinct ciphertexts.
+- `_CollisionBoundDocumented`: pins n²/2⁶⁵ = 2.7×10⁻⁸ (n=10⁶) and 0.027 (n=10⁹); deliberate replay documented as a separate class (window+sealing).
+
+### 13.3 Control-message duplicate-processing matrix (P0-3)
+- `_MessageTypePolicy_TableDriven`: per-type classes; unknown/"exec"/case-variant types rejected; opaque-payload bound checks (never a command).
+- `_DuplicateProcessing_Matrix` (real wire server + client, per type ping/status/bootstrap_request/alert/data): duplicate on live server, same request to TWO independent servers, and replay after FULL server restart (all in-memory state lost) — no fabricated responses; safe-class handlers re-run harmlessly; data-class re-invocation is why exactly-once is NOT claimed.
+- `_HandlerInvocationBoundedUnderReplayFlood`: 40 unique-ID flood — handler ran exactly once per delivered unique request; state bounded.
+
+### 13.4 CLI-path rotation / revocation / atomicity (P1-4) — `cmd/emergency/phase20_cli_rotation_test.go`
+- `_AtomicReplacementRejectsInvalidEntry`: one-bad-credential replacement rejected whole; duplicate server ID rejected; 0644 secret rejected; rotated config loads; post-load slice mutation cannot alter constructed credentials (deep-clone).
+- `_RotationInvalidatesStaleAuthorization`: pre-rotation OK → server restarts with rotated secret → stale gen-5 client FAILS CLOSED → fresh gen-6 client SUCCEEDS → revoked (unlisted) identity rejected.
+- `_V4ClientRejectsLegacyFrames`: tampered PAQC-magic and PAQA-magic frames explicitly rejected by the v4 multi-server client.
+All via the REAL `--authorized-servers-config` loader path, not low-level constructors. Symmetric trust-model limit (authorized client can forge for its own identity) restated in the spec; no server-only authentication claims.

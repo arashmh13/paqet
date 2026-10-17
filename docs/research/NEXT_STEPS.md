@@ -3,10 +3,10 @@
 ## 1. Executive Status & Current State
 
 - **Current Git Branch:** `research/hard-mode-rnd`
-- **Current Version:** `v2.5.11-sesssalt` (candidate; NOT yet promoted to production)
-- **Active Candidate Binary SHA-256:** `1cb0378201a95fe9ffad0dae8a19a8d055e41a66c3c1ee702b5aab408f316a99`
-- **Gzip SHA-256:** `6232af5c292bf70bc06e71a1d8865028ea2c9ed2825759c9dd6b28f680400986`
+- **Current Version:** `v2.5.13-domainseal` (candidate; NOT promoted — promotion BLOCKED, no approved maintenance window)
 - **Phase 19 Status:** COMPLETE (v4 lifecycle + multi-server CLI loader + isolated staging verified; production NOT modified)
+- **Phase 20 Status:** COMPLETE (replay-domain failure-closed sealing; v4.1 base-bound KDF; explicit per-type message-safety policy; CLI-path rotation/revocation/atomicity verified; production audit re-verified; preflight READY-BUT-NOT-EXECUTED)
+- **Candidate binary/gzip SHA-256 (pre-final-doc build):** gzip `191b72da1f1c5bfebba67bb851d0796fe54e9be755557a496628225942fcea52` (rebuild from the Phase 20 release commit before promotion and stamp the final hashes there)
 - **Architectural Validation Status:**
   - Phase 19 v4 Session Lifecycle & Multi-Server CLI Configuration: **COMPLETE & STAGED-VERIFIED** (Per-restart downstream nonce isolation CTL; explicit `--authorized-servers-config` with strict credential-file policy; replay-after-restart tests, rotation/revocation tests, cross-version rejection tests, isolated staging with fail-closed probes, restart/replay, and post-restart exchange. Honest probabilistic collision bounds documented; protocol spec `docs/research/paqet_protocol_v4_spec.md` published).
   - Phase 18 Mandatory Server Credentials, Session Uniqueness & Timeline Reconciliation: **COMPLETE & QA-GATED** (Completely eliminated implicit shared-PSK fallback for named authoritative servers; enforced mandatory explicit 32-byte `--server-secret-file` and `--server-id` at startup, failing closed prior to socket binding; isolated legacy single-server operation behind explicit `--legacy-single-server`; enforced defensive slice cloning preventing post-construction credential mutation; mathematically proved session uniqueness and nonce lifecycle safety across concurrent sessions, process restarts, and failover retries; documented formal symmetric trust boundaries; instrumented inter-attempt gap accounting with exact monotonic timeline reconciliation; built release `v2.5.10-credreq`; verified production SOCKS5 on `1090` returning `HEALTHY` `"pong"`).
@@ -84,3 +84,24 @@
 - **Dependencies:** `internal/ng/transport/aead_stream.go` and `internal/ng/protocol/`.
 - **Acceptance Criteria:**
   1. Under simulated 15% random packet loss (`tc qdisc add dev eth0 root netem loss 15%`), download throughput remains within 80% of baseline.
+
+
+---
+
+## Appendix A (Phase 20): Shortest Safe Credentialed v4 Migration Procedure (BLOCKED until approved window)
+
+Preconditions (all verified 2026-10-17, read-only):
+1. Germany daemon binary `c950611e…` running v3 named-fallback; Iran SOCKS5 healthy; rollback artifacts checksummed.
+2. NO approved maintenance window registered → live promotion BLOCKED. Do not execute steps 3+ until the window exists.
+
+Execution (shortest safe path, ~4 minutes of exposure):
+1. `cp /opt/paqet/paqet /opt/paqet/paqet.v3 rollback-$(date +%s)` and sha256 both.
+2. On Germany: `umask 077; openssl rand 32 > /opt/paqet/secrets/ns-de-01.key; chmod 600` (secret generated on-node; never printed/committed).
+3. On Iran: install `authorized-servers.json` (schema v1, `secret_file` referencing the SAME ns-de-01 key value delivered separately, also 0600). NOTE: per-server RESPONSE secret must be pre-shared destination-side; deliver the file over the existing protected channel, not chat.
+4. Staging sanity: run `paqet-ng emergency server --addr 127.0.0.1:15353 … --protocol-v4 --server-id ns-de-01 --server-secret-file … --disable-bootstrap` and one `emergency send` with `--authorized-servers-config` from the SAME node (expect byte-exact echo <5 ms), plus a wrong-credential fail-closed probe.
+5. `[WINDOW STARTS]` swap: update `paqet-emergency.service` ExecStart → new binary path + `--protocol-v4 --server-id ns-de-01 --server-secret-file /opt/paqet/secrets/ns-de-01.key`; `systemctl daemon-reload && systemctl restart paqet-emergency`.
+6. Readiness: `systemctl is-active`, `ss -ulnp :53`, one live v4 exchange from the Germany loopback, one from Iran through the real resolver path; confirm SOCKS5 `pong` before and after.
+7. Rollback (exact): restore `ExecStart` to the previous line (recorded verbatim pre-change), `cp /opt/paqet/paqet.v3-rollback /opt/paqet/paqet`, `systemctl daemon-reload && systemctl restart paqet-emergency`. Server identity mode before/after is v3 named-fallback, so the Iran side client (old binary) continues to work.
+8. `[WINDOW ENDS]` post-verification: `/proc/<pid>/exe` hash equals the candidate hash; repeated v4 + replay-after-restart staging probes; baseline SOCKS5 health retained.
+
+Reminder: do NOT add a public secondary NS record in this phase.

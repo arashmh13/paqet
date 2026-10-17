@@ -534,3 +534,33 @@ Both are PROBABILISTIC upper bounds under the stated seed-generation assumptions
 - Stage 10 (restart): `systemctl restart` preserves the identity; `POST_RESTART_REPLAY` e2e still yields authenticated response at 1.13 ms RTT.
 - Phase 19 production state (read-only): unmodified; Germany production daemon still running the Phase 17 binary at `c950611e...` without `--server-secret-file`; no dedicated credential files on any production node.
 - Cleanup: transient `paqet-phase19-stage` stopped, staging filesystem removed, temporary secrets destroyed on-node, no firewall changes, no transient artifacts left.
+
+
+## 16. Phase 20 Audit: Replay-Domain Sealing, v4.1 KDF Binding, Control-Message Safety & Migration Preflight
+
+### 16.1 Confirmed defect (P0-1): replay-domain eviction reopened accepted windows (FIXED)
+Phase 19's `pruneOldestReplayDomain` evicted a map-iteration-order replay filter at the 32-domain cap. A flood of 32 distinct authenticated domains (feasible only for a real response-key holder — the trust boundary) could evict the filter that had accepted a genuine response, making that response ACCEPTABLE AGAIN (verbatim replay fully passed AEAD + replay check). Deterministic test `TestPhase20_DomainCapacity_FirstDomainAcceptedThenReplayRejected` fails on that behavior and passes on the fix.
+Fix: capacity exhaustion SEALS the connection (`ErrReplayDomainCapacity`, `replayDomainSealed` atomic) — no eviction ever; a new authenticated session is required. Accepted windows are never re-opened. Concurrency test (`-race`) shows exactly 32 accepts and deterministic sealing regardless of scheduling.
+
+### 16.2 v4.1 KDF binding (P0-2): server-session base bound into the s2c salt
+The base is generated once per server-session reconstruction (single call site: `NewServerAsymmetricSessionWithIDV4`). Binding it into the s2c HKDF salt (rev 2, wire layout unchanged) makes every reconstruction's response key distinct, so `(key, nonce)` reuse requires a base collision: `n²/2⁶⁵` for n reconstructions of the SAME tuple (n=10⁶ ⇒ ~2.7×10⁻⁸; n=10⁹ ⇒ ~0.027). The 128-bit client-seed bound is NOT substituted for the deliberate-replay class — that class is handled by the client replay window + sealing, and is documented separately. Forced-base-reuse, repeated-tuple, cross-server and collision-bound tests all pass (honest probabilistic framing).
+
+### 16.3 Control-message safety (P0-3)
+Explicit per-type policy (`MessageTypeSafety`): ping/status read-only; bootstrap_request/response + alert idempotent; data ClassStateChanging (exactly-once unsupported without durable dedup); unknown types fail-closed in schema validation. The reply cache is documented and tested as a retransmission optimization: duplicate-on-live-server, cross-server duplicates, and replay-after-full-restart wire tests exercise every supported type. No exactly-once claims.
+
+### 16.4 Production audit (read-only, 2026-10-17)
+| Property | Status |
+| Germany emergency daemon active | VERIFIED |
+| Running exe = /opt/paqet/paqet = SHA c950611e51bf1a8fcbff804f9012a1b9a2a683b77430e70e7f7b0f20e5ef0c54 | VERIFIED (identical) |
+| Effective cmdline (sanitized) | VERIFIED: `--addr 0.0.0.0:53 --key-file [REDACTED] --bootstrap-config ... --server-id ns-de-01` — NO `--protocol-v4`, NO `--server-secret-file`, NO `--legacy-single-server` |
+| Actual protocol mode | VERIFIED: v3 named-server fallback (neither credentialed-v4 nor explicit legacy) |
+| Dedicated response secret file | NOT VERIFIED — none present on node |
+| Client authorized-servers config (Iran) | NOT VERIFIED — none present |
+| Restart-failure risk if binary were replaced with credentialed build | BLOCKED (would fail closed without the secret; currently running v3 binary restarts fine) |
+| Production SOCKS5 (127.0.0.1:1090, Iran) | VERIFIED healthy (`pong`) at audit time |
+| Rollback artifacts | VERIFIED checksummed: paqet.prev d4043086…, paqet-ng.v259.gz 1deaddbe… |
+| Approved maintenance window | NOT REGISTERED ⇒ live promotion BLOCKED (preflight-only) |
+No secrets, key material, or decrypted payloads were printed or recorded.
+
+### 16.5 Migration preflight (READY — NOT EXECUTED, criterion 8)
+Candidate `v2.5.13-domainseal` built from Phase 20 sources: binary `aa49fc742cec…` (see benchmark §5.7 for full hashes). Procedure, rollback, readiness checks and SOCKS5 health verification are documented in benchmark-results §5.7 and NEXT_STEPS §1. Execution is BLOCKED pending an approved maintenance window.

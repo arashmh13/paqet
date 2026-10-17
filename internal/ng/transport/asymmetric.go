@@ -74,6 +74,7 @@ var (
 	ErrMissingResponseSecret    = errors.New("asymmetric: dedicated per-server response secret is required (shared PSK fallback prohibited)")
 	ErrInvalidResponseSecret    = errors.New("asymmetric: response secret must be exactly 32 bytes")
 	ErrProtocolVersionSignature = errors.New("asymmetric: frame protocol version unsupported (seed lengths incompatible) - PAQD explicit reject")
+	ErrReplayDomainCapacity     = errors.New("asymmetric: downstream replay-domain capacity exhausted, session sealed (fail-closed; a new authenticated session is required)")
 )
 
 type unackedFrame struct {
@@ -140,7 +141,8 @@ type AsymmetricConn struct {
 	isLegacySingleServer bool              // If true, operates in legacy single-server mode using PSK only
 	protoV4              bool              // If true, seals/verifies v4 ("PAQD") frames carrying a per-session random seed
 	sessionSeed          []byte            // v4 only: 16-byte per-session random seed mixed into the HKDF salt (immutable)
-	respNonceBase        []byte            // v4 server only: per-instance random 8-byte downstream nonce stream base (immutable)
+	respNonceBase        []byte            // v4 server only: per-server-session random 8-byte downstream nonce/key base (immutable)
+	replayDomainSealed   atomic.Bool       // v4 client only: set once replay-domain capacity is exhausted; all further downstream frames fail closed
 	authEpoch            string            // v4 client only: credential epoch label from AuthorizedServerSet (safe metadata)
 	mtu                  int
 	psk                  []byte
@@ -723,17 +725,19 @@ func NewServerAsymmetricSessionWithIDV4(sessionID uint64, c2sPSK []byte, serverR
 	}
 
 	secretClone := append([]byte(nil), serverResponseSecret...)
-	c2s, s2c, err := crypto.DeriveServerTrafficKeysV4(c2sPSK, secretClone, sessionSeed, sessionID, serverID)
+
+	// Per-server-session downstream nonce/key base: generated once here and bound
+	// into BOTH the s2c HKDF salt and the response frame header, so a restarted
+	// server with identical long-term credentials gets a fresh base and replayed
+	// captured requests can never reproduce the previous response key/nonce domain
+	// for new plaintexts.
+	rnb, genErr := crypto.GenerateDownstreamNonceBase()
+	if genErr != nil {
+		return nil, fmt.Errorf("generate v4 server-session nonce/key base: %w", genErr)
+	}
+	c2s, s2c, err := crypto.DeriveServerTrafficKeysV4(c2sPSK, secretClone, sessionSeed, sessionID, serverID, rnb)
 	if err != nil {
 		return nil, fmt.Errorf("derive v4 server keys: %w", err)
-	}
-
-	// Per-instance downstream nonce stream base: a restarted server with identical
-	// long-term credentials gets a fresh base, so replayed captured requests can never
-	// reproduce the previous response key/nonce domain for new plaintexts.
-	rnb, err := crypto.GenerateDownstreamNonceBase()
-	if err != nil {
-		return nil, fmt.Errorf("generate v4 response nonce base: %w", err)
 	}
 
 	return &AsymmetricConn{
@@ -1009,7 +1013,7 @@ func (c *AsymmetricConn) VerifyFrameWithServerID(frame []byte) (seq, ack uint32,
 			if len(secret) != crypto.KeySize {
 				return 0, 0, nil, serverID, fmt.Errorf("server %q has invalid response secret length (fail-closed)", serverID)
 			}
-			sKey, err := crypto.DeriveServerResponseKeyV4(secret, frameSeed, c.sessionID, serverID)
+			sKey, err := crypto.DeriveServerResponseKeyV4(secret, frameSeed, c.sessionID, serverID, frameRNB)
 			if err != nil {
 				return 0, 0, nil, serverID, fmt.Errorf("derive v4 server response key: %w", err)
 			}
@@ -1110,18 +1114,28 @@ func (c *AsymmetricConn) openFrameWithServerID(frame []byte) (seq, ack uint32, p
 		}
 		replayKey := serverID
 		if c.protoV4 && magic == AsymmetricMagicV4 && len(frameRNB) == crypto.DownstreamNonceBaseSize {
-			// Replay protection is scoped to the downstream nonce domain: a restarted
-			// server instance with a fresh per-instance stream base gets a fresh
-			// sequence window, while a replay from the OLD instance hits the OLD
-			// filter entry (per-domain window isolation).
+			// Replay protection is scoped to the downstream nonce/key domain: a restarted
+			// server instance with a fresh per-session base gets a fresh sequence window,
+			// while a replay from the OLD instance hits the OLD filter entry (per-domain
+			// window isolation).
 			replayKey = fmt.Sprintf("%s#%x", serverID, frameRNB)
+		}
+		if c.replayDomainSealed.Load() {
+			// The domain budget was exhausted earlier: the session is sealed. Rejecting
+			// (rather than evicting) guarantees that a previously accepted response can
+			// never become acceptable again merely because replay history was dropped.
+			return 0, 0, nil, serverID, ErrReplayDomainCapacity
 		}
 		f, ok := c.serverReplay[replayKey]
 		if !ok {
-			f = replay.NewFilter(30 * time.Second)
 			if len(c.serverReplay) >= MaxServerReplayDomainsPerConn {
-				pruneOldestReplayDomain(c.serverReplay)
+				// No eviction. Seal the session permanently; the operator must establish
+				// a new authenticated session. Deterministic: capacity is only consumed by
+				// AEAD-authenticated frames (replay filtering runs after tag verification).
+				c.replayDomainSealed.Store(true)
+				return 0, 0, nil, serverID, ErrReplayDomainCapacity
 			}
+			f = replay.NewFilter(30 * time.Second)
 			c.serverReplay[replayKey] = f
 		}
 		filter = f
@@ -1297,20 +1311,14 @@ func (r *MemoryPipeReceiver) Close() error {
 }
 
 // MaxServerReplayDomainsPerConn caps per-connection downstream replay domains
-// (serverID + per-instance nonce-base pairs) to bound memory against floods of
-// synthetic stream bases from a compromised expected-protocol peer.
+// (authorized serverID + per-server-session nonce/key base pairs) so replay-state
+// memory stays explicitly bounded. When a 33rd domain would be required, the
+// connection is SEALED fail-closed (see ErrReplayDomainCapacity); domains are never
+// evicted, because eviction would silently re-open an already accepted replay
+// window. Capacity is consumed only by AEAD-authenticated server frames: malformed
+// frames, unknown server IDs, and unauthenticated ciphertexts are rejected before
+// the replay stage and therefore cannot consume domain capacity.
 const MaxServerReplayDomainsPerConn = 32
-
-// pruneOldestReplayDomain evicts the lexically first replay-domain key when the
-// map is at capacity. An attacker cannot use this to reset a window that matters:
-// eviction requires flooding 32 distinct authenticated stream bases, which itself
-// requires the response credential (documented trust boundary).
-func pruneOldestReplayDomain(m map[string]*replay.Filter) {
-	for k := range m {
-		delete(m, k)
-		return
-	}
-}
 
 // extractV4DownstreamRNB deterministically re-parses the per-instance downstream
 // nonce stream base from an AEAD-verified v4 server frame. Callers must not use

@@ -92,9 +92,12 @@ func TestPhase19_V4ReplayAfterRestartNoKeyNonceReuse(t *testing.T) {
 	if bytes.Equal(respBytes1, respBytes2) {
 		t.Fatalf("test defect: the two response plaintexts must differ for this probe")
 	}
-	// Key schedules coincide across restart (documented determinism given same creds).
-	if !bytes.Equal(inst1.encKey, inst2.encKey) {
-		t.Fatalf("unexpected: restarted instance derived different s2c key from same creds")
+	// v4 (rev 2): the per-server-session nonce/key base is bound into the s2c HKDF
+	// salt, so a restarted instance derives a DIFFERENT s2c key for the same
+	// (sessionID, seed, serverID, secret) tuple. Key schedules coinciding across
+	// restart would re-open the same (key, nonce) domain and is itself a defect now.
+	if bytes.Equal(inst1.encKey, inst2.encKey) {
+		t.Fatalf("defect: restarted instance derived the SAME s2c key from same creds (base must be bound into the KDF salt)")
 	}
 	if bytes.Equal(inst1.respNonceBase, inst2.respNonceBase) {
 		t.Fatalf("defect: restarted instance reused the downstream nonce stream base")
